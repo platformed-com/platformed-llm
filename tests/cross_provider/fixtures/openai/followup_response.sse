@@ -1,0 +1,7 @@
+data: {"type":"response.output_item.added","item":{"id":"msg_456","type":"message","role":"assistant","content":[]}}
+
+data: {"type":"response.output_text.delta","delta":"Based on the weather data, the weather in Paris is currently sunny with a temperature of 22°C (72°F). It's a beautiful day!"}
+
+data: {"type":"response.done","usage":{"input_tokens":156,"output_tokens":45}}
+
+data: [DONE]

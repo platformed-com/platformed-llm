@@ -1,0 +1,11 @@
+data: {"type":"message_start","message":{"id":"msg_02abcdef789012","model":"claude-3-5-sonnet@20241022","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":134,"output_tokens":1}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Based on the weather data, Paris is currently experiencing beautiful sunny weather with a comfortable temperature of 22°C (72°F). It's perfect weather for exploring the city and doing some sightseeing! You might want to visit outdoor attractions like the Eiffel Tower or take a stroll along the Seine River."}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","usage":{"output_tokens":58}}}
+
+data: {"type":"message_stop"}

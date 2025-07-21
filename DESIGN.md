@@ -1053,7 +1053,7 @@ use futures::StreamExt;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let llm = LLM::gemini(
         std::env::var("GCP_PROJECT_ID")?,
-        "us-central1"
+        "europe-west1"
     )
     .model("gemini-2.0-flash")
     .build()

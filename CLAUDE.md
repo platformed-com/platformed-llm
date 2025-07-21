@@ -11,6 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Streaming responses** support for real-time output
 - **Function calling** capabilities across all providers
 - **Provider abstraction** designed for easy addition of new LLM providers
+- **Flexible authentication** supporting access tokens and Application Default Credentials for Vertex AI
 
 ## Development Commands
 
@@ -59,16 +60,24 @@ Implement each provider as a separate module:
 2. **Response Types**: Mirror OpenAI's Responses API structure for consistency
 3. **Streaming**: Use tokio-stream or futures-stream for async streaming
 4. **Function Calling**: Unified function schema representation across providers
+5. **Authentication**: Support access tokens and Application Default Credentials for Vertex AI
 
 ### Key Dependencies to Consider
 - `reqwest` or `hyper` for HTTP requests
 - `tokio` for async runtime
 - `serde` + `serde_json` for serialization
 - `futures` or `tokio-stream` for streaming
-- Provider-specific auth libraries (e.g., `gcp-auth` for Vertex)
+- No external auth libraries required - supports direct API keys and access tokens
 
 ### Implementation Priority
 1. Define core traits and types
 2. Implement OpenAI provider as reference
 3. Add Vertex providers (sharing auth/transport logic)
 4. Ensure streaming and function calling work across all providers
+
+## Important Instructions
+
+### API Design Principles
+- **No legacy compatibility**: When refactoring APIs, update all usages directly without preserving old names or adding backward compatibility aliases
+- **Clean refactoring**: Remove deprecated code completely rather than maintaining it
+- **Direct updates**: Update all files that use old APIs rather than adding compatibility layers

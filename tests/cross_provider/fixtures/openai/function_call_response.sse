@@ -1,0 +1,9 @@
+data: {"type":"response.output_item.added","item":{"id":"msg_123","type":"message","role":"assistant","content":[]}}
+
+data: {"type":"response.output_text.delta","delta":"I'll help you get the weather for Paris."}
+
+data: {"type":"response.output_item.done","item":{"id":"call_abc123def456","type":"function_call","status":"completed","name":"get_weather","arguments":"{\"location\": \"Paris\"}","call_id":"call_abc123def456"}}
+
+data: [DONE]
+
+

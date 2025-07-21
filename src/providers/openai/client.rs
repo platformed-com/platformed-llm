@@ -1,9 +1,9 @@
 use std::time::Duration;
 use reqwest::Client;
-use crate::{Error, InternalRequest, Response, StreamEvent};
+use crate::{Error, LLMRequest, Response, StreamEvent};
+use crate::provider::LLMProvider;
 use super::types::{ResponsesRequest, ResponsesStreamEvent};
-use futures_util::{Stream, StreamExt};
-use std::pin::Pin;
+use futures_util::StreamExt;
 
 /// OpenAI provider implementation.
 pub struct OpenAIProvider {
@@ -41,74 +41,11 @@ impl OpenAIProvider {
         })
     }
     
-    /// Generate a chat completion (internally always streams, but buffers if needed).
-    pub async fn generate(&self, request: &InternalRequest) -> Result<Response, Error> {
-        // Always use streaming internally, then convert to Response
-        let stream = self.generate_stream(request).await?;
-        Ok(Response::from_stream(stream))
-    }
-    
-    /// Generate a streaming chat completion.
-    pub async fn generate_stream(&self, request: &InternalRequest) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>>, Error> {
-        let mut openai_request = self.convert_request(request);
-        openai_request.stream = Some(true);
-        
-        let response = self.client
-            .post(format!("{}/responses", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&openai_request)
-            .send()
-            .await?;
-        
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(Error::provider("OpenAI", format!("API error: {error_text}")));
-        }
-        
-        // Create a stream from the response bytes
-        let byte_stream = response.bytes_stream();
-        let event_stream = byte_stream.map(|chunk_result| {
-            match chunk_result {
-                Ok(chunk) => {
-                    let sse_events = crate::streaming::parse_sse_chunk(&chunk)?;
-                    let mut stream_events = Vec::new();
-                    
-                    for sse_event in sse_events {
-                        if sse_event.is_done() {
-                            // End of stream
-                            break;
-                        }
-                        
-                        // Parse the JSON data as a ResponsesStreamEvent
-                        if let Ok(event) = serde_json::from_str::<ResponsesStreamEvent>(&sse_event.data) {
-                            let events = OpenAIProvider::convert_stream_event_static(event)?;
-                            stream_events.extend(events);
-                        }
-                    }
-                    
-                    Ok(stream_events)
-                }
-                Err(e) => Err(Error::streaming(format!("Network error: {e}")))
-            }
-        }).map(|events_result| {
-            match events_result {
-                Ok(events) => events.into_iter().map(Ok).collect::<Vec<_>>(),
-                Err(e) => vec![Err(e)],
-            }
-        }).map(|events| {
-            futures_util::stream::iter(events.into_iter())
-        }).flatten();
-        
-        Ok(Box::pin(event_stream))
-    }
-    
-    
     /// Convert internal request to OpenAI Responses API format.
-    fn convert_request(&self, request: &InternalRequest) -> ResponsesRequest {
+    fn convert_request(&self, request: &LLMRequest) -> ResponsesRequest {
         // Convert items to OpenAI format
         let input: Vec<crate::providers::openai::types::OpenAIInputMessage> = request.messages.iter()
-            .map(|item| self.convert_message(item))
+            .map(Self::convert_message)
             .collect();
         
         ResponsesRequest {
@@ -118,7 +55,7 @@ impl OpenAIProvider {
             temperature: request.temperature,
             max_output_tokens: request.max_tokens,
             top_p: request.top_p,
-            tools: request.tools.as_ref().map(|tools| self.convert_tools(tools)),
+            tools: request.tools.as_ref().map(|tools| Self::convert_tools(tools)),
             tool_choice: None, // Will be set later when we add function calling
             parallel_tool_calls: Some(true),
             previous_response_id: None, // Will be set when we add conversation support
@@ -128,7 +65,7 @@ impl OpenAIProvider {
     }
     
     /// Convert our internal InputItem to OpenAI format.
-    fn convert_message(&self, item: &crate::types::InputItem) -> crate::providers::openai::types::OpenAIInputMessage {
+    fn convert_message(item: &crate::types::InputItem) -> crate::providers::openai::types::OpenAIInputMessage {
         use crate::providers::openai::types::OpenAIInputMessage;
         
         match item {
@@ -164,7 +101,7 @@ impl OpenAIProvider {
     }
     
     /// Convert our internal tools to OpenAI Responses API format.
-    fn convert_tools(&self, tools: &[crate::types::Tool]) -> Vec<super::types::OpenAITool> {
+    fn convert_tools(tools: &[crate::types::Tool]) -> Vec<super::types::OpenAITool> {
         tools.iter().map(|tool| {
             super::types::OpenAITool {
                 r#type: "function".to_string(), // OpenAI Responses API expects "function"
@@ -277,6 +214,70 @@ impl OpenAIProvider {
     }
 }
 
+#[async_trait::async_trait]
+impl LLMProvider for OpenAIProvider {
+    /// Generate a chat completion (internally always streams).
+    async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
+        let mut openai_request = self.convert_request(request);
+        openai_request.stream = Some(true);
+        
+        let response = self.client
+            .post(format!("{}/responses", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&openai_request)
+            .send()
+            .await?;
+        
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            return Err(Error::provider("OpenAI", format!("API error: {error_text}")));
+        }
+        
+        // Create a stream from the response bytes
+        let byte_stream = response.bytes_stream();
+        
+        // Use the clean SSE stream adapter
+        use crate::sse_stream::SseStreamExt;
+        let event_stream = byte_stream
+            .sse_events()
+            .filter_map(|sse_result| async move {
+                match sse_result {
+                    Ok(sse_event) => {
+                        if sse_event.is_done() {
+                            // End of stream
+                            return None;
+                        }
+                        
+                        // Parse the JSON data as a ResponsesStreamEvent
+                        if let Ok(event) = serde_json::from_str::<ResponsesStreamEvent>(&sse_event.data) {
+                            match OpenAIProvider::convert_stream_event_static(event) {
+                                Ok(events) => Some(Ok(events)),
+                                Err(e) => Some(Err(e)),
+                            }
+                        } else {
+                            // Skip unparseable events (might be comments or other SSE data)
+                            None
+                        }
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .map(|events_result| {
+                match events_result {
+                    Ok(events) => events.into_iter().map(Ok).collect::<Vec<_>>(),
+                    Err(e) => vec![Err(e)],
+                }
+            })
+            .map(|events| {
+                futures_util::stream::iter(events.into_iter())
+            })
+            .flatten();
+        
+        Ok(Response::from_stream(event_stream))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,7 +293,7 @@ mod tests {
     fn test_request_conversion() {
         let provider = OpenAIProvider::new("test-key".to_string()).unwrap();
         let prompt = Prompt::user("Hello");
-        let request = InternalRequest {
+        let request = LLMRequest {
             model: "gpt-4".to_string(),
             messages: prompt.items().to_vec(),
             temperature: Some(0.7),

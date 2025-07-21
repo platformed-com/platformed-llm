@@ -1,37 +1,6 @@
-use platformed_llm::{OpenAIProvider, InternalRequest, Prompt, Error, CompleteResponse, OutputItem, FinishReason, Usage, Role, FunctionCall};
+use platformed_llm::{Prompt, Error, CompleteResponse, OutputItem, FinishReason, Usage, Role, FunctionCall};
 use platformed_llm::types::{InputItem, Message};
 
-#[tokio::test]
-async fn test_openai_provider_creation() {
-    let provider = OpenAIProvider::new("test-api-key".to_string());
-    assert!(provider.is_ok());
-}
-
-#[tokio::test]
-async fn test_request_building() {
-    let _provider = OpenAIProvider::new("test-api-key".to_string()).unwrap();
-    
-    let prompt = Prompt::system("You are a helpful assistant")
-        .with_user("Hello, world!");
-    
-    let request = InternalRequest {
-        model: "gpt-4".to_string(),
-        messages: prompt.items().to_vec(),
-        temperature: Some(0.7),
-        max_tokens: Some(100),
-        top_p: None,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        tools: None,
-    };
-    
-    // We can't actually make an API call without a real API key,
-    // but we can test the request building
-    assert_eq!(request.model, "gpt-4");
-    assert_eq!(request.messages.len(), 2);
-    assert_eq!(request.temperature, Some(0.7));
-}
 
 #[test]
 fn test_prompt_builder() {
