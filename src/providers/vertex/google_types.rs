@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::types::Usage;
+use serde::{Deserialize, Serialize};
 
 /// Google Vertex AI request format (for Gemini models).
 #[derive(Debug, Clone, Serialize)]
@@ -24,7 +24,9 @@ pub struct GoogleContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GooglePart {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: GoogleFunctionCall,
@@ -79,6 +81,7 @@ pub struct GoogleFunctionDeclaration {
 pub struct GoogleResponse {
     pub candidates: Vec<GoogleCandidate>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "usageMetadata")]
     pub usage_metadata: Option<GoogleUsageMetadata>,
 }
 
@@ -87,8 +90,10 @@ pub struct GoogleResponse {
 pub struct GoogleCandidate {
     pub content: GoogleContent,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "finishReason")]
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "safetyRatings")]
     pub safety_ratings: Option<Vec<serde_json::Value>>,
 }
 
@@ -101,14 +106,6 @@ pub struct GoogleUsageMetadata {
     pub candidates_token_count: Option<u32>,
     #[serde(rename = "totalTokenCount")]
     pub total_token_count: Option<u32>,
-}
-
-/// Streaming response chunk from Google.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GoogleStreamChunk {
-    pub candidates: Vec<GoogleCandidate>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage_metadata: Option<GoogleUsageMetadata>,
 }
 
 impl From<GoogleUsageMetadata> for Usage {

@@ -1,3 +1,7 @@
-data: {"candidates":[{"content":{"role":"model","parts":[{"text":"I'll help you get the weather for Paris."},{"functionCall":{"name":"get_weather","args":{"location":"Paris"}}}]},"finish_reason":"STOP"}],"usage_metadata":{"prompt_token_count":50,"candidates_token_count":20,"total_token_count":70}}
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"I'll help you get the weather for Paris."}]}}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"location":"Paris"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":50,"candidatesTokenCount":20,"totalTokenCount":70}}
 
 data: [DONE]
+
+

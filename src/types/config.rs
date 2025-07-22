@@ -3,9 +3,17 @@ use serde::{Deserialize, Serialize};
 /// Configuration for different LLM providers.
 #[derive(Debug, Clone)]
 pub enum ProviderConfig {
-    OpenAI { api_key: String },
-    Gemini { project_id: String, location: String },
-    AnthropicVertex { project_id: String, location: String },
+    OpenAI {
+        api_key: String,
+    },
+    Gemini {
+        project_id: String,
+        location: String,
+    },
+    AnthropicVertex {
+        project_id: String,
+        location: String,
+    },
 }
 
 /// Token usage information.
@@ -45,48 +53,48 @@ impl LLMRequest {
             tools: None,
         }
     }
-    
+
     /// Create a new request from a Prompt.
     pub fn from_prompt(model: impl Into<String>, prompt: &crate::Prompt) -> Self {
         Self::new(model, prompt.items().to_vec())
     }
-    
+
     /// Set the temperature (randomness) parameter.
     pub fn temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
     }
-    
+
     /// Set the maximum tokens to generate.
     pub fn max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
     }
-    
+
     /// Set the top_p (nucleus sampling) parameter.
     pub fn top_p(mut self, top_p: f32) -> Self {
         self.top_p = Some(top_p);
         self
     }
-    
+
     /// Set stop sequences.
     pub fn stop(mut self, stop: Vec<String>) -> Self {
         self.stop = Some(stop);
         self
     }
-    
+
     /// Set presence penalty.
     pub fn presence_penalty(mut self, presence_penalty: f32) -> Self {
         self.presence_penalty = Some(presence_penalty);
         self
     }
-    
+
     /// Set frequency penalty.
     pub fn frequency_penalty(mut self, frequency_penalty: f32) -> Self {
         self.frequency_penalty = Some(frequency_penalty);
         self
     }
-    
+
     /// Set tools/functions for function calling.
     pub fn tools(mut self, tools: Vec<super::message::Tool>) -> Self {
         self.tools = Some(tools);
@@ -97,17 +105,17 @@ impl LLMRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Prompt, InputItem};
+    use crate::{InputItem, Prompt};
 
     #[test]
     fn test_llm_request_builder() {
         let prompt = Prompt::user("Hello");
-        
+
         let request = LLMRequest::from_prompt("gpt-4", &prompt)
             .temperature(0.8)
             .max_tokens(500)
             .top_p(0.9);
-            
+
         assert_eq!(request.model, "gpt-4");
         assert_eq!(request.messages.len(), 1);
         assert_eq!(request.temperature, Some(0.8));
@@ -119,9 +127,9 @@ mod tests {
     #[test]
     fn test_llm_request_minimal() {
         let messages = vec![InputItem::user("Test")];
-        
+
         let request = LLMRequest::new("gpt-3.5-turbo", messages);
-            
+
         assert_eq!(request.model, "gpt-3.5-turbo");
         assert_eq!(request.messages.len(), 1);
         assert_eq!(request.temperature, None);

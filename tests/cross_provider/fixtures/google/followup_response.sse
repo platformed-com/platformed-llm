@@ -1,3 +1,6 @@
-data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Based on the weather data, the weather in Paris is currently sunny with a temperature of 22°C (72°F). It's a beautiful day!"}]},"finish_reason":"STOP"}],"usage_metadata":{"prompt_token_count":156,"candidates_token_count":45,"total_token_count":201}}
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Based on the weather data, the weather in Paris is currently sunny"}]}}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":" with a temperature of 22°C (72°F). It's a beautiful day!"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":156,"candidatesTokenCount":45,"totalTokenCount":201}}
 
 data: [DONE]
+

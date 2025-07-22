@@ -5,25 +5,25 @@ use thiserror::Error;
 pub enum Error {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
-    
+
     #[error("Authentication failed: {0}")]
     Auth(String),
-    
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    
+
     #[error("Provider error: {provider} - {message}")]
     Provider { provider: String, message: String },
-    
+
     #[error("Invalid configuration: {0}")]
     Config(String),
-    
+
     #[error("Streaming error: {0}")]
     Streaming(String),
-    
+
     #[error("Rate limit exceeded")]
     RateLimit,
-    
+
     #[error("Model not available: {0}")]
     ModelNotAvailable(String),
 }

@@ -18,8 +18,6 @@ pub struct Message {
     pub content: String,
 }
 
-
-
 impl InputItem {
     /// Create a system message.
     pub fn system(content: impl Into<String>) -> Self {
@@ -28,7 +26,7 @@ impl InputItem {
             content: content.into(),
         })
     }
-    
+
     /// Create a user message.
     pub fn user(content: impl Into<String>) -> Self {
         InputItem::Message(Message {
@@ -36,7 +34,7 @@ impl InputItem {
             content: content.into(),
         })
     }
-    
+
     /// Create an assistant message.
     pub fn assistant(content: impl Into<String>) -> Self {
         InputItem::Message(Message {
@@ -44,17 +42,17 @@ impl InputItem {
             content: content.into(),
         })
     }
-    
+
     /// Create a function call item.
     pub fn function_call(call: FunctionCall) -> Self {
         InputItem::FunctionCall(call)
     }
-    
+
     /// Create a function call output item.
     pub fn function_call_output(call_id: String, output: String) -> Self {
         InputItem::FunctionCallOutput { call_id, output }
     }
-    
+
     /// Get the role of this item (if it's a message).
     pub fn role(&self) -> Option<Role> {
         match self {
@@ -62,7 +60,7 @@ impl InputItem {
             _ => None,
         }
     }
-    
+
     /// Get the text content of this item (if any).
     pub fn content(&self) -> Option<String> {
         match self {
@@ -72,12 +70,12 @@ impl InputItem {
                 } else {
                     Some(msg.content.clone())
                 }
-            },
+            }
             InputItem::FunctionCallOutput { output, .. } => Some(output.clone()),
             InputItem::FunctionCall(_) => None,
         }
     }
-    
+
     /// Get the function call from this item (if any).
     pub fn get_function_call(&self) -> Option<&FunctionCall> {
         match self {
@@ -85,7 +83,7 @@ impl InputItem {
             _ => None,
         }
     }
-    
+
     /// Get the function call ID from this item (if any).
     pub fn function_call_id(&self) -> Option<&str> {
         match self {
@@ -93,7 +91,6 @@ impl InputItem {
             _ => None,
         }
     }
-    
 }
 
 impl Message {
@@ -104,7 +101,7 @@ impl Message {
             content: content.into(),
         }
     }
-    
+
     /// Add text content to this message.
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         if !self.content.is_empty() {
@@ -113,12 +110,12 @@ impl Message {
         self.content.push_str(&text.into());
         self
     }
-    
+
     /// Get all text content.
     pub fn text_content(&self) -> String {
         self.content.clone()
     }
-    
+
     /// Create a system message.
     pub fn system(content: impl Into<String>) -> Self {
         Message {
@@ -126,7 +123,7 @@ impl Message {
             content: content.into(),
         }
     }
-    
+
     /// Create a user message.
     pub fn user(content: impl Into<String>) -> Self {
         Message {
@@ -134,7 +131,7 @@ impl Message {
             content: content.into(),
         }
     }
-    
+
     /// Create an assistant message.
     pub fn assistant(content: impl Into<String>) -> Self {
         Message {
@@ -142,12 +139,12 @@ impl Message {
             content: content.into(),
         }
     }
-    
+
     /// Get the role of this message.
     pub fn role(&self) -> Role {
         self.role
     }
-    
+
     /// Get the text content of this message (if any).
     pub fn content(&self) -> Option<String> {
         if self.content.is_empty() {
@@ -157,7 +154,6 @@ impl Message {
         }
     }
 }
-
 
 /// Role of a message participant.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -191,6 +187,16 @@ pub struct Function {
 }
 
 /// Function call information.
+///
+/// ## ID Scheme
+/// - `id`: Unique identifier for the function call item itself (e.g., "fc_123")
+/// - `call_id`: Reference ID used when providing function call outputs (e.g., "call_123")
+///
+/// The `call_id` is what should be used in `FunctionCallOutput` to reference this specific call.
+/// Different providers handle this differently:
+/// - OpenAI: Uses separate IDs (fc_* for id, call_* for call_id)
+/// - Google: Uses consistent UUID base for both to ensure they can be matched
+/// - Anthropic: Uses the same ID for both since their API uses a single identifier
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub id: String,

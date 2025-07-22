@@ -139,9 +139,8 @@ impl ProviderConfig {
                     }
                 }
                 _ => {
-                    return Err(Error::config(&format!(
-                        "Invalid PROVIDER_TYPE '{}'. Valid values are: openai, google, anthropic",
-                        provider_type
+                    return Err(Error::config(format!(
+                        "Invalid PROVIDER_TYPE '{provider_type}'. Valid values are: openai, google, anthropic"
                     )));
                 }
             }

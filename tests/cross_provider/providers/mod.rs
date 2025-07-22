@@ -1,8 +1,8 @@
-pub mod openai;
-pub mod google;
 pub mod anthropic;
+pub mod google;
+pub mod openai;
 
-use platformed_llm::{LLMProvider, Tool, Function, ToolType};
+use platformed_llm::{Function, LLMProvider, Tool, ToolType};
 use serde_json::json;
 use std::pin::Pin;
 use wiremock::MockServer;
@@ -41,10 +41,10 @@ pub struct ProviderConfig {
 pub trait ProviderTestSetup {
     /// Get the provider configuration
     fn get_config() -> ProviderConfig;
-    
+
     /// Create the provider instance
     fn create_provider(base_url: &str) -> Pin<Box<dyn LLMProvider>>;
-    
+
     /// Mount the required mocks for function calling test on the provided mock server
     async fn mount_function_calling_mocks(
         mock_server: &MockServer,

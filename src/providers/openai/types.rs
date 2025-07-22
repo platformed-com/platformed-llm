@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::types::Usage;
+use serde::{Deserialize, Serialize};
 
 /// OpenAI input message format for Responses API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7,16 +7,10 @@ use crate::types::Usage;
 pub enum OpenAIInputMessage {
     /// Regular message with role and content
     #[serde(rename = "message")]
-    Regular {
-        role: String,
-        content: String,
-    },
+    Regular { role: String, content: String },
     /// Function call output message
     #[serde(rename = "function_call_output")]
-    FunctionCallOutput {
-        call_id: String,
-        output: String,
-    },
+    FunctionCallOutput { call_id: String, output: String },
     /// Function call message (when sending previous function calls back)
     #[serde(rename = "function_call")]
     FunctionCall {
@@ -154,7 +148,7 @@ pub struct ResponsesStreamEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponsesResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub item: Option<FunctionCallItem>,
+    pub item: Option<ResponseItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub part: Option<ResponseContent>,
 }
@@ -162,7 +156,7 @@ pub struct ResponsesStreamEvent {
 /// Function call item in streaming response.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
-pub struct FunctionCallItem {
+pub struct ResponseItem {
     pub id: String,
     pub r#type: String, // "function_call"
     pub status: String, // "in_progress", "completed"

@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::types::Usage;
+use serde::{Deserialize, Serialize};
 
 /// Anthropic Claude request format via Vertex AI.
 #[derive(Debug, Clone, Serialize)]

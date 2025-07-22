@@ -5,3 +5,5 @@ data: {"type":"response.output_text.delta","delta":"Based on the weather data, t
 data: {"type":"response.done","usage":{"input_tokens":156,"output_tokens":45}}
 
 data: [DONE]
+
+

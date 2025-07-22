@@ -1,13 +1,13 @@
-use std::time::Duration;
-use reqwest::Client;
 use futures_util::StreamExt;
 use gcp_auth::AuthenticationManager;
+use reqwest::Client;
+use std::time::Duration;
 
-use crate::{Error, LLMRequest, Response, StreamEvent};
-use crate::provider::LLMProvider;
-use crate::types::{FinishReason, FunctionCall, InputItem, Role};
-use crate::sse_stream::SseStream;
 use super::anthropic_types::*;
+use crate::provider::LLMProvider;
+use crate::sse_stream::SseStream;
+use crate::types::{FinishReason, FunctionCall, InputItem, Role};
+use crate::{Error, LLMRequest, Response, StreamEvent};
 
 /// Authentication method for Anthropic provider.
 #[derive(Debug)]
@@ -31,30 +31,64 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     /// Create a new Anthropic provider with access token authentication.
-    pub fn new(project_id: String, location: String, model_id: String, access_token: String) -> Result<Self, Error> {
-        Self::with_auth(project_id, location, model_id, AnthropicAuth::AccessToken(access_token))
+    pub fn new(
+        project_id: String,
+        location: String,
+        model_id: String,
+        access_token: String,
+    ) -> Result<Self, Error> {
+        Self::with_auth(
+            project_id,
+            location,
+            model_id,
+            AnthropicAuth::AccessToken(access_token),
+        )
     }
-    
+
     /// Create a new Anthropic provider with custom base URL (for testing).
-    pub fn new_with_base_url(project_id: String, location: String, model_id: String, access_token: String, base_url: String) -> Result<Self, Error> {
-        let mut provider = Self::with_auth(project_id, location, model_id, AnthropicAuth::AccessToken(access_token))?;
+    pub fn new_with_base_url(
+        project_id: String,
+        location: String,
+        model_id: String,
+        access_token: String,
+        base_url: String,
+    ) -> Result<Self, Error> {
+        let mut provider = Self::with_auth(
+            project_id,
+            location,
+            model_id,
+            AnthropicAuth::AccessToken(access_token),
+        )?;
         provider.base_url = Some(base_url);
         Ok(provider)
     }
-    
+
     /// Create a new Anthropic provider with Application Default Credentials.
-    pub async fn with_adc(project_id: String, location: String, model_id: String) -> Result<Self, Error> {
-        Self::with_auth_async(project_id, location, model_id, AnthropicAuth::ApplicationDefault).await
+    pub async fn with_adc(
+        project_id: String,
+        location: String,
+        model_id: String,
+    ) -> Result<Self, Error> {
+        Self::with_auth_async(
+            project_id,
+            location,
+            model_id,
+            AnthropicAuth::ApplicationDefault,
+        )
+        .await
     }
-    
+
     /// Create a new Anthropic provider with specific authentication method (sync for access tokens).
-    pub fn with_auth(project_id: String, location: String, model_id: String, auth: AnthropicAuth) -> Result<Self, Error> {
+    pub fn with_auth(
+        project_id: String,
+        location: String,
+        model_id: String,
+        auth: AnthropicAuth,
+    ) -> Result<Self, Error> {
         match auth {
             AnthropicAuth::AccessToken(_) => {
-                let client = Client::builder()
-                    .timeout(Duration::from_secs(60))
-                    .build()?;
-                
+                let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
+
                 Ok(Self {
                     client,
                     project_id,
@@ -65,26 +99,30 @@ impl AnthropicProvider {
                     base_url: None,
                 })
             }
-            AnthropicAuth::ApplicationDefault => {
-                Err(Error::config("Use with_auth_async() for Application Default Credentials"))
-            }
+            AnthropicAuth::ApplicationDefault => Err(Error::config(
+                "Use with_auth_async() for Application Default Credentials",
+            )),
         }
     }
-    
+
     /// Create a new Anthropic provider with specific authentication method (async for ADC).
-    pub async fn with_auth_async(project_id: String, location: String, model_id: String, auth: AnthropicAuth) -> Result<Self, Error> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()?;
-        
+    pub async fn with_auth_async(
+        project_id: String,
+        location: String,
+        model_id: String,
+        auth: AnthropicAuth,
+    ) -> Result<Self, Error> {
+        let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
+
         let auth_manager = match &auth {
             AnthropicAuth::ApplicationDefault => {
-                Some(AuthenticationManager::new().await
-                    .map_err(|e| Error::provider("Anthropic", format!("Failed to create auth manager: {e}")))?)
+                Some(AuthenticationManager::new().await.map_err(|e| {
+                    Error::provider("Anthropic", format!("Failed to create auth manager: {e}"))
+                })?)
             }
             AnthropicAuth::AccessToken(_) => None,
         };
-        
+
         Ok(Self {
             client,
             project_id,
@@ -95,12 +133,12 @@ impl AnthropicProvider {
             base_url: None,
         })
     }
-    
+
     /// Convert internal request to Anthropic format.
     fn convert_request(&self, request: &LLMRequest) -> Result<AnthropicRequest, Error> {
         let mut messages = Vec::new();
         let mut system_message = None;
-        
+
         for item in &request.messages {
             match item {
                 InputItem::Message(msg) => {
@@ -128,8 +166,9 @@ impl AnthropicProvider {
                     let tool_use_block = AnthropicContentBlock::ToolUse {
                         id: call.id.clone(),
                         name: call.name.clone(),
-                        input: serde_json::from_str(&call.arguments)
-                            .map_err(|e| Error::provider("Anthropic", format!("Invalid function arguments: {e}")))?,
+                        input: serde_json::from_str(&call.arguments).map_err(|e| {
+                            Error::provider("Anthropic", format!("Invalid function arguments: {e}"))
+                        })?,
                     };
 
                     if let Some(last_msg) = messages.last_mut() {
@@ -137,7 +176,8 @@ impl AnthropicProvider {
                             // Convert existing content to blocks and add tool use
                             match &mut last_msg.content {
                                 AnthropicContent::Text(text) => {
-                                    let mut blocks = vec![AnthropicContentBlock::Text { text: text.clone() }];
+                                    let mut blocks =
+                                        vec![AnthropicContentBlock::Text { text: text.clone() }];
                                     blocks.push(tool_use_block);
                                     last_msg.content = AnthropicContent::Blocks(blocks);
                                 }
@@ -169,13 +209,13 @@ impl AnthropicProvider {
 
                     // Check if the last message is already a user message with tool results
                     let should_append = if let Some(last_msg) = messages.last() {
-                        last_msg.role == "user" && 
-                        match &last_msg.content {
-                            AnthropicContent::Blocks(blocks) => {
-                                blocks.iter().any(|b| matches!(b, AnthropicContentBlock::ToolResult { .. }))
+                        last_msg.role == "user"
+                            && match &last_msg.content {
+                                AnthropicContent::Blocks(blocks) => blocks
+                                    .iter()
+                                    .any(|b| matches!(b, AnthropicContentBlock::ToolResult { .. })),
+                                _ => false,
                             }
-                            _ => false,
-                        }
                     } else {
                         false
                     };
@@ -197,17 +237,18 @@ impl AnthropicProvider {
                 }
             }
         }
-        
+
         let tools = request.tools.as_ref().map(|tools| {
-            tools.iter().map(|tool| {
-                AnthropicTool {
+            tools
+                .iter()
+                .map(|tool| AnthropicTool {
                     name: tool.function.name.clone(),
                     description: tool.function.description.clone(),
                     input_schema: tool.function.parameters.clone(),
-                }
-            }).collect()
+                })
+                .collect()
         });
-        
+
         let anthropic_request = AnthropicRequest {
             messages,
             max_tokens: request.max_tokens.unwrap_or(1024),
@@ -218,20 +259,29 @@ impl AnthropicProvider {
             tools,
             stream: Some(true), // Enable streaming for SSE responses
         };
-        
+
         Ok(anthropic_request)
     }
-    
+
     /// Get the API endpoint for the Anthropic model.
     fn get_endpoint(&self, stream: bool) -> String {
-        let method = if stream { "streamRawPredict" } else { "rawPredict" };
+        let method = if stream {
+            "streamRawPredict"
+        } else {
+            "rawPredict"
+        };
         let sse_param = if stream { "?alt=sse" } else { "" };
-        
+
         if let Some(base_url) = &self.base_url {
             // Use custom base URL for testing
             format!(
                 "{}/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:{}{}",
-                base_url.trim_end_matches('/'), self.project_id, self.location, self.model_id, method, sse_param
+                base_url.trim_end_matches('/'),
+                self.project_id,
+                self.location,
+                self.model_id,
+                method,
+                sse_param
             )
         } else {
             // Use default Vertex AI endpoint
@@ -247,57 +297,69 @@ impl AnthropicProvider {
 impl LLMProvider for AnthropicProvider {
     async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
         let anthropic_request = self.convert_request(request)?;
-        
+
         let endpoint = self.get_endpoint(true);
-        
-        let mut request_builder = self.client
+
+        let mut request_builder = self
+            .client
             .post(&endpoint)
             .header("Content-Type", "application/json")
             .json(&anthropic_request);
-        
+
         // Add authentication based on the method
         request_builder = match &self.auth {
             AnthropicAuth::AccessToken(token) => {
                 request_builder.header("Authorization", format!("Bearer {token}"))
             }
             AnthropicAuth::ApplicationDefault => {
-                let auth_manager = self.auth_manager.as_ref()
-                    .ok_or_else(|| Error::provider("Anthropic", "Auth manager not initialized for ADC"))?;
-                
-                let token = auth_manager.get_token(&["https://www.googleapis.com/auth/cloud-platform"]).await
-                    .map_err(|e| Error::provider("Anthropic", format!("Failed to get ADC token: {e}")))?;
-                
+                let auth_manager = self.auth_manager.as_ref().ok_or_else(|| {
+                    Error::provider("Anthropic", "Auth manager not initialized for ADC")
+                })?;
+
+                let token = auth_manager
+                    .get_token(&["https://www.googleapis.com/auth/cloud-platform"])
+                    .await
+                    .map_err(|e| {
+                        Error::provider("Anthropic", format!("Failed to get ADC token: {e}"))
+                    })?;
+
                 request_builder.header("Authorization", format!("Bearer {}", token.as_str()))
             }
         };
-        
+
         let response = request_builder.send().await?;
-        
-        
+
         if !response.status().is_success() {
             let error_text = response.text().await?;
-            return Err(Error::provider("Anthropic", format!("API error: {error_text}")));
+            return Err(Error::provider(
+                "Anthropic",
+                format!("API error: {error_text}"),
+            ));
         }
-        
+
         // Create SSE stream from response
         let byte_stream = response.bytes_stream();
         let sse_stream = SseStream::new(byte_stream);
-        
+
+        // Create a stateful processor for function call tracking
+        let mut state = StreamState::default();
+
         let event_stream = sse_stream
-            .map(|sse_result| {
+            .map(move |sse_result| {
                 match sse_result {
                     Ok(sse_event) => {
                         let data = sse_event.data.trim();
-                        
+
                         // Skip empty events
                         if data.is_empty() {
                             return vec![];
                         }
-                        
+
                         // Parse the SSE data as Anthropic stream event
                         match serde_json::from_str::<AnthropicStreamEvent>(data) {
                             Ok(stream_event) => {
-                                match Self::convert_stream_event_static(stream_event) {
+                                match Self::convert_stream_event_stateful(stream_event, &mut state)
+                                {
                                     Ok(events) => events.into_iter().map(Ok).collect(),
                                     Err(e) => vec![Err(e)],
                                 }
@@ -307,7 +369,10 @@ impl LLMProvider for AnthropicProvider {
                                 if !data.starts_with('{') {
                                     vec![]
                                 } else {
-                                    vec![Err(Error::provider("Anthropic", format!("Failed to parse SSE event: {e}")))]
+                                    vec![Err(Error::provider(
+                                        "Anthropic",
+                                        format!("Failed to parse SSE event: {e}"),
+                                    ))]
                                 }
                             }
                         }
@@ -315,43 +380,89 @@ impl LLMProvider for AnthropicProvider {
                     Err(e) => vec![Err(e)],
                 }
             })
-            .map(|events| {
-                futures_util::stream::iter(events.into_iter())
-            })
+            .map(|events| futures_util::stream::iter(events.into_iter()))
             .flatten();
-        
+
         Ok(Response::from_stream(event_stream))
     }
 }
 
+/// State for tracking in-progress function calls during streaming.
+#[derive(Debug, Default)]
+struct StreamState {
+    /// In-progress function calls indexed by content block index
+    in_progress_calls: std::collections::HashMap<u32, InProgressFunctionCall>,
+}
+
+/// A function call that's being built incrementally from streaming events.
+#[derive(Debug)]
+struct InProgressFunctionCall {
+    id: String,
+    name: String,
+    input_buffer: String,    // Accumulates InputJsonDelta events
+    has_initial_input: bool, // Whether we started with complete input
+}
+
 impl AnthropicProvider {
-    /// Static version of convert_stream_event for use in stream processing.
-    fn convert_stream_event_static(event: AnthropicStreamEvent) -> Result<Vec<StreamEvent>, Error> {
+    /// Convert stream event with state tracking for function calls.
+    fn convert_stream_event_stateful(
+        event: AnthropicStreamEvent,
+        state: &mut StreamState,
+    ) -> Result<Vec<StreamEvent>, Error> {
         let mut events = Vec::new();
-        
+
         match event {
             AnthropicStreamEvent::MessageStart { .. } => {
                 // Start of message - no events needed for now
             }
-            AnthropicStreamEvent::ContentBlockStart { content_block, .. } => {
+            AnthropicStreamEvent::ContentBlockStart {
+                content_block,
+                index,
+            } => {
                 match content_block {
                     AnthropicContentBlock::ToolUse { id, name, input } => {
                         // Handle tool use block start
                         events.push(StreamEvent::OutputItemAdded {
-                            item: crate::types::OutputItemInfo::FunctionCall { name: name.clone(), id: id.clone() },
+                            item: crate::types::OutputItemInfo::FunctionCall {
+                                name: name.clone(),
+                                id: id.clone(),
+                            },
                         });
-                        
-                        // Emit the complete function call since Anthropic provides it all at once
-                        let function_call = FunctionCall {
-                            id: id.clone(),
-                            call_id: id, // Use the same ID for both
-                            name,
-                            arguments: serde_json::to_string(&input)
-                                .map_err(|e| Error::provider("Anthropic", format!("Failed to serialize function input: {e}")))?,
+
+                        // Start tracking this function call - don't emit FunctionCallComplete yet
+                        // Parameters may be streamed incrementally via InputJsonDelta events
+
+                        // Check if we have initial input or if it will be streamed
+                        let (initial_input, has_initial) = if input.is_null()
+                            || (input.is_object() && input.as_object().unwrap().is_empty())
+                        {
+                            // No initial input, will be streamed via InputJsonDelta
+                            (String::new(), false)
+                        } else {
+                            // We have complete initial input
+                            let json = serde_json::to_string(&input).map_err(|e| {
+                                Error::provider(
+                                    "Anthropic",
+                                    format!("Failed to serialize initial function input: {e}"),
+                                )
+                            })?;
+                            (json, true)
                         };
-                        events.push(StreamEvent::FunctionCallComplete { call: function_call });
+
+                        state.in_progress_calls.insert(
+                            index,
+                            InProgressFunctionCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input_buffer: initial_input,
+                                has_initial_input: has_initial,
+                            },
+                        );
                     }
                     AnthropicContentBlock::Text { text } => {
+                        events.push(StreamEvent::OutputItemAdded {
+                            item: crate::types::OutputItemInfo::Text,
+                        });
                         // Handle initial text content if any
                         if !text.is_empty() {
                             events.push(StreamEvent::ContentDelta { delta: text });
@@ -362,22 +473,43 @@ impl AnthropicProvider {
                     }
                 }
             }
-            AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
+            AnthropicStreamEvent::ContentBlockDelta { delta, index } => {
                 match delta {
                     AnthropicContentDelta::TextDelta { text } => {
                         if !text.is_empty() {
                             events.push(StreamEvent::ContentDelta { delta: text });
                         }
                     }
-                    AnthropicContentDelta::InputJsonDelta { .. } => {
-                        // Function arguments are being built incrementally
-                        // In the current implementation, we already emitted the complete call in ContentBlockStart
-                        // So we ignore these for now
+                    AnthropicContentDelta::InputJsonDelta { partial_json } => {
+                        // Handle function parameter updates
+                        if let Some(in_progress) = state.in_progress_calls.get_mut(&index) {
+                            if in_progress.has_initial_input {
+                                // We already had complete input in ContentBlockStart
+                                // InputJsonDelta is providing the same data again (or updates)
+                                // Replace with the new data
+                                in_progress.input_buffer = partial_json;
+                            } else {
+                                // We're building the input incrementally
+                                // Append the partial JSON
+                                in_progress.input_buffer.push_str(&partial_json);
+                            }
+                        }
                     }
                 }
             }
-            AnthropicStreamEvent::ContentBlockStop { .. } => {
-                // Content block finished - function calls already handled in ContentBlockStart
+            AnthropicStreamEvent::ContentBlockStop { index } => {
+                // Content block finished - emit FunctionCallComplete if this was a function call
+                if let Some(in_progress) = state.in_progress_calls.remove(&index) {
+                    let function_call = FunctionCall {
+                        id: in_progress.id.clone(),
+                        call_id: in_progress.id, // Use the same ID for both
+                        name: in_progress.name,
+                        arguments: in_progress.input_buffer,
+                    };
+                    events.push(StreamEvent::FunctionCallComplete {
+                        call: function_call,
+                    });
+                }
             }
             AnthropicStreamEvent::MessageDelta { delta } => {
                 // Handle usage updates and stop reason
@@ -396,7 +528,7 @@ impl AnthropicProvider {
                 // Keep-alive event - ignore
             }
         }
-        
+
         Ok(events)
     }
 }
@@ -405,17 +537,18 @@ impl AnthropicProvider {
 mod tests {
     use super::*;
     use futures_util::{stream, StreamExt};
-    
+
     #[tokio::test]
     async fn test_streaming_content_parsing() {
         // Simulate realistic Anthropic streaming response chunks
         let start_event = r#"{"type":"message_start","message":{"id":"msg_123","model":"claude-sonnet-4","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#;
-        let content_start = r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
+        let content_start =
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
         let text_delta1 = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
         let text_delta2 = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}"#;
         let content_stop = r#"{"type":"content_block_stop","index":0}"#;
         let message_stop = r#"{"type":"message_stop"}"#;
-        
+
         let byte_chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
             Ok(bytes::Bytes::from(format!("data: {start_event}\n\n"))),
             Ok(bytes::Bytes::from(format!("data: {content_start}\n\n"))),
@@ -424,27 +557,29 @@ mod tests {
             Ok(bytes::Bytes::from(format!("data: {content_stop}\n\n"))),
             Ok(bytes::Bytes::from(format!("data: {message_stop}\n\n"))),
         ];
-        
+
         let byte_stream = stream::iter(byte_chunks);
         let sse_stream = crate::sse_stream::SseStream::new(byte_stream);
-        
+
         // Process events through our Anthropic SSE handler
         let mut events = Vec::new();
-        
+
         // Collect all events using StreamExt::next
         let mut sse_stream = sse_stream;
         while let Some(sse_result) = sse_stream.next().await {
             let sse_event = sse_result.expect("SSE should parse correctly");
             let data = sse_event.data.trim();
-            
+
             if data.is_empty() {
                 continue;
             }
-            
+
             // Parse as AnthropicStreamEvent
             match serde_json::from_str::<AnthropicStreamEvent>(data) {
                 Ok(stream_event) => {
-                    match AnthropicProvider::convert_stream_event_static(stream_event) {
+                    let mut state = StreamState::default();
+                    match AnthropicProvider::convert_stream_event_stateful(stream_event, &mut state)
+                    {
                         Ok(stream_events) => {
                             events.extend(stream_events);
                         }
@@ -454,24 +589,26 @@ mod tests {
                 Err(e) => panic!("Should parse JSON successfully: {e}"),
             }
         }
-        
+
         // Verify we got the expected events
-        let content_events: Vec<_> = events.iter()
+        let content_events: Vec<_> = events
+            .iter()
             .filter_map(|e| match e {
                 StreamEvent::ContentDelta { delta } => Some(delta.as_str()),
                 _ => None,
             })
             .collect();
-        
+
         assert_eq!(content_events, vec!["Hello", " world"]);
-        
+
         // Verify we got exactly one Done event at the end
-        let done_events: Vec<_> = events.iter()
+        let done_events: Vec<_> = events
+            .iter()
             .filter(|e| matches!(e, StreamEvent::Done { .. }))
             .collect();
-        
+
         assert_eq!(done_events.len(), 1);
-        
+
         // The Done event should be the last event
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
     }

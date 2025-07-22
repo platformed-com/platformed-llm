@@ -1,4 +1,4 @@
-use super::{ProviderConfig, ProviderTestSetup, create_weather_tool};
+use super::{create_weather_tool, ProviderConfig, ProviderTestSetup};
 use platformed_llm::{LLMProvider, OpenAIProvider};
 use serde_json::json;
 use std::pin::Pin;
@@ -22,15 +22,14 @@ impl ProviderTestSetup for OpenAITestSetup {
             supports_custom_base_url: true,
         }
     }
-    
+
     fn create_provider(base_url: &str) -> Pin<Box<dyn LLMProvider>> {
-        let provider = OpenAIProvider::new_with_base_url(
-            "test-api-key".to_string(), 
-            base_url.to_string()
-        ).expect("Failed to create OpenAI provider");
+        let provider =
+            OpenAIProvider::new_with_base_url("test-api-key".to_string(), base_url.to_string())
+                .expect("Failed to create OpenAI provider");
         Box::pin(provider)
     }
-    
+
     async fn mount_function_calling_mocks(
         mock_server: &MockServer,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -45,7 +44,7 @@ impl ProviderTestSetup for OpenAITestSetup {
                 },
                 {
                     "type": "message",
-                    "role": "user", 
+                    "role": "user",
                     "content": "What's the weather like in Paris?"
                 }
             ],
@@ -74,7 +73,7 @@ impl ProviderTestSetup for OpenAITestSetup {
                 },
                 {
                     "type": "message",
-                    "role": "user", 
+                    "role": "user",
                     "content": "What's the weather like in Paris?"
                 },
                 {
@@ -108,9 +107,11 @@ impl ProviderTestSetup for OpenAITestSetup {
             .and(body_json(initial_request_payload))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_string(load_fixture("tests/cross_provider/fixtures/openai/function_call_response.sse"))
+                    .set_body_string(load_fixture(
+                        "tests/cross_provider/fixtures/openai/function_call_response.sse",
+                    ))
                     .insert_header("content-type", "text/event-stream")
-                    .insert_header("cache-control", "no-cache")
+                    .insert_header("cache-control", "no-cache"),
             )
             .expect(1)
             .mount(mock_server)
@@ -122,9 +123,11 @@ impl ProviderTestSetup for OpenAITestSetup {
             .and(body_json(followup_request_payload))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_string(load_fixture("tests/cross_provider/fixtures/openai/followup_response.sse"))
+                    .set_body_string(load_fixture(
+                        "tests/cross_provider/fixtures/openai/followup_response.sse",
+                    ))
                     .insert_header("content-type", "text/event-stream")
-                    .insert_header("cache-control", "no-cache")
+                    .insert_header("cache-control", "no-cache"),
             )
             .expect(1)
             .mount(mock_server)
