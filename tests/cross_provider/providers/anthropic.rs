@@ -1,5 +1,5 @@
 use super::{create_weather_tool, ProviderConfig, ProviderTestSetup};
-use platformed_llm::providers::vertex::AnthropicProvider;
+use platformed_llm::providers::vertex::AnthropicViaVertexProvider;
 use platformed_llm::LLMProvider;
 use serde_json::json;
 use std::pin::Pin;
@@ -25,7 +25,7 @@ impl ProviderTestSetup for AnthropicTestSetup {
     }
 
     fn create_provider(base_url: &str) -> Pin<Box<dyn LLMProvider>> {
-        let provider = AnthropicProvider::new_with_base_url(
+        let provider = AnthropicViaVertexProvider::new_with_base_url(
             "test-project".to_string(),
             "europe-west1".to_string(),
             "claude-3-5-sonnet-v2@20241022".to_string(),

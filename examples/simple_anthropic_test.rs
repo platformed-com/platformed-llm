@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use platformed_llm::providers::vertex::AnthropicProvider;
+use platformed_llm::providers::vertex::AnthropicViaVertexProvider;
 use platformed_llm::{Error, LLMProvider, LLMRequest, Prompt, ResponseAccumulator};
 
 #[tokio::main]
@@ -25,7 +25,7 @@ async fn main() -> Result<(), Error> {
     );
 
     // Create provider directly
-    let provider = AnthropicProvider::new(
+    let provider = AnthropicViaVertexProvider::new(
         project_id,
         location,
         "claude-3-5-sonnet-v2@20241022".to_string(),

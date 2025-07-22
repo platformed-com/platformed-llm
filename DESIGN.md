@@ -188,7 +188,7 @@ impl LLMBuilder {
                 Box::new(GeminiProvider::new(project_id, location).await?) as Box<dyn LLMProvider>
             }
             ProviderConfig::AnthropicVertex { project_id, location } => {
-                Box::new(AnthropicVertexProvider::new(project_id, location).await?) as Box<dyn LLMProvider>
+                Box::new(AnthropicViaVertexProvider::new(project_id, location).await?) as Box<dyn LLMProvider>
             }
         };
         
@@ -975,7 +975,7 @@ pub struct GeminiProvider {
 }
 
 // providers/vertex/anthropic/client.rs
-pub struct AnthropicVertexProvider {
+pub struct AnthropicViaVertexProvider {
     client: reqwest::Client,
     auth: Arc<VertexAuthenticator>,
     project_id: String,

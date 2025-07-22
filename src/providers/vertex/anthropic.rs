@@ -9,9 +9,9 @@ use crate::sse_stream::SseStream;
 use crate::types::{FinishReason, FunctionCall, InputItem, Role};
 use crate::{Error, LLMRequest, Response, StreamEvent};
 
-/// Authentication method for Anthropic provider.
+/// Authentication method for Anthropic provider via Vertex AI.
 #[derive(Debug)]
-pub enum AnthropicAuth {
+pub enum AnthropicViaVertexAuth {
     /// Use access token (passed as Bearer header)
     AccessToken(String),
     /// Use Application Default Credentials (ADC)
@@ -19,17 +19,17 @@ pub enum AnthropicAuth {
 }
 
 /// Anthropic Claude provider implementation via Vertex AI.
-pub struct AnthropicProvider {
+pub struct AnthropicViaVertexProvider {
     client: Client,
     project_id: String,
     location: String,
     model_id: String,
-    auth: AnthropicAuth,
+    auth: AnthropicViaVertexAuth,
     auth_manager: Option<AuthenticationManager>,
     base_url: Option<String>,
 }
 
-impl AnthropicProvider {
+impl AnthropicViaVertexProvider {
     /// Create a new Anthropic provider with access token authentication.
     pub fn new(
         project_id: String,
@@ -41,7 +41,7 @@ impl AnthropicProvider {
             project_id,
             location,
             model_id,
-            AnthropicAuth::AccessToken(access_token),
+            AnthropicViaVertexAuth::AccessToken(access_token),
         )
     }
 
@@ -57,7 +57,7 @@ impl AnthropicProvider {
             project_id,
             location,
             model_id,
-            AnthropicAuth::AccessToken(access_token),
+            AnthropicViaVertexAuth::AccessToken(access_token),
         )?;
         provider.base_url = Some(base_url);
         Ok(provider)
@@ -73,7 +73,7 @@ impl AnthropicProvider {
             project_id,
             location,
             model_id,
-            AnthropicAuth::ApplicationDefault,
+            AnthropicViaVertexAuth::ApplicationDefault,
         )
         .await
     }
@@ -83,10 +83,10 @@ impl AnthropicProvider {
         project_id: String,
         location: String,
         model_id: String,
-        auth: AnthropicAuth,
+        auth: AnthropicViaVertexAuth,
     ) -> Result<Self, Error> {
         match auth {
-            AnthropicAuth::AccessToken(_) => {
+            AnthropicViaVertexAuth::AccessToken(_) => {
                 let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
 
                 Ok(Self {
@@ -99,7 +99,7 @@ impl AnthropicProvider {
                     base_url: None,
                 })
             }
-            AnthropicAuth::ApplicationDefault => Err(Error::config(
+            AnthropicViaVertexAuth::ApplicationDefault => Err(Error::config(
                 "Use with_auth_async() for Application Default Credentials",
             )),
         }
@@ -110,17 +110,17 @@ impl AnthropicProvider {
         project_id: String,
         location: String,
         model_id: String,
-        auth: AnthropicAuth,
+        auth: AnthropicViaVertexAuth,
     ) -> Result<Self, Error> {
         let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
 
         let auth_manager = match &auth {
-            AnthropicAuth::ApplicationDefault => {
+            AnthropicViaVertexAuth::ApplicationDefault => {
                 Some(AuthenticationManager::new().await.map_err(|e| {
                     Error::provider("Anthropic", format!("Failed to create auth manager: {e}"))
                 })?)
             }
-            AnthropicAuth::AccessToken(_) => None,
+            AnthropicViaVertexAuth::AccessToken(_) => None,
         };
 
         Ok(Self {
@@ -294,7 +294,7 @@ impl AnthropicProvider {
 }
 
 #[async_trait::async_trait]
-impl LLMProvider for AnthropicProvider {
+impl LLMProvider for AnthropicViaVertexProvider {
     async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
         let anthropic_request = self.convert_request(request)?;
 
@@ -308,10 +308,10 @@ impl LLMProvider for AnthropicProvider {
 
         // Add authentication based on the method
         request_builder = match &self.auth {
-            AnthropicAuth::AccessToken(token) => {
+            AnthropicViaVertexAuth::AccessToken(token) => {
                 request_builder.header("Authorization", format!("Bearer {token}"))
             }
-            AnthropicAuth::ApplicationDefault => {
+            AnthropicViaVertexAuth::ApplicationDefault => {
                 let auth_manager = self.auth_manager.as_ref().ok_or_else(|| {
                     Error::provider("Anthropic", "Auth manager not initialized for ADC")
                 })?;
@@ -403,7 +403,7 @@ struct InProgressFunctionCall {
     has_initial_input: bool, // Whether we started with complete input
 }
 
-impl AnthropicProvider {
+impl AnthropicViaVertexProvider {
     /// Convert stream event with state tracking for function calls.
     fn convert_stream_event_stateful(
         event: AnthropicStreamEvent,
@@ -578,7 +578,7 @@ mod tests {
             match serde_json::from_str::<AnthropicStreamEvent>(data) {
                 Ok(stream_event) => {
                     let mut state = StreamState::default();
-                    match AnthropicProvider::convert_stream_event_stateful(stream_event, &mut state)
+                    match AnthropicViaVertexProvider::convert_stream_event_stateful(stream_event, &mut state)
                     {
                         Ok(stream_events) => {
                             events.extend(stream_events);

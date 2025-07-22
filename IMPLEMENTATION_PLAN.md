@@ -182,7 +182,7 @@ This implementation plan follows an incremental approach, building core function
 - [ ] Add Gemini-specific tests
 
 #### 6.3 Anthropic Provider
-- [ ] Implement `AnthropicVertexProvider`
+- [ ] Implement `AnthropicViaVertexProvider`
 - [ ] Add Anthropic via Vertex integration
 - [ ] Map Anthropic responses to common format
 - [ ] Add Anthropic-specific tests
