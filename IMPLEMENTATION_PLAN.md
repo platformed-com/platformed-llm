@@ -293,7 +293,7 @@ struct PartialFunctionCall {
 impl From<PartialFunctionCall> for FunctionCall {
     fn from(partial: PartialFunctionCall) -> Self {
         FunctionCall {
-            id: partial.id,
+            call_id: partial.id,
             name: partial.name,
             arguments: partial.arguments,
         }
@@ -326,7 +326,7 @@ pub enum Content {
 // types/function.rs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
-    pub id: String,
+    pub call_id: String,
     pub name: String,
     pub arguments: String, // JSON string
 }

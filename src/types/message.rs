@@ -188,18 +188,10 @@ pub struct Function {
 
 /// Function call information.
 ///
-/// ## ID Scheme
-/// - `id`: Unique identifier for the function call item itself (e.g., "fc_123")
-/// - `call_id`: Reference ID used when providing function call outputs (e.g., "call_123")
-///
-/// The `call_id` is what should be used in `FunctionCallOutput` to reference this specific call.
-/// Different providers handle this differently:
-/// - OpenAI: Uses separate IDs (fc_* for id, call_* for call_id)
-/// - Google: Uses consistent UUID base for both to ensure they can be matched
-/// - Anthropic: Uses the same ID for both since their API uses a single identifier
+/// The `call_id` is used when providing function call outputs back to the model.
+/// Different providers handle IDs differently internally, but this is abstracted away.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionCall {
-    pub id: String,
     pub call_id: String, // The call_id used for function results
     pub name: String,
     pub arguments: String, // JSON string

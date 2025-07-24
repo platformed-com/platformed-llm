@@ -164,7 +164,7 @@ impl AnthropicViaVertexProvider {
                 InputItem::FunctionCall(call) => {
                     // Add tool use to the last assistant response or create a new one
                     let tool_use_block = AnthropicContentBlock::ToolUse {
-                        id: call.id.clone(),
+                        id: call.call_id.clone(),
                         name: call.name.clone(),
                         input: serde_json::from_str(&call.arguments).map_err(|e| {
                             Error::provider("Anthropic", format!("Invalid function arguments: {e}"))
@@ -501,8 +501,7 @@ impl AnthropicViaVertexProvider {
                 // Content block finished - emit FunctionCallComplete if this was a function call
                 if let Some(in_progress) = state.in_progress_calls.remove(&index) {
                     let function_call = FunctionCall {
-                        id: in_progress.id.clone(),
-                        call_id: in_progress.id, // Use the same ID for both
+                        call_id: in_progress.id, // Use the same ID
                         name: in_progress.name,
                         arguments: in_progress.input_buffer,
                     };

@@ -507,7 +507,6 @@ impl GoogleProvider {
 
                         // Convert function call
                         let function_call_obj = FunctionCall {
-                            id: fc_id,
                             call_id,
                             name: function_call.name.clone(),
                             arguments: serde_json::to_string(&function_call.args).map_err(|e| {

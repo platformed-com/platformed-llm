@@ -106,7 +106,7 @@ async fn run_function_calling_test<T: ProviderTestSetup>() -> Result<(), Box<dyn
     // For OpenAI, verify specific call ID
     if config.name == "OpenAI" {
         assert_eq!(
-            weather_call.id, "call_abc123def456",
+            weather_call.call_id, "call_abc123def456",
             "OpenAI: Function call ID should match fixture"
         );
     }

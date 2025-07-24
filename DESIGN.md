@@ -883,7 +883,7 @@ pub struct ToolCall {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
-    pub id: String,
+    pub call_id: String,
     pub name: String,
     pub arguments: String, // JSON string
 }
@@ -1477,7 +1477,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 
                 // Store function call for later execution
                 function_calls.push(FunctionCall {
-                    id: id.clone(),
+                    call_id: id.clone(),
                     name: name.clone(),
                     arguments: arguments.clone(),
                 });

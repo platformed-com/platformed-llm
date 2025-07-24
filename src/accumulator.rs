@@ -162,7 +162,6 @@ mod tests {
         // Complete the function call
         let func_complete = StreamEvent::FunctionCallComplete {
             call: FunctionCall {
-                id: "fc_123".to_string(),
                 call_id: "call_123".to_string(),
                 name: "test_func".to_string(),
                 arguments: "{}".to_string(),
@@ -212,7 +211,6 @@ mod tests {
         // Complete function call
         let complete_event = StreamEvent::FunctionCallComplete {
             call: FunctionCall {
-                id: "fc_123".to_string(),
                 call_id: "call_123".to_string(),
                 name: "get_weather".to_string(),
                 arguments: "{\"location\": \"Paris\"}".to_string(),

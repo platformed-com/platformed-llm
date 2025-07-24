@@ -44,7 +44,6 @@ fn test_prompt_builder() {
     let input_items = vec![
         InputItem::Message(Message::assistant("First assistant message")),
         InputItem::FunctionCall(FunctionCall {
-            id: "fc_123".to_string(),
             call_id: "call_123".to_string(),
             name: "test_function".to_string(),
             arguments: "{}".to_string(),

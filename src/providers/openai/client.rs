@@ -84,7 +84,6 @@ impl OpenAIProvider {
                 }
             }
             crate::types::InputItem::FunctionCall(call) => OpenAIInputMessage::FunctionCall {
-                id: call.id.clone(),
                 call_id: call.call_id.clone(),
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
@@ -154,8 +153,7 @@ impl OpenAIProvider {
                     if item.r#type == "function_call" {
                         if let (Some(name), Some(arguments)) = (item.name, item.arguments) {
                             let call = crate::types::FunctionCall {
-                                id: item.id,                               // Use the actual ID (starts with "fc_")
-                                call_id: item.call_id.unwrap_or_default(), // Use call_id for function results
+                                call_id: item.call_id.unwrap_or(item.id), // Use call_id if available, otherwise use id
                                 name,
                                 arguments,
                             };

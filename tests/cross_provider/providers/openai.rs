@@ -83,7 +83,6 @@ impl ProviderTestSetup for OpenAITestSetup {
                 },
                 {
                     "type": "function_call",
-                    "id": "call_abc123def456",
                     "call_id": "call_abc123def456",
                     "name": "get_weather",
                     "arguments": "{\"location\": \"Paris\"}"

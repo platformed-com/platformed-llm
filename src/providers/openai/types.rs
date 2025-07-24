@@ -14,7 +14,6 @@ pub enum OpenAIInputMessage {
     /// Function call message (when sending previous function calls back)
     #[serde(rename = "function_call")]
     FunctionCall {
-        id: String,
         call_id: String,
         name: String,
         arguments: String,

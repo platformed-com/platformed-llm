@@ -188,7 +188,6 @@ mod tests {
                 },
                 OutputItem::FunctionCall {
                     call: FunctionCall {
-                        id: "fc_123".to_string(),
                         call_id: "call_123".to_string(),
                         name: "get_weather".to_string(),
                         arguments: "{\"location\":\"Paris\"}".to_string(),
@@ -262,7 +261,6 @@ mod tests {
                 },
                 OutputItem::FunctionCall {
                     call: FunctionCall {
-                        id: "fc_123".to_string(),
                         call_id: "call_123".to_string(),
                         name: "get_weather".to_string(),
                         arguments: "{\"location\":\"Paris\"}".to_string(),
@@ -306,7 +304,6 @@ mod tests {
                 },
                 OutputItem::FunctionCall {
                     call: FunctionCall {
-                        id: "fc_123".to_string(),
                         call_id: "call_123".to_string(),
                         name: "get_weather".to_string(),
                         arguments: "{\"location\":\"Paris\"}".to_string(),
