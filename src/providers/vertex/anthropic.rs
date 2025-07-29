@@ -23,7 +23,6 @@ pub struct AnthropicViaVertexProvider {
     client: Client,
     project_id: String,
     location: String,
-    model_id: String,
     auth: AnthropicViaVertexAuth,
     auth_manager: Option<AuthenticationManager>,
     base_url: Option<String>,
@@ -31,16 +30,10 @@ pub struct AnthropicViaVertexProvider {
 
 impl AnthropicViaVertexProvider {
     /// Create a new Anthropic provider with access token authentication.
-    pub fn new(
-        project_id: String,
-        location: String,
-        model_id: String,
-        access_token: String,
-    ) -> Result<Self, Error> {
+    pub fn new(project_id: String, location: String, access_token: String) -> Result<Self, Error> {
         Self::with_auth(
             project_id,
             location,
-            model_id,
             AnthropicViaVertexAuth::AccessToken(access_token),
         )
     }
@@ -49,14 +42,12 @@ impl AnthropicViaVertexProvider {
     pub fn new_with_base_url(
         project_id: String,
         location: String,
-        model_id: String,
         access_token: String,
         base_url: String,
     ) -> Result<Self, Error> {
         let mut provider = Self::with_auth(
             project_id,
             location,
-            model_id,
             AnthropicViaVertexAuth::AccessToken(access_token),
         )?;
         provider.base_url = Some(base_url);
@@ -64,15 +55,10 @@ impl AnthropicViaVertexProvider {
     }
 
     /// Create a new Anthropic provider with Application Default Credentials.
-    pub async fn with_adc(
-        project_id: String,
-        location: String,
-        model_id: String,
-    ) -> Result<Self, Error> {
+    pub async fn with_adc(project_id: String, location: String) -> Result<Self, Error> {
         Self::with_auth_async(
             project_id,
             location,
-            model_id,
             AnthropicViaVertexAuth::ApplicationDefault,
         )
         .await
@@ -82,7 +68,6 @@ impl AnthropicViaVertexProvider {
     pub fn with_auth(
         project_id: String,
         location: String,
-        model_id: String,
         auth: AnthropicViaVertexAuth,
     ) -> Result<Self, Error> {
         match auth {
@@ -93,7 +78,6 @@ impl AnthropicViaVertexProvider {
                     client,
                     project_id,
                     location,
-                    model_id,
                     auth,
                     auth_manager: None,
                     base_url: None,
@@ -109,7 +93,6 @@ impl AnthropicViaVertexProvider {
     pub async fn with_auth_async(
         project_id: String,
         location: String,
-        model_id: String,
         auth: AnthropicViaVertexAuth,
     ) -> Result<Self, Error> {
         let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
@@ -127,7 +110,6 @@ impl AnthropicViaVertexProvider {
             client,
             project_id,
             location,
-            model_id,
             auth,
             auth_manager,
             base_url: None,
@@ -264,7 +246,7 @@ impl AnthropicViaVertexProvider {
     }
 
     /// Get the API endpoint for the Anthropic model.
-    fn get_endpoint(&self, stream: bool) -> String {
+    fn get_endpoint(&self, stream: bool, model: &str) -> String {
         let method = if stream {
             "streamRawPredict"
         } else {
@@ -279,7 +261,7 @@ impl AnthropicViaVertexProvider {
                 base_url.trim_end_matches('/'),
                 self.project_id,
                 self.location,
-                self.model_id,
+                model,
                 method,
                 sse_param
             )
@@ -287,7 +269,7 @@ impl AnthropicViaVertexProvider {
             // Use default Vertex AI endpoint
             format!(
                 "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:{}{}",
-                self.location, self.project_id, self.location, self.model_id, method, sse_param
+                self.location, self.project_id, self.location, model, method, sse_param
             )
         }
     }
@@ -298,7 +280,7 @@ impl LLMProvider for AnthropicViaVertexProvider {
     async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
         let anthropic_request = self.convert_request(request)?;
 
-        let endpoint = self.get_endpoint(true);
+        let endpoint = self.get_endpoint(true, &request.model);
 
         let mut request_builder = self
             .client
@@ -577,8 +559,10 @@ mod tests {
             match serde_json::from_str::<AnthropicStreamEvent>(data) {
                 Ok(stream_event) => {
                     let mut state = StreamState::default();
-                    match AnthropicViaVertexProvider::convert_stream_event_stateful(stream_event, &mut state)
-                    {
+                    match AnthropicViaVertexProvider::convert_stream_event_stateful(
+                        stream_event,
+                        &mut state,
+                    ) {
                         Ok(stream_events) => {
                             events.extend(stream_events);
                         }

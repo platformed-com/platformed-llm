@@ -28,7 +28,6 @@ impl ProviderTestSetup for GoogleTestSetup {
         let provider = GoogleProvider::new_with_base_url(
             "test-project".to_string(),
             "europe-west1".to_string(),
-            "gemini-1.5-pro".to_string(),
             "test-access-token".to_string(),
             base_url.to_string(),
         )

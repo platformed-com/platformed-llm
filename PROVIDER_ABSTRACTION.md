@@ -22,10 +22,10 @@ use platformed_llm::{LLMProvider, OpenAIProvider, GeminiProvider, LLMRequest, Pr
 let openai_provider = OpenAIProvider::new(api_key)?;
 
 // Gemini Provider with access token
-let gemini_provider = GeminiProvider::new(project_id, location, model_id, access_token)?;
+let gemini_provider = GeminiProvider::new(project_id, location, access_token)?;
 
 // Gemini Provider with Application Default Credentials
-let gemini_provider = GeminiProvider::with_adc(project_id, location, model_id).await?;
+let gemini_provider = GeminiProvider::with_adc(project_id, location).await?;
 
 // Both implement the same LLMProvider trait
 let request = LLMRequest::from_prompt("gpt-4o-mini", &Prompt::user("Hello"));

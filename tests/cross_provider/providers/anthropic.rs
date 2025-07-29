@@ -28,7 +28,6 @@ impl ProviderTestSetup for AnthropicTestSetup {
         let provider = AnthropicViaVertexProvider::new_with_base_url(
             "test-project".to_string(),
             "europe-west1".to_string(),
-            "claude-3-5-sonnet-v2@20241022".to_string(),
             "test-access-token".to_string(),
             base_url.to_string(),
         )

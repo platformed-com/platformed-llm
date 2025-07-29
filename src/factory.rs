@@ -24,7 +24,6 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     pub project_id: Option<String>,
     pub location: Option<String>,
-    pub model_id: Option<String>,
     pub access_token: Option<String>,
 }
 
@@ -36,29 +35,24 @@ impl ProviderConfig {
             api_key: Some(api_key),
             project_id: None,
             location: None,
-            model_id: None,
             access_token: None,
         }
     }
 
-
-
     /// Create configuration for any Vertex AI provider with access token.
-    /// 
+    ///
     /// # Arguments
     /// * `provider_type` - The provider type (Google or Anthropic)
     /// * `project_id` - GCP project ID
     /// * `location` - GCP region (e.g., "europe-west1", "us-east5")  
-    /// * `model_id` - Model ID (e.g., "gemini-1.5-pro", "claude-3-5-sonnet-v2@20241022")
     /// * `access_token` - Vertex AI access token
-    /// 
+    ///
     /// # Panics
     /// Panics if `provider_type` is not supported via Vertex AI.
     pub fn vertex(
         provider_type: ProviderType,
         project_id: String,
         location: String,
-        model_id: String,
         access_token: String,
     ) -> Self {
         if !provider_type.is_supported_via_vertex() {
@@ -66,49 +60,44 @@ impl ProviderConfig {
                 "{provider_type:?} is not a Vertex AI provider. Use ProviderConfig::openai() instead."
             );
         }
-        
+
         Self {
             provider_type,
             api_key: None,
             project_id: Some(project_id),
             location: Some(location),
-            model_id: Some(model_id),
             access_token: Some(access_token),
         }
     }
 
     /// Create configuration for any Vertex AI provider with Application Default Credentials.
-    /// 
+    ///
     /// # Arguments
     /// * `provider_type` - The provider type (Google or Anthropic)
     /// * `project_id` - GCP project ID
     /// * `location` - GCP region (e.g., "europe-west1", "us-east5")
-    /// * `model_id` - Model ID (e.g., "gemini-1.5-pro", "claude-3-5-sonnet-v2@20241022")
-    /// 
+    ///
     /// # Panics
     /// Panics if `provider_type` is not supported via Vertex AI.
     pub fn vertex_with_adc(
         provider_type: ProviderType,
         project_id: String,
         location: String,
-        model_id: String,
     ) -> Self {
         if !provider_type.is_supported_via_vertex() {
             panic!(
                 "{provider_type:?} is not a Vertex AI provider. Use ProviderConfig::openai() instead."
             );
         }
-        
+
         Self {
             provider_type,
             api_key: None,
             project_id: Some(project_id),
             location: Some(location),
-            model_id: Some(model_id),
             access_token: None,
         }
     }
-
 
     /// Create configuration from environment variables.
     pub fn from_env() -> Result<Self, Error> {
@@ -128,15 +117,12 @@ impl ProviderConfig {
                         .map_err(|_| Error::config("GOOGLE_CLOUD_PROJECT environment variable is required for Google provider"))?;
                     let location = env::var("GOOGLE_CLOUD_REGION")
                         .unwrap_or_else(|_| "europe-west1".to_string());
-                    let model_id =
-                        env::var("GOOGLE_MODEL").unwrap_or_else(|_| "gemini-1.5-pro".to_string());
 
                     if let Ok(access_token) = env::var("VERTEX_ACCESS_TOKEN") {
                         return Ok(Self::vertex(
                             ProviderType::Google,
                             project_id,
                             location,
-                            model_id,
                             access_token,
                         ));
                     } else {
@@ -144,7 +130,6 @@ impl ProviderConfig {
                             ProviderType::Google,
                             project_id,
                             location,
-                            model_id,
                         ));
                     }
                 }
@@ -153,15 +138,12 @@ impl ProviderConfig {
                         .map_err(|_| Error::config("GOOGLE_CLOUD_PROJECT environment variable is required for Anthropic provider"))?;
                     let location = env::var("GOOGLE_CLOUD_REGION")
                         .unwrap_or_else(|_| "europe-west1".to_string());
-                    let model_id = env::var("ANTHROPIC_MODEL")
-                        .unwrap_or_else(|_| "claude-3-5-sonnet-v2@20241022".to_string());
 
                     if let Ok(access_token) = env::var("VERTEX_ACCESS_TOKEN") {
                         return Ok(Self::vertex(
                             ProviderType::Anthropic,
                             project_id,
                             location,
-                            model_id,
                             access_token,
                         ));
                     } else {
@@ -169,7 +151,6 @@ impl ProviderConfig {
                             ProviderType::Anthropic,
                             project_id,
                             location,
-                            model_id,
                         ));
                     }
                 }
@@ -194,14 +175,11 @@ impl ProviderConfig {
             })?;
             let location =
                 env::var("GOOGLE_CLOUD_REGION").unwrap_or_else(|_| "europe-west1".to_string());
-            let model_id =
-                env::var("GOOGLE_MODEL").unwrap_or_else(|_| "gemini-1.5-pro".to_string());
 
             return Ok(Self::vertex(
                 ProviderType::Google,
                 project_id,
                 location,
-                model_id,
                 access_token,
             ));
         }
@@ -213,14 +191,11 @@ impl ProviderConfig {
             })?;
             let location =
                 env::var("GOOGLE_CLOUD_REGION").unwrap_or_else(|_| "europe-west1".to_string());
-            let model_id = env::var("ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| "claude-3-5-sonnet-v2@20241022".to_string());
 
             return Ok(Self::vertex(
                 ProviderType::Anthropic,
                 project_id,
                 location,
-                model_id,
                 access_token,
             ));
         }
@@ -237,22 +212,16 @@ impl ProviderConfig {
 
             // Check if this should be Anthropic instead of Google
             if env::var("ANTHROPIC_MODEL").is_ok() {
-                let model_id = env::var("ANTHROPIC_MODEL")
-                    .unwrap_or_else(|_| "claude-3-5-sonnet-v2@20241022".to_string());
                 return Ok(Self::vertex_with_adc(
                     ProviderType::Anthropic,
                     project_id,
                     location,
-                    model_id,
                 ));
             } else {
-                let model_id =
-                    env::var("GOOGLE_MODEL").unwrap_or_else(|_| "gemini-1.5-pro".to_string());
                 return Ok(Self::vertex_with_adc(
                     ProviderType::Google,
                     project_id,
                     location,
-                    model_id,
                 ));
             }
         }
@@ -285,22 +254,12 @@ impl ProviderFactory {
                     .location
                     .as_ref()
                     .ok_or_else(|| Error::config("Location required for Google provider"))?;
-                let model_id = config
-                    .model_id
-                    .as_ref()
-                    .ok_or_else(|| Error::config("Model ID required for Google provider"))?;
                 // Determine authentication method
                 let provider = if let Some(access_token) = &config.access_token {
-                    GoogleProvider::new(
-                        project_id.clone(),
-                        location.clone(),
-                        model_id.clone(),
-                        access_token.clone(),
-                    )?
+                    GoogleProvider::new(project_id.clone(), location.clone(), access_token.clone())?
                 } else {
                     // Use Application Default Credentials
-                    GoogleProvider::with_adc(project_id.clone(), location.clone(), model_id.clone())
-                        .await?
+                    GoogleProvider::with_adc(project_id.clone(), location.clone()).await?
                 };
                 Ok(Box::new(provider))
             }
@@ -313,26 +272,17 @@ impl ProviderFactory {
                     .location
                     .as_ref()
                     .ok_or_else(|| Error::config("Location required for Anthropic provider"))?;
-                let model_id = config
-                    .model_id
-                    .as_ref()
-                    .ok_or_else(|| Error::config("Model ID required for Anthropic provider"))?;
                 // Determine authentication method
                 let provider = if let Some(access_token) = &config.access_token {
                     AnthropicViaVertexProvider::new(
                         project_id.clone(),
                         location.clone(),
-                        model_id.clone(),
                         access_token.clone(),
                     )?
                 } else {
                     // Use Application Default Credentials
-                    AnthropicViaVertexProvider::with_adc(
-                        project_id.clone(),
-                        location.clone(),
-                        model_id.clone(),
-                    )
-                    .await?
+                    AnthropicViaVertexProvider::with_adc(project_id.clone(), location.clone())
+                        .await?
                 };
                 Ok(Box::new(provider))
             }
@@ -350,7 +300,6 @@ impl ProviderFactory {
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_vertex_with_explicit_provider_types() {
         // Test direct vertex() method with Google
@@ -358,7 +307,6 @@ mod tests {
             ProviderType::Google,
             "test-project".to_string(),
             "europe-west1".to_string(),
-            "gemini-1.5-pro".to_string(),
             "test-token".to_string(),
         );
         assert!(matches!(google_config.provider_type, ProviderType::Google));
@@ -368,10 +316,12 @@ mod tests {
             ProviderType::Anthropic,
             "test-project".to_string(),
             "us-east5".to_string(),
-            "claude-3-5-sonnet-v2@20241022".to_string(),
             "test-token".to_string(),
         );
-        assert!(matches!(anthropic_config.provider_type, ProviderType::Anthropic));
+        assert!(matches!(
+            anthropic_config.provider_type,
+            ProviderType::Anthropic
+        ));
     }
 
     #[test]
@@ -382,7 +332,6 @@ mod tests {
             ProviderType::OpenAI,
             "test-project".to_string(),
             "us-east1".to_string(),
-            "gpt-4".to_string(),
             "test-token".to_string(),
         );
     }
@@ -395,7 +344,6 @@ mod tests {
             ProviderType::OpenAI,
             "test-project".to_string(),
             "us-east1".to_string(),
-            "gpt-4".to_string(),
         );
     }
 
@@ -407,7 +355,6 @@ mod tests {
         assert_eq!(config.api_key, Some("test-api-key".to_string()));
         assert_eq!(config.project_id, None);
         assert_eq!(config.location, None);
-        assert_eq!(config.model_id, None);
         assert_eq!(config.access_token, None);
     }
 

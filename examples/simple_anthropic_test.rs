@@ -25,12 +25,7 @@ async fn main() -> Result<(), Error> {
     );
 
     // Create provider directly
-    let provider = AnthropicViaVertexProvider::new(
-        project_id,
-        location,
-        "claude-3-5-sonnet-v2@20241022".to_string(),
-        access_token,
-    )?;
+    let provider = AnthropicViaVertexProvider::new(project_id, location, access_token)?;
 
     println!("✅ Anthropic provider created");
 

@@ -24,7 +24,6 @@ pub struct GoogleProvider {
     client: Client,
     project_id: String,
     location: String,
-    model_id: String,
     auth: GoogleAuth,
     auth_manager: Option<AuthenticationManager>,
     base_url: Option<String>,
@@ -32,58 +31,32 @@ pub struct GoogleProvider {
 
 impl GoogleProvider {
     /// Create a new Google provider with access token authentication.
-    pub fn new(
-        project_id: String,
-        location: String,
-        model_id: String,
-        access_token: String,
-    ) -> Result<Self, Error> {
-        Self::with_auth(
-            project_id,
-            location,
-            model_id,
-            GoogleAuth::AccessToken(access_token),
-        )
+    pub fn new(project_id: String, location: String, access_token: String) -> Result<Self, Error> {
+        Self::with_auth(project_id, location, GoogleAuth::AccessToken(access_token))
     }
 
     /// Create a new Google provider with custom base URL (for testing).
     pub fn new_with_base_url(
         project_id: String,
         location: String,
-        model_id: String,
         access_token: String,
         base_url: String,
     ) -> Result<Self, Error> {
-        let mut provider = Self::with_auth(
-            project_id,
-            location,
-            model_id,
-            GoogleAuth::AccessToken(access_token),
-        )?;
+        let mut provider =
+            Self::with_auth(project_id, location, GoogleAuth::AccessToken(access_token))?;
         provider.base_url = Some(base_url);
         Ok(provider)
     }
 
     /// Create a new Google provider with Application Default Credentials.
-    pub async fn with_adc(
-        project_id: String,
-        location: String,
-        model_id: String,
-    ) -> Result<Self, Error> {
-        Self::with_auth_async(
-            project_id,
-            location,
-            model_id,
-            GoogleAuth::ApplicationDefault,
-        )
-        .await
+    pub async fn with_adc(project_id: String, location: String) -> Result<Self, Error> {
+        Self::with_auth_async(project_id, location, GoogleAuth::ApplicationDefault).await
     }
 
     /// Create a new Google provider with specific authentication method (sync for access tokens).
     pub fn with_auth(
         project_id: String,
         location: String,
-        model_id: String,
         auth: GoogleAuth,
     ) -> Result<Self, Error> {
         match auth {
@@ -94,7 +67,6 @@ impl GoogleProvider {
                     client,
                     project_id,
                     location,
-                    model_id,
                     auth,
                     auth_manager: None,
                     base_url: None,
@@ -110,7 +82,6 @@ impl GoogleProvider {
     pub async fn with_auth_async(
         project_id: String,
         location: String,
-        model_id: String,
         auth: GoogleAuth,
     ) -> Result<Self, Error> {
         let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
@@ -128,7 +99,6 @@ impl GoogleProvider {
             client,
             project_id,
             location,
-            model_id,
             auth,
             auth_manager,
             base_url: None,
@@ -328,7 +298,7 @@ impl GoogleProvider {
     }
 
     /// Get the API endpoint for the Google model.
-    fn get_endpoint(&self, stream: bool) -> String {
+    fn get_endpoint(&self, stream: bool, model: &str) -> String {
         let method = if stream {
             "streamGenerateContent"
         } else {
@@ -343,7 +313,7 @@ impl GoogleProvider {
                 base_url.trim_end_matches('/'),
                 self.project_id,
                 self.location,
-                self.model_id,
+                model,
                 method,
                 sse_param
             )
@@ -351,7 +321,7 @@ impl GoogleProvider {
             // Use default Vertex AI endpoint
             format!(
                 "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:{}{}",
-                self.location, self.project_id, self.location, self.model_id, method, sse_param
+                self.location, self.project_id, self.location, model, method, sse_param
             )
         }
     }
@@ -362,7 +332,7 @@ impl LLMProvider for GoogleProvider {
     async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
         let google_request = self.convert_request(request)?;
 
-        let endpoint = self.get_endpoint(true);
+        let endpoint = self.get_endpoint(true, &request.model);
 
         let mut request_builder = self
             .client
