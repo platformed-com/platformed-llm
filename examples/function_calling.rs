@@ -1,9 +1,9 @@
 use futures_util::StreamExt;
+use ijson::IValue;
 use platformed_llm::{
     Error, Function, InputItem, LLMRequest, Prompt, ProviderFactory, ResponseAccumulator,
     StreamEvent, Tool, ToolType,
 };
-use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -68,7 +68,8 @@ async fn main() -> Result<(), Error> {
         function: Function {
             name: "get_weather".to_string(),
             description: "Get the current weather for a location".to_string(),
-            parameters: json!({
+            parameters: serde_json::from_str(
+                r#"{
                 "type": "object",
                 "properties": {
                     "location": {
@@ -82,7 +83,9 @@ async fn main() -> Result<(), Error> {
                     }
                 },
                 "required": ["location"]
-            }),
+            })"#,
+            )
+            .unwrap(),
         },
     };
 
@@ -91,7 +94,8 @@ async fn main() -> Result<(), Error> {
         function: Function {
             name: "calculate".to_string(),
             description: "Perform mathematical calculations".to_string(),
-            parameters: json!({
+            parameters: serde_json::from_str(
+                r#"{
                 "type": "object",
                 "properties": {
                     "expression": {
@@ -100,7 +104,9 @@ async fn main() -> Result<(), Error> {
                     }
                 },
                 "required": ["expression"]
-            }),
+            }"#,
+            )
+            .unwrap(),
         },
     };
 
@@ -250,8 +256,11 @@ async fn main() -> Result<(), Error> {
             let result = match call.name.as_str() {
                 "get_weather" => {
                     // Parse the location from arguments
-                    let args: serde_json::Value = serde_json::from_str(&call.arguments)?;
-                    let location = args["location"].as_str().unwrap_or("Unknown");
+                    let args: IValue = serde_json::from_str(&call.arguments)?;
+                    let location = args["location"]
+                        .as_string()
+                        .map(|s| &**s)
+                        .unwrap_or("Unknown");
 
                     println!("🌤️ Calling weather API for {location}...");
 
@@ -277,8 +286,8 @@ async fn main() -> Result<(), Error> {
                 }
                 "calculate" => {
                     // Parse the expression from arguments
-                    let args: serde_json::Value = serde_json::from_str(&call.arguments)?;
-                    let expression = args["expression"].as_str().unwrap_or("0");
+                    let args: IValue = serde_json::from_str(&call.arguments)?;
+                    let expression = args["expression"].as_string().map(|s| &**s).unwrap_or("0");
 
                     println!("🧮 Calculating '{expression}'...");
 

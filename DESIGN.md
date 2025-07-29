@@ -871,7 +871,7 @@ pub enum ToolType {
 pub struct Function {
     pub name: String,
     pub description: String,
-    pub parameters: serde_json::Value, // JSON Schema
+    pub parameters: serde_json::RawValue, // JSON Schema
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

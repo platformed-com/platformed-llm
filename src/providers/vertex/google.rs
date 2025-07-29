@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
 use gcp_auth::AuthenticationManager;
+use ijson::ijson;
 use reqwest::Client;
 use std::time::Duration;
 use uuid::Uuid;
@@ -215,7 +216,7 @@ impl GoogleProvider {
                             last_content.parts.push(GooglePart::FunctionResponse {
                                 function_response: GoogleFunctionResponse {
                                     name: function_name,
-                                    response: serde_json::json!({ "result": output }),
+                                    response: ijson!({ "result": output }),
                                 },
                             });
                         }
@@ -226,7 +227,7 @@ impl GoogleProvider {
                             parts: vec![GooglePart::FunctionResponse {
                                 function_response: GoogleFunctionResponse {
                                     name: function_name,
-                                    response: serde_json::json!({ "result": output }),
+                                    response: ijson!({ "result": output }),
                                 },
                             }],
                         });

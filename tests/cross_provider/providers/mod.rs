@@ -3,7 +3,6 @@ pub mod google;
 pub mod openai;
 
 use platformed_llm::{Function, LLMProvider, Tool, ToolType};
-use serde_json::json;
 use std::pin::Pin;
 use wiremock::MockServer;
 
@@ -14,16 +13,19 @@ pub fn create_weather_tool() -> Tool {
         function: Function {
             name: "get_weather".to_string(),
             description: "Get the current weather for a location".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "The city and state, e.g. San Francisco, CA"
-                    }
-                },
-                "required": ["location"]
-            }),
+            parameters: serde_json::from_str(
+                r#"{
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "The city and state, e.g. San Francisco, CA"
+                        }
+                    },
+                    "required": ["location"]
+                }"#,
+            )
+            .unwrap(),
         },
     }
 }

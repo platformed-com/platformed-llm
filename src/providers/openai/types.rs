@@ -1,5 +1,9 @@
+use std::borrow::Cow;
+
 use crate::types::Usage;
+use ijson::IValue;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 /// OpenAI input message format for Responses API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,7 +30,7 @@ pub struct OpenAITool {
     pub r#type: String, // "function"
     pub name: String,
     pub description: String,
-    pub parameters: serde_json::Value,
+    pub parameters: Cow<'static, RawValue>,
 }
 
 /// OpenAI Responses API request.
@@ -101,7 +105,7 @@ pub struct ResponseContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<Vec<serde_json::Value>>,
+    pub annotations: Option<Vec<IValue>>,
     // For tool calls
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -143,7 +147,7 @@ pub struct ResponsesStreamEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub logprobs: Option<Vec<serde_json::Value>>,
+    pub logprobs: Option<Vec<IValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponsesResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]

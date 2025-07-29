@@ -1,4 +1,7 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 /// An input item in a conversation (mirrors OutputItem).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,7 +186,7 @@ pub enum ToolType {
 pub struct Function {
     pub name: String,
     pub description: String,
-    pub parameters: serde_json::Value, // JSON Schema
+    pub parameters: Cow<'static, RawValue>,
 }
 
 /// Function call information.

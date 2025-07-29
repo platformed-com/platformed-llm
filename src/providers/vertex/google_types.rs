@@ -1,5 +1,9 @@
+use std::borrow::Cow;
+
 use crate::types::Usage;
+use ijson::IValue;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 /// Google Vertex AI request format (for Gemini models).
 #[derive(Debug, Clone, Serialize)]
@@ -41,14 +45,14 @@ pub enum GooglePart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoogleFunctionCall {
     pub name: String,
-    pub args: serde_json::Value,
+    pub args: IValue,
 }
 
 /// Google function response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoogleFunctionResponse {
     pub name: String,
-    pub response: serde_json::Value,
+    pub response: IValue,
 }
 
 /// Google generation configuration.
@@ -73,7 +77,7 @@ pub struct GoogleTool {
 pub struct GoogleFunctionDeclaration {
     pub name: String,
     pub description: String,
-    pub parameters: serde_json::Value, // JSON Schema
+    pub parameters: Cow<'static, RawValue>,
 }
 
 /// Google API response.
@@ -94,7 +98,7 @@ pub struct GoogleCandidate {
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "safetyRatings")]
-    pub safety_ratings: Option<Vec<serde_json::Value>>,
+    pub safety_ratings: Option<Vec<IValue>>,
 }
 
 /// Google usage metadata.

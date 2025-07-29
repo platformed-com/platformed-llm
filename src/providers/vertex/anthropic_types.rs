@@ -1,5 +1,9 @@
+use std::borrow::Cow;
+
 use crate::types::Usage;
+use ijson::IValue;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 /// Anthropic Claude request format via Vertex AI.
 #[derive(Debug, Clone, Serialize)]
@@ -44,7 +48,7 @@ pub enum AnthropicContentBlock {
     ToolUse {
         id: String,
         name: String,
-        input: serde_json::Value,
+        input: IValue,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -58,7 +62,7 @@ pub enum AnthropicContentBlock {
 pub struct AnthropicTool {
     pub name: String,
     pub description: String,
-    pub input_schema: serde_json::Value,
+    pub input_schema: Cow<'static, RawValue>,
 }
 
 /// Anthropic API response.
