@@ -2,7 +2,7 @@ use platformed_llm::{Error, ProviderConfig, ProviderType};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     println!("🔍 Vertex Unified API Example");
     println!("Demonstrating the new unified vertex() constructors\n");

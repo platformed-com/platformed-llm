@@ -28,11 +28,8 @@ ijson = "0.1"
 # Error handling
 thiserror = "2.0"
 
-# Environment variables
-dotenv = "0.15"
-
 # Google Cloud authentication
-gcp_auth = "0.10"
+gcp_auth = "0.12"
 
 # UUID generation
 uuid = { version = "1.0", features = ["v4"] }
@@ -40,6 +37,7 @@ uuid = { version = "1.0", features = ["v4"] }
 [dev-dependencies]
 tokio-test = "0.4"
 wiremock = "0.6"
+dotenvy = "0.15"
 
 [features]
 default = []

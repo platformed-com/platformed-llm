@@ -4,7 +4,7 @@ use platformed_llm::{Error, LLMProvider, LLMRequest, Prompt, ResponseAccumulator
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     println!("🔍 Simple Anthropic Test");
 

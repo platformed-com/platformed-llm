@@ -1,7 +1,8 @@
 use futures_util::StreamExt;
-use gcp_auth::AuthenticationManager;
+use gcp_auth::TokenProvider;
 use ijson::ijson;
 use reqwest::Client;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -26,7 +27,7 @@ pub struct GoogleProvider {
     project_id: String,
     location: String,
     auth: GoogleAuth,
-    auth_manager: Option<AuthenticationManager>,
+    auth_manager: Option<Arc<dyn TokenProvider>>,
     base_url: Option<String>,
 }
 
@@ -88,11 +89,9 @@ impl GoogleProvider {
         let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
 
         let auth_manager = match &auth {
-            GoogleAuth::ApplicationDefault => {
-                Some(AuthenticationManager::new().await.map_err(|e| {
-                    Error::provider("Google", format!("Failed to create auth manager: {e}"))
-                })?)
-            }
+            GoogleAuth::ApplicationDefault => Some(gcp_auth::provider().await.map_err(|e| {
+                Error::provider("Google", format!("Failed to create auth manager: {e}"))
+            })?),
             GoogleAuth::AccessToken(_) => None,
         };
 
@@ -352,7 +351,7 @@ impl LLMProvider for GoogleProvider {
                 })?;
 
                 let token = auth_manager
-                    .get_token(&["https://www.googleapis.com/auth/cloud-platform"])
+                    .token(&["https://www.googleapis.com/auth/cloud-platform"])
                     .await
                     .map_err(|e| {
                         Error::provider("Google", format!("Failed to get ADC token: {e}"))

@@ -1,7 +1,9 @@
+use serde::Serialize;
+
 use super::message::InputItem;
 
 /// A structured prompt containing a sequence of input items.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Prompt {
     items: Vec<InputItem>,
 }

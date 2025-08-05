@@ -3,7 +3,7 @@ use platformed_llm::{Error, LLMRequest, Prompt, ProviderFactory, ResponseAccumul
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     println!("🔍 Debug Streaming");
 

@@ -8,7 +8,7 @@ use platformed_llm::{
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // Load environment variables
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     println!("🚀 Universal Function Calling Example");
     println!("📋 This example works with any configured LLM provider");

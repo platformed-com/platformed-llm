@@ -1,6 +1,7 @@
 use futures_util::StreamExt;
-use gcp_auth::AuthenticationManager;
+use gcp_auth::TokenProvider;
 use reqwest::Client;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::anthropic_types::*;
@@ -24,7 +25,7 @@ pub struct AnthropicViaVertexProvider {
     project_id: String,
     location: String,
     auth: AnthropicViaVertexAuth,
-    auth_manager: Option<AuthenticationManager>,
+    auth_manager: Option<Arc<dyn TokenProvider>>,
     base_url: Option<String>,
 }
 
@@ -99,7 +100,7 @@ impl AnthropicViaVertexProvider {
 
         let auth_manager = match &auth {
             AnthropicViaVertexAuth::ApplicationDefault => {
-                Some(AuthenticationManager::new().await.map_err(|e| {
+                Some(gcp_auth::provider().await.map_err(|e| {
                     Error::provider("Anthropic", format!("Failed to create auth manager: {e}"))
                 })?)
             }
@@ -299,7 +300,7 @@ impl LLMProvider for AnthropicViaVertexProvider {
                 })?;
 
                 let token = auth_manager
-                    .get_token(&["https://www.googleapis.com/auth/cloud-platform"])
+                    .token(&["https://www.googleapis.com/auth/cloud-platform"])
                     .await
                     .map_err(|e| {
                         Error::provider("Anthropic", format!("Failed to get ADC token: {e}"))
