@@ -12,7 +12,10 @@ tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = [
+    "json",
+    "stream",
+], default-features = false }
 bytes = "1.0"
 memchr = "2.7"
 
