@@ -917,6 +917,7 @@ dependencies = [
  "futures-util",
  "gcp_auth",
  "ijson",
+ "log",
  "memchr",
  "reqwest",
  "serde",

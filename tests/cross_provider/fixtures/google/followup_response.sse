@@ -2,5 +2,3 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Based on the w
 
 data: {"candidates":[{"content":{"role":"model","parts":[{"text":" with a temperature of 22°C (72°F). It's a beautiful day!"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":156,"candidatesTokenCount":45,"totalTokenCount":201}}
 
-data: [DONE]
-

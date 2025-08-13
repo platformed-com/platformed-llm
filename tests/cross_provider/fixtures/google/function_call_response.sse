@@ -2,6 +2,4 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":"I'll help you 
 
 data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"location":"Paris"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":50,"candidatesTokenCount":20,"totalTokenCount":70}}
 
-data: [DONE]
-
 

@@ -1,7 +1,8 @@
 use super::types::{ResponsesRequest, ResponsesStreamEvent};
 use crate::provider::LLMProvider;
 use crate::{Error, LLMRequest, Response, StreamEvent};
-use futures_util::StreamExt;
+use futures::TryStreamExt as _;
+use log::info;
 use reqwest::Client;
 use std::time::Duration;
 
@@ -112,13 +113,21 @@ impl OpenAIProvider {
             .collect()
     }
 
-    /// Convert an OpenAI streaming event to our StreamEvents (static version).
-    fn convert_stream_event_static(event: ResponsesStreamEvent) -> Result<Vec<StreamEvent>, Error> {
+    /// Convert an OpenAI streaming event to our StreamEvents
+    fn convert_stream_event(event: ResponsesStreamEvent) -> Result<Option<StreamEvent>, Error> {
         match event.r#type.as_str() {
+            "error" => {
+                let (type_, message) = if let Some(error) = &event.error {
+                    (error.r#type.as_str(), error.message.as_str())
+                } else {
+                    ("unknown", "Unknown error occurred")
+                };
+                return Err(Error::provider("OpenAI", format!("{type_}: {message}")));
+            }
             "response.output_text.delta" => {
                 if let Some(delta) = event.delta {
                     if !delta.is_empty() {
-                        return Ok(vec![StreamEvent::ContentDelta { delta }]);
+                        return Ok(Some(StreamEvent::ContentDelta { delta }));
                     }
                 }
             }
@@ -136,7 +145,7 @@ impl OpenAIProvider {
                         _ => crate::types::OutputItemInfo::Text,
                     };
 
-                    return Ok(vec![StreamEvent::OutputItemAdded { item: item_info }]);
+                    return Ok(Some(StreamEvent::OutputItemAdded { item: item_info }));
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -157,7 +166,7 @@ impl OpenAIProvider {
                                 name,
                                 arguments,
                             };
-                            return Ok(vec![StreamEvent::FunctionCallComplete { call }]);
+                            return Ok(Some(StreamEvent::FunctionCallComplete { call }));
                         }
                     }
                 }
@@ -173,10 +182,10 @@ impl OpenAIProvider {
                             crate::types::FinishReason::Stop
                         };
 
-                    return Ok(vec![StreamEvent::Done {
+                    return Ok(Some(StreamEvent::Done {
                         finish_reason,
-                        usage: response.usage,
-                    }]);
+                        usage: response.usage.unwrap_or_default(),
+                    }));
                 }
             }
             _ => {
@@ -184,7 +193,7 @@ impl OpenAIProvider {
             }
         }
 
-        Ok(vec![])
+        Ok(None)
     }
 }
 
@@ -194,6 +203,11 @@ impl LLMProvider for OpenAIProvider {
     async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
         let mut openai_request = self.convert_request(request);
         openai_request.stream = Some(true);
+
+        info!(
+            "🔄 Sending OpenAI request: {}",
+            serde_json::to_string_pretty(&openai_request).unwrap()
+        );
 
         let response = self
             .client
@@ -219,36 +233,11 @@ impl LLMProvider for OpenAIProvider {
         use crate::sse_stream::SseStreamExt;
         let event_stream = byte_stream
             .sse_events()
-            .filter_map(|sse_result| async move {
-                match sse_result {
-                    Ok(sse_event) => {
-                        if sse_event.data.trim() == "[DONE]" {
-                            // End of stream
-                            return None;
-                        }
-
-                        // Parse the JSON data as a ResponsesStreamEvent
-                        if let Ok(event) =
-                            serde_json::from_str::<ResponsesStreamEvent>(&sse_event.data)
-                        {
-                            match OpenAIProvider::convert_stream_event_static(event) {
-                                Ok(events) => Some(Ok(events)),
-                                Err(e) => Some(Err(e)),
-                            }
-                        } else {
-                            // Skip unparseable events (might be comments or other SSE data)
-                            None
-                        }
-                    }
-                    Err(e) => Some(Err(e)),
-                }
-            })
-            .map(|events_result| match events_result {
-                Ok(events) => events.into_iter().map(Ok).collect::<Vec<_>>(),
-                Err(e) => vec![Err(e)],
-            })
-            .map(|events| futures_util::stream::iter(events.into_iter()))
-            .flatten();
+            .try_filter_map(|sse_event| async move {
+                info!("🔄 Received SSE event: {sse_event:?}");
+                let stream_event = serde_json::from_str::<ResponsesStreamEvent>(&sse_event.data)?;
+                OpenAIProvider::convert_stream_event(stream_event)
+            });
 
         Ok(Response::from_stream(event_stream))
     }

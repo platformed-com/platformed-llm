@@ -69,8 +69,8 @@ pub struct ResponsesResponse {
     pub created_at: u64,
     pub status: String,
     pub model: String,
-    pub output: Vec<ResponseOutput>,
-    pub usage: Usage,
+    pub output: Vec<ResponseItem>,
+    pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,10 +80,11 @@ pub struct ResponsesResponse {
 /// Output item in a Responses API response.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)] // Will be used in non-streaming mode later
-pub struct ResponseOutput {
+pub struct ResponseItem {
     pub r#type: String, // "message" or "function_call"
     pub id: String,
-    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,29 +107,16 @@ pub struct ResponseContent {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Vec<IValue>>,
-    // For tool calls
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<String>,
-}
-
-/// OpenAI error response.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // For error handling and debugging
-pub struct OpenAIError {
-    pub error: ErrorDetails,
 }
 
 /// Error details from OpenAI API.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // For error handling and debugging
 pub struct ErrorDetails {
     pub message: String,
     pub r#type: String,
+    #[allow(unused)]
     pub param: Option<String>,
+    #[allow(unused)]
     pub code: Option<String>,
 }
 
@@ -154,21 +142,8 @@ pub struct ResponsesStreamEvent {
     pub item: Option<ResponseItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub part: Option<ResponseContent>,
-}
-
-/// Function call item in streaming response.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct ResponseItem {
-    pub id: String,
-    pub r#type: String, // "function_call"
-    pub status: String, // "in_progress", "completed"
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub error: Option<ErrorDetails>,
 }
 
 /// Tool call delta in a streaming response.

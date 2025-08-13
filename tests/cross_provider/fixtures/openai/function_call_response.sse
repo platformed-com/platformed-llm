@@ -4,8 +4,3 @@ data: {"type":"response.output_text.delta","delta":"I'll help you get the weathe
 
 data: {"type":"response.output_item.done","item":{"id":"call_abc123def456","type":"function_call","status":"completed","name":"get_weather","arguments":"{\"location\": \"Paris\"}","call_id":"call_abc123def456"}}
 
-data: [DONE]
-
-
-
-
