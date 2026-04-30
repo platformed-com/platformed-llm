@@ -15,13 +15,25 @@ pub struct OpenAIProvider {
 
 // Removed function call tracking structs - no longer needed since we handle complete calls only
 
+/// Connect timeout for the underlying HTTP client.
+///
+/// We deliberately do **not** set a total request timeout — streaming
+/// reasoning responses (gpt-5 / o-series) can legitimately run for many
+/// minutes, and a whole-request timeout aborts them mid-stream.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn build_client() -> Result<Client, Error> {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(Error::from)
+}
+
 impl OpenAIProvider {
     /// Create a new OpenAI provider.
     pub fn new(api_key: String) -> Result<Self, Error> {
-        let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
-
         Ok(Self {
-            client,
+            client: build_client()?,
             api_key,
             base_url: "https://api.openai.com/v1".to_string(),
         })
@@ -29,10 +41,8 @@ impl OpenAIProvider {
 
     /// Create a new OpenAI provider with custom base URL.
     pub fn new_with_base_url(api_key: String, base_url: String) -> Result<Self, Error> {
-        let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
-
         Ok(Self {
-            client,
+            client: build_client()?,
             api_key,
             base_url,
         })

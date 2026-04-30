@@ -226,7 +226,11 @@ impl LLMProvider for AnthropicViaVertexProvider {
                             return vec![];
                         }
 
-                        // Parse the SSE data as Anthropic stream event
+                        // Anthropic's wire format only emits JSON event
+                        // payloads (including `{"type":"ping"}` for keep-
+                        // alives). The SSE parser already filters comment
+                        // lines, so anything that fails to parse here is a
+                        // genuine surprise — surface it.
                         match serde_json::from_str::<AnthropicStreamEvent>(data) {
                             Ok(stream_event) => {
                                 match convert_stream_event_stateful(stream_event, &mut state) {
@@ -234,17 +238,10 @@ impl LLMProvider for AnthropicViaVertexProvider {
                                     Err(e) => vec![Err(e)],
                                 }
                             }
-                            Err(e) => {
-                                // Skip unparseable events (might be connection keep-alive or other data)
-                                if !data.starts_with('{') {
-                                    vec![]
-                                } else {
-                                    vec![Err(Error::provider(
-                                        "Anthropic",
-                                        format!("Failed to parse SSE event: {e}"),
-                                    ))]
-                                }
-                            }
+                            Err(e) => vec![Err(Error::provider(
+                                "Anthropic",
+                                format!("Failed to parse SSE event: {e}"),
+                            ))],
                         }
                     }
                     Err(e) => vec![Err(e)],

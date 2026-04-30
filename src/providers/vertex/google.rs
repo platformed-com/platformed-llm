@@ -254,8 +254,11 @@ impl LLMProvider for GoogleProvider {
                     Ok(sse_event) => {
                         let data = sse_event.data.trim();
 
-                        // Skip [DONE] events and empty events
-                        if data == "[DONE]" || data.is_empty() {
+                        // Vertex's SSE channel terminates by stream close;
+                        // there is no `[DONE]` sentinel (that is an OpenAI
+                        // convention). Empty events do still occur for
+                        // keep-alives.
+                        if data.is_empty() {
                             return vec![];
                         }
 
