@@ -566,7 +566,7 @@ mod tests {
     }
 
     /// Each emitted function call must produce a paired `OutputItemAdded`
-    /// + `FunctionCallComplete` whose ids derive from the same base UUID.
+    /// and `FunctionCallComplete` whose ids derive from the same base UUID.
     /// The previous implementation deduped `OutputItemAdded` by name+args
     /// while regenerating the call_id on every chunk, so a repeated
     /// emission produced an orphan `FunctionCallComplete` with no

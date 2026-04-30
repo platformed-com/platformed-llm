@@ -14,8 +14,6 @@ pub struct OpenAIProvider {
     base_url: String,
 }
 
-// Removed function call tracking structs - no longer needed since we handle complete calls only
-
 /// Connect timeout for the underlying HTTP client.
 ///
 /// We deliberately do **not** set a total request timeout — streaming

@@ -161,25 +161,3 @@ pub struct ResponsesStreamEvent {
     pub error: Option<ErrorDetails>,
 }
 
-/// Tool call delta in a streaming response.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // Some fields used for metadata
-pub struct ToolCallDelta {
-    pub index: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function: Option<FunctionCallDelta>,
-}
-
-/// Function call delta in a streaming response.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // Used for completeness of API response structure
-pub struct FunctionCallDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<String>,
-}

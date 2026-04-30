@@ -2,30 +2,52 @@
 
 use crate::types::{FinishReason, FunctionCall, Usage};
 
-/// Events that can be emitted during streaming.
+/// Events emitted by [`crate::Response`] streams.
+///
+/// The expected ordering for a single response is:
+///
+/// 1. Zero or more output items, each announced by [`StreamEvent::OutputItemAdded`].
+///    - For [`OutputItemInfo::Text`], one or more [`StreamEvent::ContentDelta`]
+///      events follow with the next text chunks.
+///    - For [`OutputItemInfo::FunctionCall`], a single
+///      [`StreamEvent::FunctionCallComplete`] follows once the model has
+///      finished assembling the arguments JSON.
+/// 2. Exactly one terminal [`StreamEvent::Done`] event with the finish reason
+///    and final usage tally.
+///
+/// [`StreamEvent::Error`] terminates the stream out-of-band and must be
+/// treated as fatal for the current response.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    /// A chunk of content was received.
+    /// Incremental text appended to the most recent text output item.
     ContentDelta { delta: String },
-    /// A new output item was added (text or function call).
+    /// A new output item is starting. Subsequent `ContentDelta` /
+    /// `FunctionCallComplete` events apply to this item.
     OutputItemAdded { item: OutputItemInfo },
-    /// A function call has completed with full arguments.
+    /// A function call has completed. The `call_id` matches the one carried
+    /// in the corresponding `OutputItemAdded { item: FunctionCall { id } }`
+    /// for some providers (Anthropic) and shares a base UUID with it for
+    /// others (Gemini); for OpenAI the `id` and `call_id` are distinct
+    /// surfaces of the same call.
     FunctionCallComplete { call: FunctionCall },
-    /// The stream has finished.
+    /// The stream has finished. This is the last event.
     Done {
         finish_reason: FinishReason,
         usage: Usage,
     },
-    /// An error occurred during streaming.
+    /// A fatal streaming-level error. The stream will yield no further
+    /// events for this response.
     Error { error: String },
 }
 
 /// Information about an output item being added.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputItemInfo {
-    /// Text/message output item.
+    /// Text/message output item. Filled by subsequent `ContentDelta`
+    /// events.
     Text,
-    /// Function call output item with name and ID.
+    /// Function call output item. Followed by exactly one
+    /// `FunctionCallComplete` carrying the assembled arguments.
     FunctionCall { name: String, id: String },
 }
 
