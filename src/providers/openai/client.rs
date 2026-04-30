@@ -130,6 +130,61 @@ impl OpenAIProvider {
 
 }
 
+/// Map an OpenAI HTTP error response onto our [`Error`] variants.
+///
+/// OpenAI returns `{"error":{"message":..., "type":..., "code":...}}` on
+/// failure. We parse it best-effort and pick a typed variant from the
+/// HTTP status:
+///
+/// - 401 → [`Error::Auth`]
+/// - 429 → [`Error::RateLimit`] (carries `Retry-After` if present)
+/// - any other → [`Error::Provider`] with status, type, and message
+///
+/// The full body is preserved in the message so callers can still extract
+/// the unparsed structured fields if they need them.
+pub(crate) fn parse_openai_error(
+    status: u16,
+    retry_after_seconds: Option<u64>,
+    body: &str,
+) -> Error {
+    #[derive(serde::Deserialize)]
+    struct Outer<'a> {
+        #[serde(borrow)]
+        error: Option<Inner<'a>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Inner<'a> {
+        #[serde(default, borrow)]
+        message: Option<&'a str>,
+        #[serde(default, rename = "type", borrow)]
+        kind: Option<&'a str>,
+        #[serde(default, borrow)]
+        code: Option<&'a str>,
+    }
+    let parsed = serde_json::from_str::<Outer>(body)
+        .ok()
+        .and_then(|o| o.error);
+    let message = parsed
+        .as_ref()
+        .and_then(|e| e.message)
+        .unwrap_or(body)
+        .to_string();
+    let kind = parsed.as_ref().and_then(|e| e.kind).unwrap_or("");
+    let code = parsed.as_ref().and_then(|e| e.code).unwrap_or("");
+
+    match status {
+        401 => Error::auth(format!("OpenAI 401 ({kind} {code}): {message}")),
+        429 => Error::rate_limit(
+            retry_after_seconds,
+            format!("OpenAI 429 ({kind} {code}): {message}"),
+        ),
+        _ => Error::provider(
+            "OpenAI",
+            format!("HTTP {status} ({kind} {code}): {message}"),
+        ),
+    }
+}
+
 fn convert_tool_choice(choice: &ToolChoice) -> OpenAIToolChoice {
     match choice {
         ToolChoice::Auto => OpenAIToolChoice::Mode("auto"),
@@ -270,11 +325,14 @@ impl LLMProvider for OpenAIProvider {
             .await?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(Error::provider(
-                "OpenAI",
-                format!("API error: {error_text}"),
-            ));
+            let status = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            let body = response.text().await.unwrap_or_default();
+            return Err(parse_openai_error(status, retry_after, &body));
         }
 
         // Create a stream from the response bytes
@@ -307,6 +365,49 @@ mod tests {
 
     fn provider() -> OpenAIProvider {
         OpenAIProvider::new("k".to_string()).unwrap()
+    }
+
+    /// HTTP 429 with an OpenAI-shaped error body should produce
+    /// [`Error::RateLimit`] (not the generic [`Error::Provider`]) so
+    /// retry-aware callers can branch on it.
+    #[test]
+    fn http_429_maps_to_rate_limit() {
+        let body = r#"{"error":{"message":"Rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#;
+        let err = parse_openai_error(429, Some(30), body);
+        match err {
+            Error::RateLimit {
+                retry_after_seconds,
+                message,
+            } => {
+                assert_eq!(retry_after_seconds, Some(30));
+                assert!(message.contains("Rate limited"));
+                assert!(message.contains("rate_limit_error"));
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_401_maps_to_auth() {
+        let body =
+            r#"{"error":{"message":"Bad key","type":"invalid_request_error","code":"invalid_api_key"}}"#;
+        let err = parse_openai_error(401, None, body);
+        assert!(matches!(err, Error::Auth(_)), "got {err:?}");
+        assert!(format!("{err}").contains("Bad key"));
+    }
+
+    /// Non-JSON / non-conforming bodies still produce a useful error rather
+    /// than swallowing the status code.
+    #[test]
+    fn unparseable_error_body_still_carries_status_and_body() {
+        let err = parse_openai_error(500, None, "<html>500 Server Error</html>");
+        match &err {
+            Error::Provider { message, .. } => {
+                assert!(message.contains("500"));
+                assert!(message.contains("<html>"));
+            }
+            other => panic!("expected Provider, got {other:?}"),
+        }
     }
 
     fn request_with_tool_choice(choice: ToolChoice) -> LLMRequest {

@@ -21,8 +21,13 @@ pub enum Error {
     #[error("Streaming error: {0}")]
     Streaming(String),
 
-    #[error("Rate limit exceeded")]
-    RateLimit,
+    #[error("Rate limit exceeded: {message}")]
+    RateLimit {
+        /// Seconds to wait before retrying, parsed from the provider's
+        /// response (e.g. OpenAI's error body or the `Retry-After` header).
+        retry_after_seconds: Option<u64>,
+        message: String,
+    },
 
     #[error("Model not available: {0}")]
     ModelNotAvailable(String),
@@ -46,5 +51,12 @@ impl Error {
 
     pub fn streaming(message: impl Into<String>) -> Self {
         Error::Streaming(message.into())
+    }
+
+    pub fn rate_limit(retry_after_seconds: Option<u64>, message: impl Into<String>) -> Self {
+        Error::RateLimit {
+            retry_after_seconds,
+            message: message.into(),
+        }
     }
 }
