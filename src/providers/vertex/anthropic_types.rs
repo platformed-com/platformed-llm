@@ -55,6 +55,23 @@ pub enum AnthropicContentBlock {
         tool_use_id: String,
         content: String,
     },
+    /// Extended-thinking block. The model's chain-of-thought reasoning;
+    /// `signature` must be echoed back unchanged in subsequent turns to
+    /// preserve thinking continuity.
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// Encrypted thinking that's been classified as sensitive. Pass-through
+    /// only — opaque blob to be echoed back unchanged.
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
+    /// Image content block (request side).
+    #[serde(rename = "image")]
+    Image { source: IValue },
 }
 
 /// Anthropic tool definition.
@@ -123,6 +140,19 @@ pub enum AnthropicStreamEvent {
     MessageStop,
     #[serde(rename = "ping")]
     Ping,
+    /// Operational error delivered mid-stream (e.g. `overloaded_error`,
+    /// `api_error`). Surfaces as a stream `Err` rather than being parsed as
+    /// a "failed to parse SSE event".
+    #[serde(rename = "error")]
+    Error { error: AnthropicErrorPayload },
+}
+
+/// Payload of a mid-stream `event: error` frame.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnthropicErrorPayload {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub message: String,
 }
 
 /// Delta for content blocks.
@@ -133,6 +163,13 @@ pub enum AnthropicContentDelta {
     TextDelta { text: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
+    /// Incremental update to a `thinking` content block.
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta { thinking: String },
+    /// Signature appended to a `thinking` block at end-of-block. Required to
+    /// be echoed back unchanged in subsequent turns.
+    #[serde(rename = "signature_delta")]
+    SignatureDelta { signature: String },
 }
 
 /// Delta for message-level changes carried by a `message_delta` event.

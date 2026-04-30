@@ -390,6 +390,17 @@ pub(crate) fn convert_stream_event_stateful(
                 AnthropicContentBlock::ToolResult { .. } => {
                     // Tool results are handled in request construction, not in responses
                 }
+                AnthropicContentBlock::Thinking { .. }
+                | AnthropicContentBlock::RedactedThinking { .. } => {
+                    // Extended thinking blocks: surfacing them through the
+                    // unified API is Phase 3.3 territory. For now we just
+                    // parse without crashing so the rest of the response
+                    // streams normally.
+                }
+                AnthropicContentBlock::Image { .. } => {
+                    // Image blocks only appear on the request side in
+                    // practice; not expected here.
+                }
             }
         }
         AnthropicStreamEvent::ContentBlockDelta { delta, index } => match delta {
@@ -402,6 +413,11 @@ pub(crate) fn convert_stream_event_stateful(
                 if let Some(in_progress) = state.in_progress_calls.get_mut(&index) {
                     in_progress.input_buffer.push_str(&partial_json);
                 }
+            }
+            AnthropicContentDelta::ThinkingDelta { .. }
+            | AnthropicContentDelta::SignatureDelta { .. } => {
+                // Phase 3.3 will route these through to the unified API as
+                // reasoning content. For now, ignore.
             }
         },
         AnthropicStreamEvent::ContentBlockStop { index } => {
@@ -439,6 +455,12 @@ pub(crate) fn convert_stream_event_stateful(
         }
         AnthropicStreamEvent::Ping => {
             // Keep-alive event - ignore
+        }
+        AnthropicStreamEvent::Error { error } => {
+            return Err(Error::provider(
+                "Anthropic",
+                format!("{}: {}", error.error_type, error.message),
+            ));
         }
     }
 
@@ -564,6 +586,63 @@ mod tests {
             call.arguments.contains("FIRST") && call.arguments.contains("SECOND"),
             "deltas must accumulate, got: {:?}",
             call.arguments,
+        );
+    }
+
+    /// Extended-thinking blocks must parse — the previous schema only knew
+    /// about text/tool_use/tool_result, so `content_block_start` for a
+    /// `thinking` block crashed the entire stream with a deserialization
+    /// error.
+    #[test]
+    fn thinking_content_blocks_parse() {
+        for (label, json) in [
+            (
+                "thinking",
+                r#"{"type":"content_block_start","index":0,
+                    "content_block":{"type":"thinking","thinking":"","signature":null}}"#,
+            ),
+            (
+                "redacted_thinking",
+                r#"{"type":"content_block_start","index":0,
+                    "content_block":{"type":"redacted_thinking","data":"opaque"}}"#,
+            ),
+            (
+                "thinking_delta",
+                r#"{"type":"content_block_delta","index":0,
+                    "delta":{"type":"thinking_delta","thinking":"hmm"}}"#,
+            ),
+            (
+                "signature_delta",
+                r#"{"type":"content_block_delta","index":0,
+                    "delta":{"type":"signature_delta","signature":"sig"}}"#,
+            ),
+        ] {
+            let event: AnthropicStreamEvent = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("{label} should parse: {e}"));
+            let mut state = StreamState::default();
+            convert_stream_event_stateful(event, &mut state)
+                .unwrap_or_else(|e| panic!("{label} should not error: {e}"));
+        }
+    }
+
+    /// Anthropic delivers operational errors (overloaded / timeout / API
+    /// errors) over the same SSE channel via `event: error` frames. The
+    /// previous code masqueraded these as "Failed to parse SSE event".
+    #[test]
+    fn mid_stream_error_event_surfaces_as_error() {
+        let json = r#"{
+            "type":"error",
+            "error":{"type":"overloaded_error","message":"Overloaded"}
+        }"#;
+        let event: AnthropicStreamEvent =
+            serde_json::from_str(json).expect("error event should parse");
+        let mut state = StreamState::default();
+        let result = convert_stream_event_stateful(event, &mut state);
+        let err = result.expect_err("error event must surface as Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("overloaded_error") && msg.contains("Overloaded"),
+            "error must propagate type and message; got: {msg}",
         );
     }
 
