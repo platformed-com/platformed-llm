@@ -1,6 +1,5 @@
 use futures_util::StreamExt;
 use ijson::{ijson, IValue};
-use std::collections::HashSet;
 use uuid::Uuid;
 
 use super::google_types::*;
@@ -47,6 +46,13 @@ impl GoogleProvider {
     fn convert_request(&self, request: &LLMRequest) -> Result<GoogleRequest, Error> {
         let mut contents: Vec<GoogleContent> = Vec::new();
         let mut system_instruction = None;
+
+        // Gemini's `functionCall` parts have no `id` field on the wire, so
+        // we synthesize call_ids on the response side. To send results back
+        // we have to recover the function name by call_id from the
+        // conversation history. Build the mapping in a single pass.
+        let mut call_id_to_name: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
 
         // Append a part to the last content with the same role, otherwise
         // start a new content. Vertex rejects consecutive same-role contents,
@@ -96,6 +102,7 @@ impl GoogleProvider {
                     ),
                 },
                 InputItem::FunctionCall(call) => {
+                    call_id_to_name.insert(call.call_id.as_str(), call.name.as_str());
                     let args = serde_json::from_str(&call.arguments).map_err(|e| {
                         Error::provider("Google", format!("Invalid function arguments: {e}"))
                     })?;
@@ -111,9 +118,18 @@ impl GoogleProvider {
                     );
                 }
                 InputItem::FunctionCallOutput { call_id, output } => {
-                    let function_name = self
-                        .find_function_name_by_call_id(&contents, call_id)
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let function_name = call_id_to_name
+                        .get(call_id.as_str())
+                        .ok_or_else(|| {
+                            Error::provider(
+                                "Google",
+                                format!(
+                                    "FunctionCallOutput references unknown call_id {call_id:?} \
+                                     — no prior FunctionCall in the conversation matches it",
+                                ),
+                            )
+                        })?
+                        .to_string();
                     push_part(
                         &mut contents,
                         "user",
@@ -173,41 +189,6 @@ fn encode_function_output(output: &str) -> IValue {
         Ok(value) if value.is_object() => value,
         Ok(value) => ijson!({ "result": value }),
         Err(_) => ijson!({ "result": output }),
-    }
-}
-
-impl GoogleProvider {
-    /// Find the function name associated with a call_id.
-    /// This is a simplified implementation that assumes function responses are processed
-    /// in the same order as function calls were made.
-    fn find_function_name_by_call_id(
-        &self,
-        contents: &[GoogleContent],
-        _call_id: &str,
-    ) -> Option<String> {
-        // Count how many function responses we've already processed
-        let response_count = contents
-            .iter()
-            .filter(|c| c.role == "user")
-            .flat_map(|c| &c.parts)
-            .filter(|p| matches!(p, GooglePart::FunctionResponse { .. }))
-            .count();
-
-        // Find the corresponding function call
-        let mut call_count = 0;
-        for content in contents {
-            if content.role == "model" {
-                for part in &content.parts {
-                    if let GooglePart::FunctionCall { function_call } = part {
-                        if call_count == response_count {
-                            return Some(function_call.name.clone());
-                        }
-                        call_count += 1;
-                    }
-                }
-            }
-        }
-        None
     }
 }
 
@@ -290,13 +271,13 @@ impl LLMProvider for GoogleProvider {
     }
 }
 
-/// State for tracking output items during streaming to avoid duplicate OutputItemAdded events.
+/// State for tracking output items during streaming.
 #[derive(Debug, Default)]
 pub(crate) struct GoogleStreamState {
-    /// Whether we've started text output
+    /// Whether we've started text output. Only the first text part across
+    /// the whole stream emits an `OutputItemAdded`; subsequent ones append
+    /// to the same item via `ContentDelta`.
     has_text_output: bool,
-    /// Set of function call IDs we've already announced
-    announced_function_calls: HashSet<String>,
 }
 
 /// Stateful version of convert_response that tracks output items to emit OutputItemAdded only once.
@@ -328,30 +309,28 @@ pub(crate) fn convert_response_stateful(
                     }
                 }
                 GooglePart::FunctionCall { function_call } => {
-                    // Use a deterministic ID based on function name and arguments for tracking
-                    let function_key = format!(
-                        "{}:{}",
-                        function_call.name,
-                        serde_json::to_string(&function_call.args).unwrap_or_default()
-                    );
-
-                    // Use a single UUID for both id and call_id to ensure consistency
+                    // Synthesize a single UUID for the call and prefix it
+                    // for the two surfaces — `fc_<base>` for the
+                    // OutputItemAdded item id, `call_<base>` for the
+                    // FunctionCallComplete call_id. Sharing the base lets a
+                    // consumer correlate the two events for one call.
+                    //
+                    // Each `functionCall` part in each chunk is treated as
+                    // a fresh emission. Gemini's streaming protocol uses
+                    // delta semantics (text parts only contain new text), so
+                    // function calls don't repeat across chunks; if they
+                    // ever do, we'd over-emit, but the previous behaviour
+                    // was strictly worse (orphan Complete events).
                     let base_id = Uuid::new_v4().simple().to_string();
                     let fc_id = format!("fc_{base_id}");
                     let call_id = format!("call_{base_id}");
 
-                    // Only emit OutputItemAdded if we haven't announced this function call yet
-                    if !state.announced_function_calls.contains(&function_key) {
-                        events.push(StreamEvent::OutputItemAdded {
-                            item: crate::types::OutputItemInfo::FunctionCall {
-                                name: function_call.name.clone(),
-                                id: fc_id.clone(),
-                            },
-                        });
-                        state.announced_function_calls.insert(function_key);
-                    }
-
-                    // Convert function call
+                    events.push(StreamEvent::OutputItemAdded {
+                        item: crate::types::OutputItemInfo::FunctionCall {
+                            name: function_call.name.clone(),
+                            id: fc_id,
+                        },
+                    });
                     let function_call_obj = FunctionCall {
                         call_id,
                         name: function_call.name.clone(),
@@ -583,6 +562,142 @@ mod tests {
             body.contents[1].parts.len(),
             2,
             "merged model content should have two text parts",
+        );
+    }
+
+    /// Each emitted function call must produce a paired `OutputItemAdded`
+    /// + `FunctionCallComplete` whose ids derive from the same base UUID.
+    /// The previous implementation deduped `OutputItemAdded` by name+args
+    /// while regenerating the call_id on every chunk, so a repeated
+    /// emission produced an orphan `FunctionCallComplete` with no
+    /// preceding `Added`.
+    #[test]
+    fn function_call_emits_paired_ids_per_occurrence() {
+        fn pair(events: &[StreamEvent]) -> (String, String) {
+            assert_eq!(
+                events.len(),
+                2,
+                "expected [Added, Complete] for one call, got {events:?}",
+            );
+            match (&events[0], &events[1]) {
+                (
+                    StreamEvent::OutputItemAdded {
+                        item: crate::types::OutputItemInfo::FunctionCall { id, .. },
+                    },
+                    StreamEvent::FunctionCallComplete { call },
+                ) => (id.clone(), call.call_id.clone()),
+                other => panic!("expected [Added, Complete], got {other:?}"),
+            }
+        }
+
+        let chunk = r#"{"candidates":[{"content":{"role":"model","parts":[
+            {"functionCall":{"name":"get_weather","args":{"city":"Paris"}}}
+        ]}}]}"#;
+
+        let mut state = GoogleStreamState::default();
+        let r1: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let events1 = convert_response_stateful(r1, &mut state).unwrap();
+        let (added1, complete1) = pair(&events1);
+
+        // Second emission of the same call — historically this lost the
+        // `Added` event (deduped) but still emitted `Complete` (orphan).
+        let r2: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let events2 = convert_response_stateful(r2, &mut state).unwrap();
+        let (added2, complete2) = pair(&events2);
+
+        for (added, complete) in [(&added1, &complete1), (&added2, &complete2)] {
+            let base_added = added.strip_prefix("fc_").expect("fc_*");
+            let base_complete = complete.strip_prefix("call_").expect("call_*");
+            assert_eq!(
+                base_added, base_complete,
+                "OutputItemAdded and FunctionCallComplete must share a UUID base",
+            );
+        }
+        assert_ne!(
+            added1, added2,
+            "two distinct emissions should yield distinct ids",
+        );
+    }
+
+    /// Gemini doesn't return IDs on `functionCall` parts, so we have to
+    /// rebuild the call_id → name map ourselves from the conversation
+    /// history. The previous code matched positionally (Nth response
+    /// pairs with Nth call), which silently mis-matches when the caller
+    /// sends responses out of order. Use distinct function names so the
+    /// bug surfaces if positional matching ever creeps back in.
+    #[test]
+    fn function_call_output_resolves_name_via_call_id_not_position() {
+        use crate::types::{FunctionCall, InputItem};
+        let req = LLMRequest::new(
+            "gemini",
+            vec![
+                InputItem::user("hi"),
+                InputItem::FunctionCall(FunctionCall {
+                    call_id: "call_one".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: "{}".to_string(),
+                }),
+                InputItem::FunctionCall(FunctionCall {
+                    call_id: "call_two".to_string(),
+                    name: "get_time".to_string(),
+                    arguments: "{}".to_string(),
+                }),
+                // Responses arrive in the reverse order.
+                InputItem::function_call_output("call_two".to_string(), r#"{"x":1}"#.to_string()),
+                InputItem::function_call_output("call_one".to_string(), r#"{"y":2}"#.to_string()),
+            ],
+        );
+        let provider = GoogleProvider::new(
+            "p".to_string(),
+            "us-east1".to_string(),
+            "tok".to_string(),
+        )
+        .unwrap();
+        let body = provider.convert_request(&req).unwrap();
+        let last = body.contents.last().unwrap();
+        let names: Vec<&str> = last
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                GooglePart::FunctionResponse { function_response } => {
+                    Some(function_response.name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["get_time", "get_weather"],
+            "responses should resolve via call_id, not position",
+        );
+    }
+
+    /// Sending a FunctionCallOutput for an unknown call_id is a programmer
+    /// bug — the previous code substituted the literal string "unknown"
+    /// (which Vertex would then reject). Now we surface a clear error.
+    #[test]
+    fn function_call_output_with_unknown_call_id_errors() {
+        use crate::types::InputItem;
+        let req = LLMRequest::new(
+            "gemini",
+            vec![
+                InputItem::user("hi"),
+                InputItem::function_call_output("call_unknown".to_string(), "result".to_string()),
+            ],
+        );
+        let provider = GoogleProvider::new(
+            "p".to_string(),
+            "us-east1".to_string(),
+            "tok".to_string(),
+        )
+        .unwrap();
+        let err = provider
+            .convert_request(&req)
+            .expect_err("unknown call_id should produce an error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("call_unknown"),
+            "error message should reference the unknown id; got: {msg}",
         );
     }
 
