@@ -58,6 +58,17 @@ pub struct ResponsesRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<OpenAIReasoning>,
+}
+
+/// OpenAI's `reasoning` request field for chain-of-thought models.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAIReasoning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<&'static str>,
 }
 
 /// OpenAI's `tool_choice` accepts either a string mode or a typed object

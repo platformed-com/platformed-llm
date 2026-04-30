@@ -501,6 +501,7 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: None,
             store: None,
+            reasoning: None,
         };
         let provider = GoogleProvider::new(
             "p".to_string(),
@@ -541,6 +542,7 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: None,
             store: None,
+            reasoning: None,
         };
         let provider = GoogleProvider::new(
             "p".to_string(),
@@ -894,6 +896,7 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: None,
             store: None,
+            reasoning: None,
         };
 
         let provider = GoogleProvider::new(

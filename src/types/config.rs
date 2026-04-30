@@ -43,6 +43,36 @@ pub struct Usage {
     pub reasoning_tokens: Option<u32>,
 }
 
+/// Reasoning configuration for models that support chain-of-thought
+/// (gpt-5 / o-series, Claude extended thinking, Gemini thinking).
+///
+/// Each provider has a different shape; this is the unified surface and
+/// each provider's `convert_request` translates it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ReasoningConfig {
+    /// How much effort to spend reasoning. Maps to OpenAI's `effort` and
+    /// to Anthropic / Gemini's `budget_tokens` (rough mapping).
+    pub effort: Option<ReasoningEffort>,
+    /// Whether (and how) to surface reasoning summaries (OpenAI). Anthropic
+    /// returns thinking content unconditionally when enabled; Gemini's
+    /// thinking is not exposed to clients.
+    pub summary: Option<ReasoningSummary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
+}
+
 /// Strategy for how the model should use available tools.
 ///
 /// Each provider has its own wire shape for this; the conversion happens
@@ -83,6 +113,10 @@ pub struct LLMRequest {
     /// (which is currently `true` for OpenAI).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
+    /// Reasoning configuration. Only meaningful for models that support
+    /// chain-of-thought reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip)]
+    pub reasoning: Option<ReasoningConfig>,
 }
 
 impl LLMRequest {
@@ -101,6 +135,7 @@ impl LLMRequest {
             tool_choice: None,
             parallel_tool_calls: None,
             store: None,
+            reasoning: None,
         }
     }
 
@@ -166,6 +201,12 @@ impl LLMRequest {
     /// Whether to store the response server-side (OpenAI).
     pub fn store(mut self, store: bool) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Configure reasoning (chain-of-thought) for the request.
+    pub fn reasoning(mut self, reasoning: ReasoningConfig) -> Self {
+        self.reasoning = Some(reasoning);
         self
     }
 }

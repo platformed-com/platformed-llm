@@ -16,10 +16,18 @@ pub struct CompleteResponse {
 /// An item in the LLM response output.
 #[derive(Debug, Clone)]
 pub enum OutputItem {
-    /// Text content
+    /// Text content.
     Text { content: String },
-    /// Function call
+    /// Function call.
     FunctionCall { call: FunctionCall },
+    /// Chain-of-thought reasoning (gpt-5 / o-series, Claude extended
+    /// thinking, Gemini thinking). Some providers attach an opaque
+    /// `signature` that must be echoed back unchanged in subsequent turns
+    /// to preserve reasoning continuity (Anthropic).
+    Reasoning {
+        content: String,
+        signature: Option<String>,
+    },
 }
 
 impl OutputItem {
@@ -35,6 +43,17 @@ impl OutputItem {
             }
             OutputItem::FunctionCall { call } => {
                 crate::types::InputItem::FunctionCall(call.clone())
+            }
+            // Reasoning items are not currently round-tripped through the
+            // unified InputItem model — that's tracked for the Phase 5
+            // multi-part content redesign. For now we drop them on the way
+            // back into the conversation; the model recreates its own
+            // reasoning each turn.
+            OutputItem::Reasoning { .. } => {
+                crate::types::InputItem::Message(crate::types::Message {
+                    role: crate::types::Role::Assistant,
+                    content: String::new(),
+                })
             }
         }
     }

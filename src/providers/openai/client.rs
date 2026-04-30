@@ -1,6 +1,6 @@
-use super::types::{OpenAIToolChoice, ResponsesRequest, ResponsesStreamEvent};
+use super::types::{OpenAIReasoning, OpenAIToolChoice, ResponsesRequest, ResponsesStreamEvent};
 use crate::provider::LLMProvider;
-use crate::types::ToolChoice;
+use crate::types::{ReasoningConfig, ReasoningEffort, ReasoningSummary, ToolChoice};
 use crate::{Error, LLMRequest, Response, StreamEvent};
 use futures::TryStreamExt as _;
 use reqwest::Client;
@@ -72,6 +72,7 @@ impl OpenAIProvider {
             // retained server-side. Override via LLMRequest::store(true) when
             // intentionally chaining via `previous_response_id`.
             store: Some(request.store.unwrap_or(false)),
+            reasoning: request.reasoning.as_ref().map(convert_reasoning),
         }
     }
 
@@ -183,6 +184,21 @@ pub(crate) fn parse_openai_error(
     }
 }
 
+fn convert_reasoning(cfg: &ReasoningConfig) -> OpenAIReasoning {
+    OpenAIReasoning {
+        effort: cfg.effort.map(|e| match e {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }),
+        summary: cfg.summary.map(|s| match s {
+            ReasoningSummary::Auto => "auto",
+            ReasoningSummary::Concise => "concise",
+            ReasoningSummary::Detailed => "detailed",
+        }),
+    }
+}
+
 fn convert_tool_choice(choice: &ToolChoice) -> OpenAIToolChoice {
     match choice {
         ToolChoice::Auto => OpenAIToolChoice::Mode("auto"),
@@ -228,12 +244,23 @@ impl OpenAIProvider {
                             let name = item.name.unwrap_or_else(|| "unknown".to_string());
                             crate::types::OutputItemInfo::FunctionCall { name, id: item.id }
                         }
+                        "reasoning" => crate::types::OutputItemInfo::Reasoning,
                         "message" => crate::types::OutputItemInfo::Text,
                         _ => crate::types::OutputItemInfo::Text,
                     };
 
                     return Ok(Some(StreamEvent::OutputItemAdded { item: item_info }));
                 }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(delta) = event.delta {
+                    if !delta.is_empty() {
+                        return Ok(Some(StreamEvent::ReasoningDelta { delta }));
+                    }
+                }
+            }
+            "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
+                // Final canonical text — we already accumulated via deltas.
             }
             "response.function_call_arguments.delta" => {
                 // We no longer emit FunctionCallArguments events
@@ -443,6 +470,52 @@ mod tests {
         );
     }
 
+    /// `reasoning` configuration must reach the wire as
+    /// `{"effort": "...", "summary": "..."}`. Both fields are optional.
+    #[test]
+    fn reasoning_config_serializes_to_correct_shape() {
+        use crate::types::{ReasoningConfig, ReasoningEffort, ReasoningSummary};
+        let req = provider().convert_request(
+            &LLMRequest::from_prompt("gpt-5", &Prompt::user("hi")).reasoning(ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                summary: Some(ReasoningSummary::Auto),
+            }),
+        );
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            json["reasoning"],
+            serde_json::json!({"effort": "high", "summary": "auto"}),
+        );
+    }
+
+    /// OpenAI's reasoning streaming events should be routed onto the
+    /// unified `ReasoningDelta` channel; the corresponding
+    /// `response.output_item.added` for type `reasoning` should produce a
+    /// `Reasoning` `OutputItemInfo` so the accumulator opens a reasoning
+    /// item before deltas arrive.
+    #[test]
+    fn reasoning_summary_text_delta_emits_reasoning_delta() {
+        let added: ResponsesStreamEvent = serde_json::from_str(
+            r#"{"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1"}}"#,
+        )
+        .unwrap();
+        match OpenAIProvider::convert_stream_event(added).unwrap().unwrap() {
+            StreamEvent::OutputItemAdded {
+                item: crate::types::OutputItemInfo::Reasoning,
+            } => {}
+            other => panic!("expected OutputItemAdded(Reasoning), got {other:?}"),
+        }
+
+        let delta: ResponsesStreamEvent = serde_json::from_str(
+            r#"{"type":"response.reasoning_summary_text.delta","delta":"hmm,"}"#,
+        )
+        .unwrap();
+        match OpenAIProvider::convert_stream_event(delta).unwrap().unwrap() {
+            StreamEvent::ReasoningDelta { delta } => assert_eq!(delta, "hmm,"),
+            other => panic!("expected ReasoningDelta, got {other:?}"),
+        }
+    }
+
     /// `parallel_tool_calls` and `store` should reach the wire when the
     /// caller sets them, and stay absent when not. Default `store` is false
     /// (opt-out) so we don't unintentionally retain prompts server-side.
@@ -534,6 +607,7 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: None,
             store: None,
+            reasoning: None,
         };
 
         let openai_request = provider.convert_request(&request);

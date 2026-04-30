@@ -9,6 +9,10 @@ use crate::types::{FinishReason, FunctionCall, Usage};
 /// 1. Zero or more output items, each announced by [`StreamEvent::OutputItemAdded`].
 ///    - For [`OutputItemInfo::Text`], one or more [`StreamEvent::ContentDelta`]
 ///      events follow with the next text chunks.
+///    - For [`OutputItemInfo::Reasoning`], one or more
+///      [`StreamEvent::ReasoningDelta`] events follow with chain-of-thought
+///      text. May carry an opaque `signature` that must be echoed back in
+///      subsequent turns to preserve reasoning continuity (Anthropic).
 ///    - For [`OutputItemInfo::FunctionCall`], a single
 ///      [`StreamEvent::FunctionCallComplete`] follows once the model has
 ///      finished assembling the arguments JSON.
@@ -21,8 +25,11 @@ use crate::types::{FinishReason, FunctionCall, Usage};
 pub enum StreamEvent {
     /// Incremental text appended to the most recent text output item.
     ContentDelta { delta: String },
+    /// Incremental chain-of-thought text appended to the most recent
+    /// reasoning output item.
+    ReasoningDelta { delta: String },
     /// A new output item is starting. Subsequent `ContentDelta` /
-    /// `FunctionCallComplete` events apply to this item.
+    /// `ReasoningDelta` / `FunctionCallComplete` events apply to this item.
     OutputItemAdded { item: OutputItemInfo },
     /// A function call has completed. The `call_id` matches the one carried
     /// in the corresponding `OutputItemAdded { item: FunctionCall { id } }`
@@ -49,6 +56,9 @@ pub enum OutputItemInfo {
     /// Function call output item. Followed by exactly one
     /// `FunctionCallComplete` carrying the assembled arguments.
     FunctionCall { name: String, id: String },
+    /// Chain-of-thought reasoning output. Filled by subsequent
+    /// `ReasoningDelta` events.
+    Reasoning,
 }
 
 #[cfg(test)]

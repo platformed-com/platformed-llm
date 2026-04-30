@@ -40,6 +40,21 @@ impl ResponseAccumulator {
                     }
                 }
             }
+            StreamEvent::ReasoningDelta { delta } => {
+                // Append to the most recent reasoning item, or start a new
+                // one if there isn't one open.
+                match self.output_items.last_mut() {
+                    Some(OutputItem::Reasoning { content, .. }) => {
+                        content.push_str(&delta);
+                    }
+                    _ => {
+                        self.output_items.push(OutputItem::Reasoning {
+                            content: delta,
+                            signature: None,
+                        });
+                    }
+                }
+            }
             StreamEvent::OutputItemAdded { item } => {
                 // When a new output item is added, create the appropriate empty item
                 match item {
@@ -47,6 +62,12 @@ impl ResponseAccumulator {
                         // Add an empty text item that will be filled by subsequent ContentDelta events
                         self.output_items.push(OutputItem::Text {
                             content: String::new(),
+                        });
+                    }
+                    crate::types::OutputItemInfo::Reasoning => {
+                        self.output_items.push(OutputItem::Reasoning {
+                            content: String::new(),
+                            signature: None,
                         });
                     }
                     crate::types::OutputItemInfo::FunctionCall { .. } => {
