@@ -41,62 +41,49 @@ impl ProviderConfig {
 
     /// Create configuration for any Vertex AI provider with access token.
     ///
-    /// # Arguments
-    /// * `provider_type` - The provider type (Google or Anthropic)
-    /// * `project_id` - GCP project ID
-    /// * `location` - GCP region (e.g., "europe-west1", "us-east5")  
-    /// * `access_token` - Vertex AI access token
-    ///
-    /// # Panics
-    /// Panics if `provider_type` is not supported via Vertex AI.
+    /// Returns `Err` if `provider_type` is not supported via Vertex AI
+    /// (e.g. `ProviderType::OpenAI`).
     pub fn vertex(
         provider_type: ProviderType,
         project_id: String,
         location: String,
         access_token: String,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         if !provider_type.is_supported_via_vertex() {
-            panic!(
-                "{provider_type:?} is not a Vertex AI provider. Use ProviderConfig::openai() instead."
-            );
+            return Err(Error::config(format!(
+                "{provider_type:?} is not a Vertex AI provider; use ProviderConfig::openai()",
+            )));
         }
-
-        Self {
+        Ok(Self {
             provider_type,
             api_key: None,
             project_id: Some(project_id),
             location: Some(location),
             access_token: Some(access_token),
-        }
+        })
     }
 
-    /// Create configuration for any Vertex AI provider with Application Default Credentials.
+    /// Create configuration for any Vertex AI provider with Application
+    /// Default Credentials.
     ///
-    /// # Arguments
-    /// * `provider_type` - The provider type (Google or Anthropic)
-    /// * `project_id` - GCP project ID
-    /// * `location` - GCP region (e.g., "europe-west1", "us-east5")
-    ///
-    /// # Panics
-    /// Panics if `provider_type` is not supported via Vertex AI.
+    /// Returns `Err` if `provider_type` is not supported via Vertex AI.
     pub fn vertex_with_adc(
         provider_type: ProviderType,
         project_id: String,
         location: String,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         if !provider_type.is_supported_via_vertex() {
-            panic!(
-                "{provider_type:?} is not a Vertex AI provider. Use ProviderConfig::openai() instead."
-            );
+            return Err(Error::config(format!(
+                "{provider_type:?} is not a Vertex AI provider; use ProviderConfig::openai()",
+            )));
         }
-
-        Self {
+        Ok(Self {
             provider_type,
             api_key: None,
             project_id: Some(project_id),
             location: Some(location),
             access_token: None,
-        }
+        })
     }
 
     /// Create configuration from environment variables.
@@ -119,18 +106,18 @@ impl ProviderConfig {
                         .unwrap_or_else(|_| "europe-west1".to_string());
 
                     if let Ok(access_token) = env::var("VERTEX_ACCESS_TOKEN") {
-                        return Ok(Self::vertex(
+                        return Self::vertex(
                             ProviderType::Google,
                             project_id,
                             location,
                             access_token,
-                        ));
+                        );
                     } else {
-                        return Ok(Self::vertex_with_adc(
+                        return Self::vertex_with_adc(
                             ProviderType::Google,
                             project_id,
                             location,
-                        ));
+                        );
                     }
                 }
                 "anthropic" => {
@@ -140,18 +127,18 @@ impl ProviderConfig {
                         .unwrap_or_else(|_| "europe-west1".to_string());
 
                     if let Ok(access_token) = env::var("VERTEX_ACCESS_TOKEN") {
-                        return Ok(Self::vertex(
+                        return Self::vertex(
                             ProviderType::Anthropic,
                             project_id,
                             location,
                             access_token,
-                        ));
+                        );
                     } else {
-                        return Ok(Self::vertex_with_adc(
+                        return Self::vertex_with_adc(
                             ProviderType::Anthropic,
                             project_id,
                             location,
-                        ));
+                        );
                     }
                 }
                 _ => {
@@ -176,12 +163,7 @@ impl ProviderConfig {
             let location =
                 env::var("GOOGLE_CLOUD_REGION").unwrap_or_else(|_| "europe-west1".to_string());
 
-            return Ok(Self::vertex(
-                ProviderType::Google,
-                project_id,
-                location,
-                access_token,
-            ));
+            return Self::vertex(ProviderType::Google, project_id, location, access_token);
         }
 
         // Try Anthropic/Vertex with access token
@@ -192,12 +174,7 @@ impl ProviderConfig {
             let location =
                 env::var("GOOGLE_CLOUD_REGION").unwrap_or_else(|_| "europe-west1".to_string());
 
-            return Ok(Self::vertex(
-                ProviderType::Anthropic,
-                project_id,
-                location,
-                access_token,
-            ));
+            return Self::vertex(ProviderType::Anthropic, project_id, location, access_token);
         }
 
         // Try Google/Vertex with Application Default Credentials
@@ -212,17 +189,9 @@ impl ProviderConfig {
 
             // Check if this should be Anthropic instead of Google
             if env::var("ANTHROPIC_MODEL").is_ok() {
-                return Ok(Self::vertex_with_adc(
-                    ProviderType::Anthropic,
-                    project_id,
-                    location,
-                ));
+                return Self::vertex_with_adc(ProviderType::Anthropic, project_id, location);
             } else {
-                return Ok(Self::vertex_with_adc(
-                    ProviderType::Google,
-                    project_id,
-                    location,
-                ));
+                return Self::vertex_with_adc(ProviderType::Google, project_id, location);
             }
         }
 
@@ -308,7 +277,8 @@ mod tests {
             "test-project".to_string(),
             "europe-west1".to_string(),
             "test-token".to_string(),
-        );
+        )
+        .unwrap();
         assert!(matches!(google_config.provider_type, ProviderType::Google));
 
         // Test direct vertex() method with Anthropic
@@ -317,7 +287,8 @@ mod tests {
             "test-project".to_string(),
             "us-east5".to_string(),
             "test-token".to_string(),
-        );
+        )
+        .unwrap();
         assert!(matches!(
             anthropic_config.provider_type,
             ProviderType::Anthropic
@@ -325,26 +296,26 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not a Vertex AI provider")]
-    fn test_vertex_panics_on_openai() {
-        // vertex() should panic on OpenAI provider type
-        ProviderConfig::vertex(
+    fn test_vertex_returns_err_on_openai() {
+        let err = ProviderConfig::vertex(
             ProviderType::OpenAI,
             "test-project".to_string(),
             "us-east1".to_string(),
             "test-token".to_string(),
-        );
+        )
+        .expect_err("OpenAI is not a Vertex provider");
+        assert!(format!("{err}").contains("not a Vertex AI provider"));
     }
 
     #[test]
-    #[should_panic(expected = "not a Vertex AI provider")]
-    fn test_vertex_with_adc_panics_on_openai() {
-        // vertex_with_adc() should also panic on OpenAI provider type
-        ProviderConfig::vertex_with_adc(
+    fn test_vertex_with_adc_returns_err_on_openai() {
+        let err = ProviderConfig::vertex_with_adc(
             ProviderType::OpenAI,
             "test-project".to_string(),
             "us-east1".to_string(),
-        );
+        )
+        .expect_err("OpenAI is not a Vertex provider");
+        assert!(format!("{err}").contains("not a Vertex AI provider"));
     }
 
     #[test]

@@ -67,7 +67,7 @@ async fn main() -> Result<(), Error> {
         r#type: ToolType::Function,
         function: Function {
             name: "get_weather".to_string(),
-            description: "Get the current weather for a location".to_string(),
+            description: Some("Get the current weather for a location".to_string()),
             parameters: serde_json::from_str(
                 r#"{
                 "type": "object",
@@ -93,7 +93,7 @@ async fn main() -> Result<(), Error> {
         r#type: ToolType::Function,
         function: Function {
             name: "calculate".to_string(),
-            description: "Perform mathematical calculations".to_string(),
+            description: Some("Perform mathematical calculations".to_string()),
             parameters: serde_json::from_str(
                 r#"{
                 "type": "object",

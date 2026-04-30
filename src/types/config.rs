@@ -1,21 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Configuration for different LLM providers.
-#[derive(Debug, Clone)]
-pub enum ProviderConfig {
-    OpenAI {
-        api_key: String,
-    },
-    Gemini {
-        project_id: String,
-        location: String,
-    },
-    AnthropicVertex {
-        project_id: String,
-        location: String,
-    },
-}
-
 /// Token usage information across providers.
 ///
 /// Not every provider populates every field — fields specific to one

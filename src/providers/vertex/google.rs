@@ -156,7 +156,7 @@ impl GoogleProvider {
                     .iter()
                     .map(|tool| GoogleFunctionDeclaration {
                         name: tool.function.name.clone(),
-                        description: tool.function.description.clone(),
+                        description: tool.function.description.clone().unwrap_or_default(),
                         parameters: tool.function.parameters.clone(),
                     })
                     .collect(),
@@ -873,7 +873,7 @@ mod tests {
             r#type: ToolType::Function,
             function: Function {
                 name: "get_weather".to_string(),
-                description: "Get the weather".to_string(),
+                description: Some("Get the weather".to_string()),
                 parameters: serde_json::from_str(
                     r#"{"type":"object","properties":{}}"#,
                 )

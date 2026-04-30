@@ -12,7 +12,7 @@ pub fn create_weather_tool() -> Tool {
         r#type: ToolType::Function,
         function: Function {
             name: "get_weather".to_string(),
-            description: "Get the current weather for a location".to_string(),
+            description: Some("Get the current weather for a location".to_string()),
             parameters: serde_json::from_str(
                 r#"{
                     "type": "object",

@@ -157,7 +157,7 @@ impl AnthropicViaVertexProvider {
                 .iter()
                 .map(|tool| AnthropicTool {
                     name: tool.function.name.clone(),
-                    description: tool.function.description.clone(),
+                    description: tool.function.description.clone().unwrap_or_default(),
                     input_schema: tool.function.parameters.clone(),
                 })
                 .collect()

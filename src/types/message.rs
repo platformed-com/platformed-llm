@@ -159,7 +159,7 @@ impl Message {
 }
 
 /// Role of a message participant.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
@@ -185,7 +185,10 @@ pub enum ToolType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
     pub name: String,
-    pub description: String,
+    /// Function description. Optional per the OpenAI / Anthropic / Gemini
+    /// schemas, though strongly recommended for tool selection accuracy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub parameters: Cow<'static, RawValue>,
 }
 

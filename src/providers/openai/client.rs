@@ -120,7 +120,7 @@ impl OpenAIProvider {
                 super::types::OpenAITool {
                     r#type: "function".to_string(), // OpenAI Responses API expects "function"
                     name: tool.function.name.clone(),
-                    description: tool.function.description.clone(),
+                    description: tool.function.description.clone().unwrap_or_default(),
                     parameters: tool.function.parameters.clone(),
                 }
             })
