@@ -5,7 +5,7 @@ use super::anthropic_types::*;
 use super::transport::VertexTransport;
 use crate::provider::LLMProvider;
 use crate::sse_stream::SseStream;
-use crate::types::{FinishReason, FunctionCall, InputItem, Role, Usage};
+use crate::types::{FinishReason, FunctionCall, InputItem, ReasoningEffort, Role, Usage};
 use crate::{Error, LLMRequest, Response, StreamEvent};
 
 /// Anthropic Claude provider implementation via Vertex AI.
@@ -163,15 +163,43 @@ impl AnthropicViaVertexProvider {
                 .collect()
         });
 
+        // Map our unified ReasoningConfig onto Anthropic's `thinking` field.
+        // We derive budget_tokens from `effort` with sensible defaults;
+        // callers needing precise control can construct providers directly.
+        let thinking = request.reasoning.as_ref().map(|cfg| {
+            let budget_tokens = match cfg.effort.unwrap_or(ReasoningEffort::Medium) {
+                ReasoningEffort::Low => 2048,
+                ReasoningEffort::Medium => 8192,
+                ReasoningEffort::High => 16384,
+            };
+            AnthropicThinking::Enabled { budget_tokens }
+        });
+
+        // Anthropic requires temperature == 1 when thinking is enabled.
+        // Override with a warning rather than erroring; better DX.
+        let temperature = if thinking.is_some() {
+            if matches!(request.temperature, Some(t) if (t - 1.0).abs() > f32::EPSILON) {
+                tracing::warn!(
+                    requested = ?request.temperature,
+                    "Anthropic requires temperature=1 when extended thinking is enabled; \
+                     overriding"
+                );
+            }
+            Some(1.0)
+        } else {
+            request.temperature
+        };
+
         let anthropic_request = AnthropicRequest {
             messages,
             max_tokens: request.max_tokens.unwrap_or(1024),
             anthropic_version: "vertex-2023-10-16".to_string(),
             system: system_message,
-            temperature: request.temperature,
+            temperature,
             top_p: request.top_p,
             tools,
             stream: Some(true), // Enable streaming for SSE responses
+            thinking,
         };
 
         Ok(anthropic_request)
@@ -391,12 +419,22 @@ pub(crate) fn convert_stream_event_stateful(
                 AnthropicContentBlock::ToolResult { .. } => {
                     // Tool results are handled in request construction, not in responses
                 }
-                AnthropicContentBlock::Thinking { .. }
-                | AnthropicContentBlock::RedactedThinking { .. } => {
-                    // Extended thinking blocks: surfacing them through the
-                    // unified API is Phase 3.3 territory. For now we just
-                    // parse without crashing so the rest of the response
-                    // streams normally.
+                AnthropicContentBlock::Thinking { thinking, signature } => {
+                    events.push(StreamEvent::OutputItemAdded {
+                        item: crate::types::OutputItemInfo::Reasoning,
+                    });
+                    if !thinking.is_empty() {
+                        events.push(StreamEvent::ReasoningDelta { delta: thinking });
+                    }
+                    if let Some(sig) = signature {
+                        events.push(StreamEvent::ReasoningSignature { signature: sig });
+                    }
+                }
+                AnthropicContentBlock::RedactedThinking { .. } => {
+                    // Encrypted thinking — opaque blob. We can't surface
+                    // its content meaningfully through the unified API
+                    // and a Phase 5 multi-part redesign is the right place
+                    // to preserve it for round-trips.
                 }
                 AnthropicContentBlock::Image { .. } => {
                     // Image blocks only appear on the request side in
@@ -415,10 +453,13 @@ pub(crate) fn convert_stream_event_stateful(
                     in_progress.input_buffer.push_str(&partial_json);
                 }
             }
-            AnthropicContentDelta::ThinkingDelta { .. }
-            | AnthropicContentDelta::SignatureDelta { .. } => {
-                // Phase 3.3 will route these through to the unified API as
-                // reasoning content. For now, ignore.
+            AnthropicContentDelta::ThinkingDelta { thinking } => {
+                if !thinking.is_empty() {
+                    events.push(StreamEvent::ReasoningDelta { delta: thinking });
+                }
+            }
+            AnthropicContentDelta::SignatureDelta { signature } => {
+                events.push(StreamEvent::ReasoningSignature { signature });
             }
         },
         AnthropicStreamEvent::ContentBlockStop { index } => {
@@ -487,6 +528,79 @@ mod tests {
             );
         }
         out
+    }
+
+    /// `ReasoningConfig` should reach the wire as Anthropic's
+    /// `thinking: { type: "enabled", budget_tokens: N }`. The exact
+    /// budget is derived from `effort`; the requirement is just that the
+    /// shape is correct and the budget is positive.
+    #[test]
+    fn reasoning_config_serializes_as_anthropic_thinking() {
+        use crate::types::{Prompt, ReasoningConfig, ReasoningEffort};
+        let provider = AnthropicViaVertexProvider::new(
+            "p".to_string(),
+            "us-east1".to_string(),
+            "tok".to_string(),
+        )
+        .unwrap();
+        let req = LLMRequest::from_prompt("claude", &Prompt::user("hi")).reasoning(
+            ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                summary: None,
+            },
+        );
+        let body = provider.convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["thinking"]["type"], "enabled");
+        assert!(
+            json["thinking"]["budget_tokens"].as_u64().unwrap_or(0) > 0,
+            "budget_tokens should be positive, got: {}",
+            json["thinking"]["budget_tokens"],
+        );
+        // Anthropic requires temperature=1 when thinking is enabled —
+        // we should normalize.
+        assert_eq!(json["temperature"], 1.0);
+    }
+
+    /// A streaming `thinking` block must surface as Reasoning output items
+    /// with deltas, and the trailing `signature_delta` must reach the
+    /// accumulator so it can be echoed back next turn.
+    #[test]
+    fn thinking_block_routes_to_reasoning_events() {
+        let mut state = StreamState::default();
+        let events = [
+            r#"{"type":"content_block_start","index":0,
+                "content_block":{"type":"thinking","thinking":"","signature":null}}"#,
+            r#"{"type":"content_block_delta","index":0,
+                "delta":{"type":"thinking_delta","thinking":"hmm "}}"#,
+            r#"{"type":"content_block_delta","index":0,
+                "delta":{"type":"thinking_delta","thinking":"because…"}}"#,
+            r#"{"type":"content_block_delta","index":0,
+                "delta":{"type":"signature_delta","signature":"sig_blob"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+        ]
+        .iter()
+        .flat_map(|j| convert_stream_event_stateful(parse(j), &mut state).unwrap())
+        .collect::<Vec<_>>();
+
+        let mut saw_added = false;
+        let mut reasoning_text = String::new();
+        let mut signature = None;
+        for ev in &events {
+            match ev {
+                StreamEvent::OutputItemAdded {
+                    item: crate::types::OutputItemInfo::Reasoning,
+                } => saw_added = true,
+                StreamEvent::ReasoningDelta { delta } => reasoning_text.push_str(delta),
+                StreamEvent::ReasoningSignature { signature: s } => {
+                    signature = Some(s.clone())
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_added, "should have emitted OutputItemAdded(Reasoning)");
+        assert_eq!(reasoning_text, "hmm because…");
+        assert_eq!(signature.as_deref(), Some("sig_blob"));
     }
 
     /// Anthropic distinguishes `cache_creation_input_tokens` (writes,

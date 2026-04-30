@@ -28,6 +28,11 @@ pub enum StreamEvent {
     /// Incremental chain-of-thought text appended to the most recent
     /// reasoning output item.
     ReasoningDelta { delta: String },
+    /// Opaque signature attached to the current reasoning output item.
+    /// Anthropic emits this once at the end of a thinking block; it must
+    /// be echoed back unchanged in subsequent turns to preserve thinking
+    /// continuity. Other providers ignore it.
+    ReasoningSignature { signature: String },
     /// A new output item is starting. Subsequent `ContentDelta` /
     /// `ReasoningDelta` / `FunctionCallComplete` events apply to this item.
     OutputItemAdded { item: OutputItemInfo },

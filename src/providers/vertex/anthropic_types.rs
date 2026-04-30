@@ -21,6 +21,15 @@ pub struct AnthropicRequest {
     pub tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<AnthropicThinking>,
+}
+
+/// Anthropic extended-thinking config.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicThinking {
+    Enabled { budget_tokens: u32 },
 }
 
 /// Anthropic message format.

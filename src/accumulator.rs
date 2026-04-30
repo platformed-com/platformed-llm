@@ -55,6 +55,13 @@ impl ResponseAccumulator {
                     }
                 }
             }
+            StreamEvent::ReasoningSignature { signature: sig } => {
+                // Attach the signature to the current reasoning item.
+                if let Some(OutputItem::Reasoning { signature, .. }) = self.output_items.last_mut()
+                {
+                    *signature = Some(sig);
+                }
+            }
             StreamEvent::OutputItemAdded { item } => {
                 // When a new output item is added, create the appropriate empty item
                 match item {
