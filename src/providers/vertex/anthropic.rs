@@ -1,119 +1,43 @@
 use futures_util::StreamExt;
-use gcp_auth::TokenProvider;
-use reqwest::Client;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
 
 use super::anthropic_types::*;
+use super::transport::VertexTransport;
 use crate::provider::LLMProvider;
 use crate::sse_stream::SseStream;
-use crate::types::{FinishReason, FunctionCall, InputItem, Role};
+use crate::types::{FinishReason, FunctionCall, InputItem, Role, Usage};
 use crate::{Error, LLMRequest, Response, StreamEvent};
-
-/// Authentication method for Anthropic provider via Vertex AI.
-#[derive(Debug)]
-pub enum AnthropicViaVertexAuth {
-    /// Use access token (passed as Bearer header)
-    AccessToken(String),
-    /// Use Application Default Credentials (ADC)
-    ApplicationDefault,
-}
 
 /// Anthropic Claude provider implementation via Vertex AI.
 pub struct AnthropicViaVertexProvider {
-    client: Client,
-    project_id: String,
-    location: String,
-    auth: AnthropicViaVertexAuth,
-    auth_manager: Option<Arc<dyn TokenProvider>>,
-    base_url: Option<String>,
+    transport: VertexTransport,
 }
 
 impl AnthropicViaVertexProvider {
     /// Create a new Anthropic provider with access token authentication.
     pub fn new(project_id: String, location: String, access_token: String) -> Result<Self, Error> {
-        Self::with_auth(
-            project_id,
-            location,
-            AnthropicViaVertexAuth::AccessToken(access_token),
-        )
+        Ok(Self {
+            transport: VertexTransport::with_access_token(project_id, location, access_token)?,
+        })
     }
 
-    /// Create a new Anthropic provider with custom base URL (for testing).
+    /// Create a new Anthropic provider with a custom base URL (for testing).
     pub fn new_with_base_url(
         project_id: String,
         location: String,
         access_token: String,
         base_url: String,
     ) -> Result<Self, Error> {
-        let mut provider = Self::with_auth(
-            project_id,
-            location,
-            AnthropicViaVertexAuth::AccessToken(access_token),
-        )?;
-        provider.base_url = Some(base_url);
-        Ok(provider)
+        Ok(Self {
+            transport: VertexTransport::with_access_token(project_id, location, access_token)?
+                .with_base_url(base_url),
+        })
     }
 
     /// Create a new Anthropic provider with Application Default Credentials.
     pub async fn with_adc(project_id: String, location: String) -> Result<Self, Error> {
-        Self::with_auth_async(
-            project_id,
-            location,
-            AnthropicViaVertexAuth::ApplicationDefault,
-        )
-        .await
-    }
-
-    /// Create a new Anthropic provider with specific authentication method (sync for access tokens).
-    pub fn with_auth(
-        project_id: String,
-        location: String,
-        auth: AnthropicViaVertexAuth,
-    ) -> Result<Self, Error> {
-        match auth {
-            AnthropicViaVertexAuth::AccessToken(_) => {
-                let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
-
-                Ok(Self {
-                    client,
-                    project_id,
-                    location,
-                    auth,
-                    auth_manager: None,
-                    base_url: None,
-                })
-            }
-            AnthropicViaVertexAuth::ApplicationDefault => Err(Error::config(
-                "Use with_auth_async() for Application Default Credentials",
-            )),
-        }
-    }
-
-    /// Create a new Anthropic provider with specific authentication method (async for ADC).
-    pub async fn with_auth_async(
-        project_id: String,
-        location: String,
-        auth: AnthropicViaVertexAuth,
-    ) -> Result<Self, Error> {
-        let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
-
-        let auth_manager = match &auth {
-            AnthropicViaVertexAuth::ApplicationDefault => {
-                Some(gcp_auth::provider().await.map_err(|e| {
-                    Error::provider("Anthropic", format!("Failed to create auth manager: {e}"))
-                })?)
-            }
-            AnthropicViaVertexAuth::AccessToken(_) => None,
-        };
-
         Ok(Self {
-            client,
-            project_id,
-            location,
-            auth,
-            auth_manager,
-            base_url: None,
+            transport: VertexTransport::with_adc(project_id, location).await?,
         })
     }
 
@@ -150,7 +74,10 @@ impl AnthropicViaVertexProvider {
                         id: call.call_id.clone(),
                         name: call.name.clone(),
                         input: serde_json::from_str(&call.arguments).map_err(|e| {
-                            Error::provider("Anthropic", format!("Invalid function arguments: {e}"))
+                            Error::provider(
+                                "Anthropic",
+                                format!("Invalid function arguments: {e}"),
+                            )
                         })?,
                     };
 
@@ -194,9 +121,9 @@ impl AnthropicViaVertexProvider {
                     let should_append = if let Some(last_msg) = messages.last() {
                         last_msg.role == "user"
                             && match &last_msg.content {
-                                AnthropicContent::Blocks(blocks) => blocks
-                                    .iter()
-                                    .any(|b| matches!(b, AnthropicContentBlock::ToolResult { .. })),
+                                AnthropicContent::Blocks(blocks) => blocks.iter().any(|b| {
+                                    matches!(b, AnthropicContentBlock::ToolResult { .. })
+                                }),
                                 _ => false,
                             }
                     } else {
@@ -245,35 +172,6 @@ impl AnthropicViaVertexProvider {
 
         Ok(anthropic_request)
     }
-
-    /// Get the API endpoint for the Anthropic model.
-    fn get_endpoint(&self, stream: bool, model: &str) -> String {
-        let method = if stream {
-            "streamRawPredict"
-        } else {
-            "rawPredict"
-        };
-        let sse_param = if stream { "?alt=sse" } else { "" };
-
-        if let Some(base_url) = &self.base_url {
-            // Use custom base URL for testing
-            format!(
-                "{}/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:{}{}",
-                base_url.trim_end_matches('/'),
-                self.project_id,
-                self.location,
-                model,
-                method,
-                sse_param
-            )
-        } else {
-            // Use default Vertex AI endpoint
-            format!(
-                "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:{}{}",
-                self.location, self.project_id, self.location, model, method, sse_param
-            )
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -281,34 +179,20 @@ impl LLMProvider for AnthropicViaVertexProvider {
     async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
         let anthropic_request = self.convert_request(request)?;
 
-        let endpoint = self.get_endpoint(true, &request.model);
+        let endpoint = self.transport.endpoint(
+            "anthropic",
+            &request.model,
+            "streamRawPredict",
+            Some("alt=sse"),
+        );
 
-        let mut request_builder = self
-            .client
+        let builder = self
+            .transport
+            .client()
             .post(&endpoint)
             .header("Content-Type", "application/json")
             .json(&anthropic_request);
-
-        // Add authentication based on the method
-        request_builder = match &self.auth {
-            AnthropicViaVertexAuth::AccessToken(token) => {
-                request_builder.header("Authorization", format!("Bearer {token}"))
-            }
-            AnthropicViaVertexAuth::ApplicationDefault => {
-                let auth_manager = self.auth_manager.as_ref().ok_or_else(|| {
-                    Error::provider("Anthropic", "Auth manager not initialized for ADC")
-                })?;
-
-                let token = auth_manager
-                    .token(&["https://www.googleapis.com/auth/cloud-platform"])
-                    .await
-                    .map_err(|e| {
-                        Error::provider("Anthropic", format!("Failed to get ADC token: {e}"))
-                    })?;
-
-                request_builder.header("Authorization", format!("Bearer {}", token.as_str()))
-            }
-        };
+        let request_builder = self.transport.authorize(builder).await?;
 
         let response = request_builder.send().await?;
 
@@ -341,8 +225,7 @@ impl LLMProvider for AnthropicViaVertexProvider {
                         // Parse the SSE data as Anthropic stream event
                         match serde_json::from_str::<AnthropicStreamEvent>(data) {
                             Ok(stream_event) => {
-                                match Self::convert_stream_event_stateful(stream_event, &mut state)
-                                {
+                                match convert_stream_event_stateful(stream_event, &mut state) {
                                     Ok(events) => events.into_iter().map(Ok).collect(),
                                     Err(e) => vec![Err(e)],
                                 }
@@ -370,155 +253,338 @@ impl LLMProvider for AnthropicViaVertexProvider {
     }
 }
 
-/// State for tracking in-progress function calls during streaming.
+/// State for tracking streaming progress across content blocks and the
+/// message-level metadata that arrives on `message_delta`.
+///
+/// Anthropic delivers `stop_reason` and the cumulative `usage` on
+/// `message_delta` events, which fire **before** `message_stop`. We have to
+/// stash them here so the final `Done` event we synthesize at `message_stop`
+/// reflects what the model actually said.
 #[derive(Debug, Default)]
-struct StreamState {
-    /// In-progress function calls indexed by content block index
-    in_progress_calls: std::collections::HashMap<u32, InProgressFunctionCall>,
+pub(crate) struct StreamState {
+    /// In-progress function calls indexed by content block index.
+    in_progress_calls: HashMap<u32, InProgressFunctionCall>,
+    /// Cumulative usage merged from `message_start` and `message_delta`.
+    pending_usage: Usage,
+    /// `stop_reason` captured from `message_delta`.
+    pending_stop_reason: Option<String>,
+}
+
+/// Map an Anthropic `stop_reason` string onto our unified [`FinishReason`].
+///
+/// Until [`FinishReason`] is extended (Phase 5), `stop_sequence` and
+/// `pause_turn` collapse to `Stop` — the closest existing variant.
+pub(crate) fn map_anthropic_stop_reason(reason: Option<&str>) -> FinishReason {
+    match reason {
+        Some("end_turn") => FinishReason::Stop,
+        Some("tool_use") => FinishReason::ToolCalls,
+        Some("max_tokens") => FinishReason::Length,
+        Some("stop_sequence") => FinishReason::Stop,
+        Some("pause_turn") => FinishReason::Stop,
+        Some("refusal") => FinishReason::ContentFilter,
+        Some(other) => {
+            tracing::warn!(stop_reason = other, "unknown Anthropic stop_reason");
+            FinishReason::Stop
+        }
+        None => FinishReason::Stop,
+    }
+}
+
+/// Merge an Anthropic `usage` object into the running [`Usage`] tally.
+///
+/// Anthropic's streaming protocol reports `input_tokens` once on
+/// `message_start` and a cumulative `output_tokens` on the final
+/// `message_delta`. We always overwrite with the latest non-`None` value so
+/// the `Done` event reflects the model's authoritative final counts.
+fn merge_anthropic_usage(target: &mut Usage, src: &AnthropicUsage) {
+    if let Some(t) = src.input_tokens {
+        target.input_tokens = t;
+    }
+    if let Some(t) = src.output_tokens {
+        target.output_tokens = t;
+    }
+    // Note: `cache_creation_input_tokens` is currently aliased onto
+    // `cached_tokens` for parity with the existing `From` impl; Phase 3.4 will
+    // split this out properly into separate cache_read / cache_create fields.
+    if let Some(t) = src.cache_creation_input_tokens {
+        target.cached_tokens = Some(t);
+    }
 }
 
 /// A function call that's being built incrementally from streaming events.
+///
+/// Per the streaming protocol the `input` field on `content_block_start` is
+/// always `{}` — the actual JSON arrives in `input_json_delta` chunks. We
+/// always start with an empty buffer and append every delta verbatim.
 #[derive(Debug)]
 struct InProgressFunctionCall {
     id: String,
     name: String,
-    input_buffer: String,    // Accumulates InputJsonDelta events
-    has_initial_input: bool, // Whether we started with complete input
+    input_buffer: String,
 }
 
-impl AnthropicViaVertexProvider {
-    /// Convert stream event with state tracking for function calls.
-    fn convert_stream_event_stateful(
-        event: AnthropicStreamEvent,
-        state: &mut StreamState,
-    ) -> Result<Vec<StreamEvent>, Error> {
-        let mut events = Vec::new();
+/// Convert an Anthropic stream event into our unified `StreamEvent`s, with
+/// state tracking for incremental function-call argument accumulation.
+///
+/// `pub(crate)` so unit tests can drive this directly with synthetic events
+/// rather than going through the full SSE plumbing.
+pub(crate) fn convert_stream_event_stateful(
+    event: AnthropicStreamEvent,
+    state: &mut StreamState,
+) -> Result<Vec<StreamEvent>, Error> {
+    let mut events = Vec::new();
 
-        match event {
-            AnthropicStreamEvent::MessageStart { .. } => {
-                // Start of message - no events needed for now
-            }
-            AnthropicStreamEvent::ContentBlockStart {
-                content_block,
-                index,
-            } => {
-                match content_block {
-                    AnthropicContentBlock::ToolUse { id, name, input } => {
-                        // Handle tool use block start
-                        events.push(StreamEvent::OutputItemAdded {
-                            item: crate::types::OutputItemInfo::FunctionCall {
-                                name: name.clone(),
-                                id: id.clone(),
-                            },
-                        });
-
-                        // Start tracking this function call - don't emit FunctionCallComplete yet
-                        // Parameters may be streamed incrementally via InputJsonDelta events
-
-                        // Check if we have initial input or if it will be streamed
-                        let (initial_input, has_initial) = if input.is_null()
-                            || (input.is_object() && input.as_object().unwrap().is_empty())
-                        {
-                            // No initial input, will be streamed via InputJsonDelta
-                            (String::new(), false)
-                        } else {
-                            // We have complete initial input
-                            let json = serde_json::to_string(&input).map_err(|e| {
-                                Error::provider(
-                                    "Anthropic",
-                                    format!("Failed to serialize initial function input: {e}"),
-                                )
-                            })?;
-                            (json, true)
-                        };
-
-                        state.in_progress_calls.insert(
-                            index,
-                            InProgressFunctionCall {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input_buffer: initial_input,
-                                has_initial_input: has_initial,
-                            },
-                        );
-                    }
-                    AnthropicContentBlock::Text { text } => {
-                        events.push(StreamEvent::OutputItemAdded {
-                            item: crate::types::OutputItemInfo::Text,
-                        });
-                        // Handle initial text content if any
-                        if !text.is_empty() {
-                            events.push(StreamEvent::ContentDelta { delta: text });
-                        }
-                    }
-                    AnthropicContentBlock::ToolResult { .. } => {
-                        // Tool results are handled in request construction, not in responses
-                    }
-                }
-            }
-            AnthropicStreamEvent::ContentBlockDelta { delta, index } => {
-                match delta {
-                    AnthropicContentDelta::TextDelta { text } => {
-                        if !text.is_empty() {
-                            events.push(StreamEvent::ContentDelta { delta: text });
-                        }
-                    }
-                    AnthropicContentDelta::InputJsonDelta { partial_json } => {
-                        // Handle function parameter updates
-                        if let Some(in_progress) = state.in_progress_calls.get_mut(&index) {
-                            if in_progress.has_initial_input {
-                                // We already had complete input in ContentBlockStart
-                                // InputJsonDelta is providing the same data again (or updates)
-                                // Replace with the new data
-                                in_progress.input_buffer = partial_json;
-                            } else {
-                                // We're building the input incrementally
-                                // Append the partial JSON
-                                in_progress.input_buffer.push_str(&partial_json);
-                            }
-                        }
-                    }
-                }
-            }
-            AnthropicStreamEvent::ContentBlockStop { index } => {
-                // Content block finished - emit FunctionCallComplete if this was a function call
-                if let Some(in_progress) = state.in_progress_calls.remove(&index) {
-                    let function_call = FunctionCall {
-                        call_id: in_progress.id, // Use the same ID
-                        name: in_progress.name,
-                        arguments: in_progress.input_buffer,
-                    };
-                    events.push(StreamEvent::FunctionCallComplete {
-                        call: function_call,
-                    });
-                }
-            }
-            AnthropicStreamEvent::MessageDelta { delta } => {
-                // Handle usage updates and stop reason
-                if let Some(_usage) = delta.usage {
-                    // Don't emit Done event here, wait for MessageStop
-                }
-            }
-            AnthropicStreamEvent::MessageStop => {
-                // Message is complete - emit done event
-                events.push(StreamEvent::Done {
-                    finish_reason: FinishReason::Stop, // TODO: Map actual stop reason
-                    usage: crate::types::Usage::default(), // TODO: Get actual usage from message_delta
-                });
-            }
-            AnthropicStreamEvent::Ping => {
-                // Keep-alive event - ignore
+    match event {
+        AnthropicStreamEvent::MessageStart { message } => {
+            // `message_start` carries the initial `input_tokens`.
+            if let Some(usage) = &message.usage {
+                merge_anthropic_usage(&mut state.pending_usage, usage);
             }
         }
+        AnthropicStreamEvent::ContentBlockStart {
+            content_block,
+            index,
+        } => {
+            match content_block {
+                AnthropicContentBlock::ToolUse { id, name, input } => {
+                    events.push(StreamEvent::OutputItemAdded {
+                        item: crate::types::OutputItemInfo::FunctionCall {
+                            name: name.clone(),
+                            id: id.clone(),
+                        },
+                    });
 
-        Ok(events)
+                    // Per the streaming protocol the `input` here is always
+                    // `{}`. Anything else is off-spec — log and proceed with
+                    // an empty buffer; `input_json_delta` events are the
+                    // source of truth.
+                    let nonempty = !(input.is_null()
+                        || (input.is_object()
+                            && input.as_object().map(|o| o.is_empty()).unwrap_or(true)));
+                    if nonempty {
+                        tracing::warn!(
+                            ?input,
+                            "Anthropic content_block_start carried non-empty `input`; \
+                             ignoring and relying on input_json_delta accumulation"
+                        );
+                    }
+
+                    state.in_progress_calls.insert(
+                        index,
+                        InProgressFunctionCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input_buffer: String::new(),
+                        },
+                    );
+                }
+                AnthropicContentBlock::Text { text } => {
+                    events.push(StreamEvent::OutputItemAdded {
+                        item: crate::types::OutputItemInfo::Text,
+                    });
+                    // Handle initial text content if any
+                    if !text.is_empty() {
+                        events.push(StreamEvent::ContentDelta { delta: text });
+                    }
+                }
+                AnthropicContentBlock::ToolResult { .. } => {
+                    // Tool results are handled in request construction, not in responses
+                }
+            }
+        }
+        AnthropicStreamEvent::ContentBlockDelta { delta, index } => match delta {
+            AnthropicContentDelta::TextDelta { text } => {
+                if !text.is_empty() {
+                    events.push(StreamEvent::ContentDelta { delta: text });
+                }
+            }
+            AnthropicContentDelta::InputJsonDelta { partial_json } => {
+                if let Some(in_progress) = state.in_progress_calls.get_mut(&index) {
+                    in_progress.input_buffer.push_str(&partial_json);
+                }
+            }
+        },
+        AnthropicStreamEvent::ContentBlockStop { index } => {
+            // Content block finished - emit FunctionCallComplete if this was a function call
+            if let Some(in_progress) = state.in_progress_calls.remove(&index) {
+                let function_call = FunctionCall {
+                    call_id: in_progress.id, // Use the same ID
+                    name: in_progress.name,
+                    arguments: in_progress.input_buffer,
+                };
+                events.push(StreamEvent::FunctionCallComplete {
+                    call: function_call,
+                });
+            }
+        }
+        AnthropicStreamEvent::MessageDelta { delta, usage } => {
+            // `message_delta` carries the canonical `stop_reason` and the
+            // cumulative `output_tokens`. Stash them — the final `Done` event
+            // gets emitted on `message_stop`.
+            if let Some(reason) = delta.stop_reason {
+                state.pending_stop_reason = Some(reason);
+            }
+            if let Some(usage) = usage {
+                merge_anthropic_usage(&mut state.pending_usage, &usage);
+            }
+        }
+        AnthropicStreamEvent::MessageStop => {
+            let finish_reason =
+                map_anthropic_stop_reason(state.pending_stop_reason.as_deref());
+            let usage = std::mem::take(&mut state.pending_usage);
+            events.push(StreamEvent::Done {
+                finish_reason,
+                usage,
+            });
+        }
+        AnthropicStreamEvent::Ping => {
+            // Keep-alive event - ignore
+        }
     }
+
+    Ok(events)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures_util::{stream, StreamExt};
+
+    fn parse(json: &str) -> AnthropicStreamEvent {
+        serde_json::from_str(json).expect("event JSON should parse")
+    }
+
+    fn drain(events: Vec<AnthropicStreamEvent>) -> Vec<StreamEvent> {
+        let mut state = StreamState::default();
+        let mut out = Vec::new();
+        for event in events {
+            out.extend(
+                convert_stream_event_stateful(event, &mut state)
+                    .expect("conversion should succeed"),
+            );
+        }
+        out
+    }
+
+    /// `message_delta` carries the canonical `stop_reason` (and on the wire,
+    /// `usage` is a sibling of `delta`, not nested inside it). `message_stop`
+    /// must surface those fields on the final `Done` event — the previous
+    /// implementation hard-coded `Stop` / `Usage::default()` regardless.
+    #[test]
+    fn message_stop_emits_actual_finish_reason_and_usage() {
+        let events = drain(vec![
+            parse(
+                r#"{
+                    "type":"message_start",
+                    "message":{
+                        "id":"m1","model":"c","role":"assistant","content":[],
+                        "usage":{"input_tokens":10,"output_tokens":0}
+                    }
+                }"#,
+            ),
+            parse(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            parse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            ),
+            parse(r#"{"type":"content_block_stop","index":0}"#),
+            parse(
+                r#"{
+                    "type":"message_delta",
+                    "delta":{"stop_reason":"tool_use","stop_sequence":null},
+                    "usage":{"output_tokens":42}
+                }"#,
+            ),
+            parse(r#"{"type":"message_stop"}"#),
+        ]);
+
+        let done = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Done {
+                    finish_reason,
+                    usage,
+                } => Some((finish_reason, usage)),
+                _ => None,
+            })
+            .expect("expected a Done event");
+
+        assert_eq!(
+            *done.0,
+            FinishReason::ToolCalls,
+            "stop_reason 'tool_use' should map to FinishReason::ToolCalls",
+        );
+        assert_eq!(
+            done.1.input_tokens, 10,
+            "input_tokens should be carried from message_start",
+        );
+        assert_eq!(
+            done.1.output_tokens, 42,
+            "output_tokens should be carried from message_delta",
+        );
+    }
+
+    /// Per the streaming protocol, multiple `input_json_delta` events for one
+    /// tool_use block must **accumulate** — the JSON string is delivered in
+    /// pieces. The previous implementation had a path that *replaced* the
+    /// buffer on each delta whenever `content_block_start` had carried any
+    /// initial input (real or imagined), which silently dropped earlier
+    /// deltas on the floor.
+    #[test]
+    fn multiple_input_json_deltas_concatenate_not_replace() {
+        let mut state = StreamState::default();
+        // Off-spec but historically triggered the buggy "replace" branch.
+        let evt = parse(
+            r#"{"type":"content_block_start","index":0,
+                "content_block":{"type":"tool_use","id":"toolu_1","name":"f","input":{"a":1}}}"#,
+        );
+        let _ = convert_stream_event_stateful(evt, &mut state).unwrap();
+        let evt = parse(
+            r#"{"type":"content_block_delta","index":0,
+                "delta":{"type":"input_json_delta","partial_json":"FIRST"}}"#,
+        );
+        let _ = convert_stream_event_stateful(evt, &mut state).unwrap();
+        let evt = parse(
+            r#"{"type":"content_block_delta","index":0,
+                "delta":{"type":"input_json_delta","partial_json":"SECOND"}}"#,
+        );
+        let _ = convert_stream_event_stateful(evt, &mut state).unwrap();
+        let evt = parse(r#"{"type":"content_block_stop","index":0}"#);
+        let events = convert_stream_event_stateful(evt, &mut state).unwrap();
+
+        let call = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::FunctionCallComplete { call } => Some(call),
+                _ => None,
+            })
+            .expect("expected FunctionCallComplete");
+        assert!(
+            call.arguments.contains("FIRST") && call.arguments.contains("SECOND"),
+            "deltas must accumulate, got: {:?}",
+            call.arguments,
+        );
+    }
+
+    #[test]
+    fn finish_reason_mapping_covers_known_stop_reasons() {
+        let cases = [
+            ("end_turn", FinishReason::Stop),
+            ("tool_use", FinishReason::ToolCalls),
+            ("max_tokens", FinishReason::Length),
+            ("stop_sequence", FinishReason::Stop),
+            ("pause_turn", FinishReason::Stop),
+            ("refusal", FinishReason::ContentFilter),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                map_anthropic_stop_reason(Some(input)),
+                expected,
+                "stop_reason {input:?}",
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_streaming_content_parsing() {
@@ -545,6 +611,7 @@ mod tests {
 
         // Process events through our Anthropic SSE handler
         let mut events = Vec::new();
+        let mut state = StreamState::default();
 
         // Collect all events using StreamExt::next
         let mut sse_stream = sse_stream;
@@ -557,21 +624,11 @@ mod tests {
             }
 
             // Parse as AnthropicStreamEvent
-            match serde_json::from_str::<AnthropicStreamEvent>(data) {
-                Ok(stream_event) => {
-                    let mut state = StreamState::default();
-                    match AnthropicViaVertexProvider::convert_stream_event_stateful(
-                        stream_event,
-                        &mut state,
-                    ) {
-                        Ok(stream_events) => {
-                            events.extend(stream_events);
-                        }
-                        Err(e) => panic!("Should parse successfully: {e}"),
-                    }
-                }
-                Err(e) => panic!("Should parse JSON successfully: {e}"),
-            }
+            let stream_event: AnthropicStreamEvent =
+                serde_json::from_str(data).expect("JSON should parse");
+            let stream_events = convert_stream_event_stateful(stream_event, &mut state)
+                .expect("conversion should succeed");
+            events.extend(stream_events);
         }
 
         // Verify we got the expected events

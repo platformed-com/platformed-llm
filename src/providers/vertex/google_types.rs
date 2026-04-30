@@ -7,6 +7,7 @@ use serde_json::value::RawValue;
 
 /// Google Vertex AI request format (for Gemini models).
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleRequest {
     pub contents: Vec<GoogleContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21,6 +22,10 @@ pub struct GoogleRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoogleContent {
     pub role: String, // "user", "model"
+    /// Vertex sometimes returns a candidate with `content: {role: model}`
+    /// and no `parts` (e.g. when a candidate is safety-blocked mid-stream).
+    /// Default to empty so we don't fail to parse those frames.
+    #[serde(default)]
     pub parts: Vec<GooglePart>,
 }
 
@@ -57,6 +62,7 @@ pub struct GoogleFunctionResponse {
 
 /// Google generation configuration.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
@@ -68,6 +74,7 @@ pub struct GoogleGenerationConfig {
 
 /// Google tool definition.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleTool {
     pub function_declarations: Vec<GoogleFunctionDeclaration>,
 }
@@ -81,12 +88,27 @@ pub struct GoogleFunctionDeclaration {
 }
 
 /// Google API response.
+///
+/// `candidates` defaults to empty so we still parse safety-blocked-at-prompt
+/// frames, which carry only `promptFeedback` and no candidates array.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GoogleResponse {
+    #[serde(default)]
     pub candidates: Vec<GoogleCandidate>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "usageMetadata")]
+    #[serde(default, rename = "usageMetadata")]
     pub usage_metadata: Option<GoogleUsageMetadata>,
+    #[serde(default, rename = "promptFeedback")]
+    pub prompt_feedback: Option<GooglePromptFeedback>,
+}
+
+/// Returned in place of (or alongside) candidates when the prompt itself was
+/// blocked at the safety layer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GooglePromptFeedback {
+    #[serde(default, rename = "blockReason")]
+    pub block_reason: Option<String>,
+    #[serde(default, rename = "blockReasonMessage")]
+    pub block_reason_message: Option<String>,
 }
 
 /// Google response candidate.

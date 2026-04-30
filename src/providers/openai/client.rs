@@ -2,9 +2,9 @@ use super::types::{ResponsesRequest, ResponsesStreamEvent};
 use crate::provider::LLMProvider;
 use crate::{Error, LLMRequest, Response, StreamEvent};
 use futures::TryStreamExt as _;
-use log::info;
 use reqwest::Client;
 use std::time::Duration;
+use tracing::debug;
 
 /// OpenAI provider implementation.
 pub struct OpenAIProvider {
@@ -113,8 +113,12 @@ impl OpenAIProvider {
             .collect()
     }
 
-    /// Convert an OpenAI streaming event to our StreamEvents
-    fn convert_stream_event(event: ResponsesStreamEvent) -> Result<Option<StreamEvent>, Error> {
+    /// Convert an OpenAI streaming event to our `StreamEvent`s.
+    ///
+    /// `pub(crate)` so unit tests can drive this with synthetic events.
+    pub(crate) fn convert_stream_event(
+        event: ResponsesStreamEvent,
+    ) -> Result<Option<StreamEvent>, Error> {
         match event.r#type.as_str() {
             "error" => {
                 let (type_, message) = if let Some(error) = &event.error {
@@ -157,12 +161,29 @@ impl OpenAIProvider {
                 // Function call arguments are complete but no complete data here
             }
             "response.output_item.done" => {
-                // Output item is done - this might contain complete function call data
+                // Output item is done - emit FunctionCallComplete for function calls.
                 if let Some(item) = event.item {
                     if item.r#type == "function_call" {
                         if let (Some(name), Some(arguments)) = (item.name, item.arguments) {
+                            // The Responses API always populates `call_id`
+                            // (`call_…`) on function-call items. The `id`
+                            // field (`fc_…`) is the output-item id and is
+                            // NOT interchangeable — subsequent
+                            // `function_call_output` items must reference
+                            // the `call_…` id or the model can't correlate
+                            // them. Refuse to silently substitute.
+                            let call_id = item.call_id.ok_or_else(|| {
+                                Error::provider(
+                                    "OpenAI",
+                                    format!(
+                                        "function_call output item is missing required \
+                                         `call_id` field (item id: {})",
+                                        item.id,
+                                    ),
+                                )
+                            })?;
                             let call = crate::types::FunctionCall {
-                                call_id: item.call_id.unwrap_or(item.id), // Use call_id if available, otherwise use id
+                                call_id,
                                 name,
                                 arguments,
                             };
@@ -204,9 +225,9 @@ impl LLMProvider for OpenAIProvider {
         let mut openai_request = self.convert_request(request);
         openai_request.stream = Some(true);
 
-        info!(
-            "🔄 Sending OpenAI request: {}",
-            serde_json::to_string_pretty(&openai_request).unwrap()
+        debug!(
+            request = ?openai_request,
+            "sending OpenAI Responses API request"
         );
 
         let response = self
@@ -234,7 +255,7 @@ impl LLMProvider for OpenAIProvider {
         let event_stream = byte_stream
             .sse_events()
             .try_filter_map(|sse_event| async move {
-                info!("🔄 Received SSE event: {sse_event:?}");
+                debug!(event = ?sse_event, "received OpenAI SSE event");
                 let stream_event = serde_json::from_str::<ResponsesStreamEvent>(&sse_event.data)?;
                 OpenAIProvider::convert_stream_event(stream_event)
             });
@@ -252,6 +273,65 @@ mod tests {
     fn test_provider_creation() {
         let provider = OpenAIProvider::new("test-key".to_string());
         assert!(provider.is_ok());
+    }
+
+    /// On a `response.output_item.done` for a `function_call`, the unified
+    /// `FunctionCallComplete.call_id` MUST come from the API's `call_id`
+    /// (`call_…`) — not the output item id (`fc_…`). The two are not
+    /// interchangeable; subsequent `function_call_output` items have to
+    /// reference the `call_…` id or the model can't correlate them.
+    #[test]
+    fn function_call_done_uses_api_call_id() {
+        let json = r#"{
+            "type":"response.output_item.done",
+            "item":{
+                "type":"function_call",
+                "id":"fc_123",
+                "name":"get_weather",
+                "arguments":"{\"city\":\"Paris\"}",
+                "call_id":"call_abc"
+            }
+        }"#;
+        let event: ResponsesStreamEvent = serde_json::from_str(json).unwrap();
+        let stream_event = OpenAIProvider::convert_stream_event(event)
+            .expect("conversion should succeed")
+            .expect("should produce a StreamEvent");
+
+        match stream_event {
+            StreamEvent::FunctionCallComplete { call } => {
+                assert_eq!(
+                    call.call_id, "call_abc",
+                    "call_id must come from API's call_id field, not item.id",
+                );
+                assert_ne!(
+                    call.call_id, "fc_123",
+                    "call_id must NOT alias to the fc_* output item id",
+                );
+            }
+            other => panic!("expected FunctionCallComplete, got {other:?}"),
+        }
+    }
+
+    /// A `function_call` item with no `call_id` is malformed per the
+    /// Responses API — silently substituting the `fc_*` id breaks multi-turn
+    /// tool calls invisibly. Surface it as an error instead.
+    #[test]
+    fn function_call_done_without_call_id_errors() {
+        let json = r#"{
+            "type":"response.output_item.done",
+            "item":{
+                "type":"function_call",
+                "id":"fc_123",
+                "name":"get_weather",
+                "arguments":"{}"
+            }
+        }"#;
+        let event: ResponsesStreamEvent = serde_json::from_str(json).unwrap();
+        let result = OpenAIProvider::convert_stream_event(event);
+        assert!(
+            result.is_err(),
+            "function_call without call_id must error, got: {result:?}",
+        );
     }
 
     #[test]

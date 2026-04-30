@@ -1,107 +1,45 @@
 use futures_util::StreamExt;
-use gcp_auth::TokenProvider;
 use ijson::ijson;
-use reqwest::Client;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use super::google_types::*;
+use super::transport::VertexTransport;
 use crate::provider::LLMProvider;
 use crate::sse_stream::SseStream;
 use crate::types::{FinishReason, FunctionCall, InputItem, Role};
 use crate::{Error, LLMRequest, Response, StreamEvent};
 
-/// Authentication method for Google provider.
-#[derive(Debug)]
-pub enum GoogleAuth {
-    /// Use access token (passed as Bearer header)
-    AccessToken(String),
-    /// Use Application Default Credentials (ADC)
-    ApplicationDefault,
-}
-
 /// Google provider implementation via Vertex AI (for Gemini models).
 pub struct GoogleProvider {
-    client: Client,
-    project_id: String,
-    location: String,
-    auth: GoogleAuth,
-    auth_manager: Option<Arc<dyn TokenProvider>>,
-    base_url: Option<String>,
+    transport: VertexTransport,
 }
 
 impl GoogleProvider {
     /// Create a new Google provider with access token authentication.
     pub fn new(project_id: String, location: String, access_token: String) -> Result<Self, Error> {
-        Self::with_auth(project_id, location, GoogleAuth::AccessToken(access_token))
+        Ok(Self {
+            transport: VertexTransport::with_access_token(project_id, location, access_token)?,
+        })
     }
 
-    /// Create a new Google provider with custom base URL (for testing).
+    /// Create a new Google provider with a custom base URL (for testing).
     pub fn new_with_base_url(
         project_id: String,
         location: String,
         access_token: String,
         base_url: String,
     ) -> Result<Self, Error> {
-        let mut provider =
-            Self::with_auth(project_id, location, GoogleAuth::AccessToken(access_token))?;
-        provider.base_url = Some(base_url);
-        Ok(provider)
+        Ok(Self {
+            transport: VertexTransport::with_access_token(project_id, location, access_token)?
+                .with_base_url(base_url),
+        })
     }
 
     /// Create a new Google provider with Application Default Credentials.
     pub async fn with_adc(project_id: String, location: String) -> Result<Self, Error> {
-        Self::with_auth_async(project_id, location, GoogleAuth::ApplicationDefault).await
-    }
-
-    /// Create a new Google provider with specific authentication method (sync for access tokens).
-    pub fn with_auth(
-        project_id: String,
-        location: String,
-        auth: GoogleAuth,
-    ) -> Result<Self, Error> {
-        match auth {
-            GoogleAuth::AccessToken(_) => {
-                let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
-
-                Ok(Self {
-                    client,
-                    project_id,
-                    location,
-                    auth,
-                    auth_manager: None,
-                    base_url: None,
-                })
-            }
-            GoogleAuth::ApplicationDefault => Err(Error::config(
-                "Use with_auth_async() for Application Default Credentials",
-            )),
-        }
-    }
-
-    /// Create a new Google provider with specific authentication method (async for ADC).
-    pub async fn with_auth_async(
-        project_id: String,
-        location: String,
-        auth: GoogleAuth,
-    ) -> Result<Self, Error> {
-        let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
-
-        let auth_manager = match &auth {
-            GoogleAuth::ApplicationDefault => Some(gcp_auth::provider().await.map_err(|e| {
-                Error::provider("Google", format!("Failed to create auth manager: {e}"))
-            })?),
-            GoogleAuth::AccessToken(_) => None,
-        };
-
         Ok(Self {
-            client,
-            project_id,
-            location,
-            auth,
-            auth_manager,
-            base_url: None,
+            transport: VertexTransport::with_adc(project_id, location).await?,
         })
     }
 
@@ -296,35 +234,6 @@ impl GoogleProvider {
         }
         None
     }
-
-    /// Get the API endpoint for the Google model.
-    fn get_endpoint(&self, stream: bool, model: &str) -> String {
-        let method = if stream {
-            "streamGenerateContent"
-        } else {
-            "generateContent"
-        };
-        let sse_param = if stream { "?alt=sse" } else { "" };
-
-        if let Some(base_url) = &self.base_url {
-            // Use custom base URL for testing
-            format!(
-                "{}/v1/projects/{}/locations/{}/publishers/google/models/{}:{}{}",
-                base_url.trim_end_matches('/'),
-                self.project_id,
-                self.location,
-                model,
-                method,
-                sse_param
-            )
-        } else {
-            // Use default Vertex AI endpoint
-            format!(
-                "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:{}{}",
-                self.location, self.project_id, self.location, model, method, sse_param
-            )
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -332,34 +241,20 @@ impl LLMProvider for GoogleProvider {
     async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
         let google_request = self.convert_request(request)?;
 
-        let endpoint = self.get_endpoint(true, &request.model);
+        let endpoint = self.transport.endpoint(
+            "google",
+            &request.model,
+            "streamGenerateContent",
+            Some("alt=sse"),
+        );
 
-        let mut request_builder = self
-            .client
+        let builder = self
+            .transport
+            .client()
             .post(&endpoint)
             .header("Content-Type", "application/json")
             .json(&google_request);
-
-        // Add authentication based on the method
-        request_builder = match &self.auth {
-            GoogleAuth::AccessToken(token) => {
-                request_builder.header("Authorization", format!("Bearer {token}"))
-            }
-            GoogleAuth::ApplicationDefault => {
-                let auth_manager = self.auth_manager.as_ref().ok_or_else(|| {
-                    Error::provider("Google", "Auth manager not initialized for ADC")
-                })?;
-
-                let token = auth_manager
-                    .token(&["https://www.googleapis.com/auth/cloud-platform"])
-                    .await
-                    .map_err(|e| {
-                        Error::provider("Google", format!("Failed to get ADC token: {e}"))
-                    })?;
-
-                request_builder.header("Authorization", format!("Bearer {}", token.as_str()))
-            }
-        };
+        let request_builder = self.transport.authorize(builder).await?;
 
         let response = request_builder.send().await?;
 
@@ -392,7 +287,7 @@ impl LLMProvider for GoogleProvider {
                         // Parse the SSE data as GoogleResponse
                         match serde_json::from_str::<GoogleResponse>(data) {
                             Ok(google_response) => {
-                                match Self::convert_response_stateful(google_response, &mut state) {
+                                match convert_response_stateful(google_response, &mut state) {
                                     Ok(stream_events) => {
                                         stream_events.into_iter().map(Ok).collect()
                                     }
@@ -419,116 +314,137 @@ impl LLMProvider for GoogleProvider {
 
 /// State for tracking output items during streaming to avoid duplicate OutputItemAdded events.
 #[derive(Debug, Default)]
-struct GoogleStreamState {
+pub(crate) struct GoogleStreamState {
     /// Whether we've started text output
     has_text_output: bool,
     /// Set of function call IDs we've already announced
-    announced_function_calls: std::collections::HashSet<String>,
+    announced_function_calls: HashSet<String>,
 }
 
-impl GoogleProvider {
-    /// Stateful version of convert_response that tracks output items to emit OutputItemAdded only once.
-    fn convert_response_stateful(
-        response: GoogleResponse,
-        state: &mut GoogleStreamState,
-    ) -> Result<Vec<StreamEvent>, Error> {
-        let mut events = Vec::new();
+/// Stateful version of convert_response that tracks output items to emit OutputItemAdded only once.
+///
+/// `pub(crate)` so unit tests in this module (and future fixture-driven tests in
+/// `tests/`) can drive the conversion directly with synthetic `GoogleResponse`
+/// values, without standing up a transport or a mock server.
+pub(crate) fn convert_response_stateful(
+    response: GoogleResponse,
+    state: &mut GoogleStreamState,
+) -> Result<Vec<StreamEvent>, Error> {
+    let mut events = Vec::new();
 
-        if let Some(candidate) = response.candidates.first() {
-            for part in &candidate.content.parts {
-                match part {
-                    GooglePart::Text { text } => {
-                        // Only emit OutputItemAdded if we haven't started text output yet
-                        if !state.has_text_output {
-                            events.push(StreamEvent::OutputItemAdded {
-                                item: crate::types::OutputItemInfo::Text,
-                            });
-                            state.has_text_output = true;
-                        }
-                        if !text.is_empty() {
-                            events.push(StreamEvent::ContentDelta {
-                                delta: text.clone(),
-                            });
-                        }
+    if let Some(candidate) = response.candidates.first() {
+        for part in &candidate.content.parts {
+            match part {
+                GooglePart::Text { text } => {
+                    // Only emit OutputItemAdded if we haven't started text output yet
+                    if !state.has_text_output {
+                        events.push(StreamEvent::OutputItemAdded {
+                            item: crate::types::OutputItemInfo::Text,
+                        });
+                        state.has_text_output = true;
                     }
-                    GooglePart::FunctionCall { function_call } => {
-                        // Use a deterministic ID based on function name and arguments for tracking
-                        let function_key = format!(
-                            "{}:{}",
-                            function_call.name,
-                            serde_json::to_string(&function_call.args).unwrap_or_default()
-                        );
-
-                        // Use a single UUID for both id and call_id to ensure consistency
-                        let base_id = Uuid::new_v4().simple().to_string();
-                        let fc_id = format!("fc_{base_id}");
-                        let call_id = format!("call_{base_id}");
-
-                        // Only emit OutputItemAdded if we haven't announced this function call yet
-                        if !state.announced_function_calls.contains(&function_key) {
-                            events.push(StreamEvent::OutputItemAdded {
-                                item: crate::types::OutputItemInfo::FunctionCall {
-                                    name: function_call.name.clone(),
-                                    id: fc_id.clone(),
-                                },
-                            });
-                            state.announced_function_calls.insert(function_key);
-                        }
-
-                        // Convert function call
-                        let function_call_obj = FunctionCall {
-                            call_id,
-                            name: function_call.name.clone(),
-                            arguments: serde_json::to_string(&function_call.args).map_err(|e| {
-                                Error::provider(
-                                    "Google",
-                                    format!("Failed to serialize function args: {e}"),
-                                )
-                            })?,
-                        };
-                        events.push(StreamEvent::FunctionCallComplete {
-                            call: function_call_obj,
+                    if !text.is_empty() {
+                        events.push(StreamEvent::ContentDelta {
+                            delta: text.clone(),
                         });
                     }
-                    GooglePart::FunctionResponse { .. } => {
-                        // Function responses are typically not part of the model's output
+                }
+                GooglePart::FunctionCall { function_call } => {
+                    // Use a deterministic ID based on function name and arguments for tracking
+                    let function_key = format!(
+                        "{}:{}",
+                        function_call.name,
+                        serde_json::to_string(&function_call.args).unwrap_or_default()
+                    );
+
+                    // Use a single UUID for both id and call_id to ensure consistency
+                    let base_id = Uuid::new_v4().simple().to_string();
+                    let fc_id = format!("fc_{base_id}");
+                    let call_id = format!("call_{base_id}");
+
+                    // Only emit OutputItemAdded if we haven't announced this function call yet
+                    if !state.announced_function_calls.contains(&function_key) {
+                        events.push(StreamEvent::OutputItemAdded {
+                            item: crate::types::OutputItemInfo::FunctionCall {
+                                name: function_call.name.clone(),
+                                id: fc_id.clone(),
+                            },
+                        });
+                        state.announced_function_calls.insert(function_key);
                     }
+
+                    // Convert function call
+                    let function_call_obj = FunctionCall {
+                        call_id,
+                        name: function_call.name.clone(),
+                        arguments: serde_json::to_string(&function_call.args).map_err(|e| {
+                            Error::provider(
+                                "Google",
+                                format!("Failed to serialize function args: {e}"),
+                            )
+                        })?,
+                    };
+                    events.push(StreamEvent::FunctionCallComplete {
+                        call: function_call_obj,
+                    });
+                }
+                GooglePart::FunctionResponse { .. } => {
+                    // Function responses are typically not part of the model's output
                 }
             }
+        }
 
-            // Only add a Done event if this response has a finish_reason (indicates end of stream)
-            if let Some(finish_reason_str) = &candidate.finish_reason {
-                let finish_reason = match finish_reason_str.as_str() {
-                    "STOP" => FinishReason::Stop,
-                    "MAX_TOKENS" => FinishReason::Length,
-                    "SAFETY" => FinishReason::ContentFilter,
-                    _ => FinishReason::Stop, // Default to Stop for unknown reasons
-                };
+        // Only add a Done event if this response has a finish_reason (indicates end of stream)
+        if let Some(finish_reason_str) = &candidate.finish_reason {
+            let finish_reason = match finish_reason_str.as_str() {
+                "STOP" => FinishReason::Stop,
+                "MAX_TOKENS" => FinishReason::Length,
+                "SAFETY" => FinishReason::ContentFilter,
+                _ => FinishReason::Stop, // Default to Stop for unknown reasons
+            };
 
-                let usage = response
-                    .usage_metadata
-                    .map(|meta| meta.into())
-                    .unwrap_or_default();
-
-                events.push(StreamEvent::Done {
-                    finish_reason,
-                    usage,
-                });
-            }
-        } else if response.usage_metadata.is_some() {
-            // If no candidates but we have usage metadata, this might be a final response
             let usage = response
                 .usage_metadata
                 .map(|meta| meta.into())
                 .unwrap_or_default();
+
             events.push(StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
+                finish_reason,
                 usage,
             });
         }
-
-        Ok(events)
+    } else if let Some(feedback) = &response.prompt_feedback {
+        // Prompt was safety-blocked. Surface as ContentFilter regardless of
+        // the specific reason (SAFETY / BLOCKLIST / PROHIBITED_CONTENT / SPII
+        // / OTHER) — they all mean "the model declined to respond".
+        if let Some(reason) = &feedback.block_reason {
+            tracing::warn!(
+                block_reason = %reason,
+                message = ?feedback.block_reason_message,
+                "Gemini prompt was blocked",
+            );
+        }
+        let usage = response
+            .usage_metadata
+            .map(|meta| meta.into())
+            .unwrap_or_default();
+        events.push(StreamEvent::Done {
+            finish_reason: FinishReason::ContentFilter,
+            usage,
+        });
+    } else if response.usage_metadata.is_some() {
+        // If no candidates but we have usage metadata, this might be a final response
+        let usage = response
+            .usage_metadata
+            .map(|meta| meta.into())
+            .unwrap_or_default();
+        events.push(StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+            usage,
+        });
     }
+
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -572,14 +488,12 @@ mod tests {
 
             // Parse as GoogleResponse
             match serde_json::from_str::<GoogleResponse>(data) {
-                Ok(response) => {
-                    match GoogleProvider::convert_response_stateful(response, &mut shared_state) {
-                        Ok(stream_events) => {
-                            events.extend(stream_events);
-                        }
-                        Err(e) => panic!("Should parse successfully: {e}"),
+                Ok(response) => match convert_response_stateful(response, &mut shared_state) {
+                    Ok(stream_events) => {
+                        events.extend(stream_events);
                     }
-                }
+                    Err(e) => panic!("Should parse successfully: {e}"),
+                },
                 Err(e) => panic!("Should parse JSON successfully: {e}"),
             }
         }
@@ -607,84 +521,138 @@ mod tests {
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
     }
 
-    #[tokio::test]
-    async fn test_trailing_characters_error_simulation() {
-        // Simulate the exact scenario that would cause a "trailing characters" error
-        // This simulates what might happen if Google's API sends extra whitespace or formatting
+    /// When Vertex blocks a prompt at the safety layer, it returns
+    /// `{"promptFeedback":{...}}` with no `candidates` array. Deserializing
+    /// that previously failed because `candidates: Vec<...>` was required —
+    /// surfaced to callers as a misleading "Failed to parse SSE event"
+    /// instead of a real `Done`/blocked signal.
+    #[test]
+    fn prompt_feedback_only_response_parses() {
+        let json = r#"{"promptFeedback":{"blockReason":"SAFETY"}}"#;
+        let response: GoogleResponse = serde_json::from_str(json)
+            .expect("safety-blocked response with no candidates must parse");
 
-        // Test case 1: JSON with trailing whitespace
-        let problematic_chunk1 =
-            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Test"}]}}]}  "#; // Extra spaces
+        let mut state = GoogleStreamState::default();
+        let events = convert_response_stateful(response, &mut state).unwrap();
 
-        // Test case 2: JSON with trailing newline
-        let problematic_chunk2 =
-            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Test2"}]}}]}
-"#
-            .to_string(); // Extra newline
+        let done = events.iter().find_map(|e| match e {
+            StreamEvent::Done { finish_reason, .. } => Some(finish_reason.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            done,
+            Some(FinishReason::ContentFilter),
+            "promptFeedback.blockReason should yield Done with ContentFilter",
+        );
+    }
 
-        // Test case 3: Multiple JSON objects (should trigger fallback)
-        let problematic_chunk3 = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Test3"}]}}]}
-{"candidates":[{"content":{"role":"model","parts":[{"text":"Test4"}]}}]}"#;
+    /// Vertex sometimes emits a candidate with `finishReason: SAFETY` and
+    /// `content: {role: model}` (no `parts`). `parts` was a required field;
+    /// the parse failure leaked through as a generic "Failed to parse SSE
+    /// event" error.
+    #[test]
+    fn candidate_with_no_parts_parses() {
+        let json = r#"{
+            "candidates":[{"content":{"role":"model"},"finishReason":"SAFETY"}]
+        }"#;
+        let response: GoogleResponse =
+            serde_json::from_str(json).expect("candidate without parts must parse");
 
-        let test_cases = vec![
-            ("trailing spaces", problematic_chunk1),
-            ("trailing newline", &problematic_chunk2),
-            ("multiple json", problematic_chunk3),
-        ];
+        let mut state = GoogleStreamState::default();
+        let events = convert_response_stateful(response, &mut state).unwrap();
+        let done = events.iter().find_map(|e| match e {
+            StreamEvent::Done { finish_reason, .. } => Some(finish_reason.clone()),
+            _ => None,
+        });
+        assert_eq!(done, Some(FinishReason::ContentFilter));
+    }
 
-        for (case_name, json_data) in test_cases {
-            println!("Testing case: {case_name}");
+    #[test]
+    fn request_body_uses_camel_case_keys() {
+        // Vertex AI's REST API expects camelCase keys: `generationConfig`,
+        // `systemInstruction`, `functionDeclarations`. snake_case keys are
+        // silently ignored, which means temperature / maxOutputTokens / topP
+        // / system instructions / tool definitions all silently drop on the
+        // floor. Lock in the correct shape.
+        use crate::types::{Function, InputItem, Tool, ToolType};
 
-            // Try parsing directly to see what error we get
-            match serde_json::from_str::<GoogleResponse>(json_data) {
-                Ok(_) => println!("  ✅ Case '{case_name}' parsed successfully (no error)"),
-                Err(e) => {
-                    println!("  ❌ Case '{case_name}' failed with error: {e}");
-                    if e.to_string().contains("trailing characters") {
-                        println!("  🎯 Found trailing characters error!");
+        let tool = Tool {
+            r#type: ToolType::Function,
+            function: Function {
+                name: "get_weather".to_string(),
+                description: "Get the weather".to_string(),
+                parameters: serde_json::from_str(
+                    r#"{"type":"object","properties":{}}"#,
+                )
+                .unwrap(),
+            },
+        };
+        let request = LLMRequest {
+            model: "gemini-1.5-pro".to_string(),
+            messages: vec![
+                InputItem::system("You are helpful."),
+                InputItem::user("Hi"),
+            ],
+            temperature: Some(0.5),
+            max_tokens: Some(128),
+            top_p: Some(0.9),
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools: Some(vec![tool]),
+        };
 
-                        // Test our fallback parsing logic
-                        let mut all_events = Vec::new();
-                        for line in json_data.lines() {
-                            let line = line.trim();
-                            if line.is_empty() || line == "[DONE]" {
-                                continue;
-                            }
+        let provider = GoogleProvider::new(
+            "p".to_string(),
+            "us-east1".to_string(),
+            "tok".to_string(),
+        )
+        .unwrap();
+        let google_request = provider.convert_request(&request).unwrap();
+        let json = serde_json::to_value(&google_request).unwrap();
 
-                            match serde_json::from_str::<GoogleResponse>(line) {
-                                Ok(google_response) => {
-                                    let mut test_state = GoogleStreamState::default();
-                                    match GoogleProvider::convert_response_stateful(
-                                        google_response,
-                                        &mut test_state,
-                                    ) {
-                                        Ok(stream_events) => {
-                                            all_events.extend(stream_events);
-                                            println!(
-                                                "  ✅ Successfully parsed line: '{}'",
-                                                line.chars().take(50).collect::<String>()
-                                            );
-                                        }
-                                        Err(e) => {
-                                            println!("  ❌ Failed to convert response: {e}");
-                                        }
-                                    }
-                                }
-                                Err(line_err) => {
-                                    println!(
-                                        "  ⚠️ Failed to parse line '{}': {}",
-                                        line.chars().take(30).collect::<String>(),
-                                        line_err
-                                    );
-                                }
-                            }
-                        }
-                        println!("  📊 Fallback parsing produced {} events", all_events.len());
-                    }
-                }
-            }
-            println!();
-        }
+        // Top-level keys
+        assert!(
+            json.get("generationConfig").is_some(),
+            "request must serialize 'generationConfig' (camelCase), got: {json}",
+        );
+        assert!(
+            json.get("systemInstruction").is_some(),
+            "request must serialize 'systemInstruction' (camelCase), got: {json}",
+        );
+        assert!(
+            json.get("generation_config").is_none(),
+            "request must NOT contain snake_case 'generation_config'",
+        );
+        assert!(
+            json.get("system_instruction").is_none(),
+            "request must NOT contain snake_case 'system_instruction'",
+        );
+
+        // Inside generationConfig
+        let gen_cfg = &json["generationConfig"];
+        assert!(gen_cfg.get("temperature").is_some(), "missing temperature");
+        assert!(gen_cfg.get("maxOutputTokens").is_some(), "missing maxOutputTokens");
+        assert!(gen_cfg.get("topP").is_some(), "missing topP");
+        assert!(
+            gen_cfg.get("max_output_tokens").is_none(),
+            "generationConfig must NOT contain snake_case 'max_output_tokens'",
+        );
+        assert!(
+            gen_cfg.get("top_p").is_none(),
+            "generationConfig must NOT contain snake_case 'top_p'",
+        );
+
+        // Inside tools[0]
+        let tool_obj = &json["tools"][0];
+        assert!(
+            tool_obj.get("functionDeclarations").is_some(),
+            "tools[0] must serialize 'functionDeclarations' (camelCase)",
+        );
+        assert!(
+            tool_obj.get("function_declarations").is_none(),
+            "tools[0] must NOT contain snake_case 'function_declarations'",
+        );
     }
 
     #[tokio::test]
@@ -704,146 +672,30 @@ data: {"candidates": [{"content": {"role": "model","parts": [{"text": ", Japan i
         let byte_stream = stream::iter(byte_chunks);
         let sse_stream = crate::sse_stream::SseStream::new(byte_stream);
 
-        // Process events through our Google SSE handler to see where the issue occurs
         let mut all_parsed_events = Vec::new();
         let mut event_count = 0;
-        let mut shared_state = GoogleStreamState::default(); // Share state across all SSE events like in real usage
+        let mut shared_state = GoogleStreamState::default();
 
         let mut sse_stream = sse_stream;
         while let Some(sse_result) = sse_stream.next().await {
-            match sse_result {
-                Ok(sse_event) => {
-                    event_count += 1;
-                    let data = sse_event.data.trim();
-                    println!("SSE Event #{}: data length = {}", event_count, data.len());
-                    println!(
-                        "SSE Event #{}: first 100 chars = {:?}",
-                        event_count,
-                        data.chars().take(100).collect::<String>()
-                    );
-
-                    if data == "[DONE]" || data.is_empty() {
-                        continue;
-                    }
-
-                    // This is the exact logic from the Google provider
-                    match serde_json::from_str::<GoogleResponse>(data) {
-                        Ok(google_response) => {
-                            match GoogleProvider::convert_response_stateful(
-                                google_response,
-                                &mut shared_state,
-                            ) {
-                                Ok(stream_events) => {
-                                    println!(
-                                        "✅ SSE Event #{}: Successfully parsed {} stream events",
-                                        event_count,
-                                        stream_events.len()
-                                    );
-                                    all_parsed_events.extend(stream_events);
-                                }
-                                Err(e) => {
-                                    println!("❌ SSE Event #{event_count}: Failed to convert: {e}");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            println!("❌ SSE Event #{event_count}: JSON parse error: {e}");
-                            if e.to_string().contains("trailing characters") {
-                                println!("🚨 SSE Event #{event_count}: This is the trailing characters error!");
-                                println!("🔍 Data causing error: {data:?}");
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("❌ SSE parsing error: {e}");
-                }
+            let sse_event = sse_result.expect("SSE should parse correctly");
+            event_count += 1;
+            let data = sse_event.data.trim();
+            if data == "[DONE]" || data.is_empty() {
+                continue;
             }
+            let google_response: GoogleResponse =
+                serde_json::from_str(data).expect("JSON should parse");
+            let stream_events = convert_response_stateful(google_response, &mut shared_state)
+                .expect("conversion should succeed");
+            all_parsed_events.extend(stream_events);
         }
 
-        println!("📊 Total SSE events processed: {event_count}");
-        println!(
-            "📊 Total stream events generated: {}",
-            all_parsed_events.len()
-        );
-
-        // Verify we got separate events, not concatenated ones
         assert_eq!(event_count, 3, "Should have 3 separate SSE events");
         assert_eq!(
             all_parsed_events.len(),
             4,
             "Should generate 4 stream events (1 OutputItemAdded + 3 ContentDelta)"
         );
-    }
-
-    #[tokio::test]
-    async fn test_potential_edge_cases_causing_trailing_chars() {
-        // Test various edge cases that might cause the trailing characters error in production
-
-        // Case 1: CRLF line endings (Windows-style)
-        let crlf_sse = "data: {\"candidates\": [{\"content\": {\"role\": \"model\",\"parts\": [{\"text\": \"Test1\"}]}}]}\r\n\r\ndata: {\"candidates\": [{\"content\": {\"role\": \"model\",\"parts\": [{\"text\": \"Test2\"}]}}]}\r\n\r\n";
-
-        // Case 2: Mixed line endings
-        let mixed_sse = "data: {\"candidates\": [{\"content\": {\"role\": \"model\",\"parts\": [{\"text\": \"Test1\"}]}}]}\r\n\ndata: {\"candidates\": [{\"content\": {\"role\": \"model\",\"parts\": [{\"text\": \"Test2\"}]}}]}\n\r\n";
-
-        // Case 3: UTF-8 BOM at the start
-        let bom_sse = "\u{FEFF}data: {\"candidates\": [{\"content\": {\"role\": \"model\",\"parts\": [{\"text\": \"Test1\"}]}}]}\n\n";
-
-        // Case 4: Extra whitespace in data field
-        let whitespace_sse = "data:  {\"candidates\": [{\"content\": {\"role\": \"model\",\"parts\": [{\"text\": \"Test1\"}]}}]}  \n\n";
-
-        let test_cases = vec![
-            ("CRLF endings", crlf_sse),
-            ("Mixed endings", mixed_sse),
-            ("UTF-8 BOM", bom_sse),
-            ("Extra whitespace", whitespace_sse),
-        ];
-
-        for (case_name, sse_data) in test_cases {
-            println!("Testing case: {case_name}");
-
-            let byte_chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
-                vec![Ok(bytes::Bytes::from(sse_data))];
-
-            let byte_stream = stream::iter(byte_chunks);
-            let sse_stream = crate::sse_stream::SseStream::new(byte_stream);
-
-            let mut events_processed = 0;
-            let mut sse_stream = sse_stream;
-
-            while let Some(sse_result) = sse_stream.next().await {
-                match sse_result {
-                    Ok(sse_event) => {
-                        events_processed += 1;
-                        let data = sse_event.data.trim();
-
-                        if data.is_empty() || data == "[DONE]" {
-                            continue;
-                        }
-
-                        // Try parsing the data
-                        match serde_json::from_str::<GoogleResponse>(data) {
-                            Ok(_) => {
-                                println!("  ✅ Event {events_processed}: Parsed successfully");
-                            }
-                            Err(e) => {
-                                println!("  ❌ Event {events_processed}: Parse error: {e}");
-                                if e.to_string().contains("trailing characters") {
-                                    println!("  🚨 Found trailing characters error in case '{case_name}'!");
-                                    println!("  🔍 Raw data bytes: {:?}", data.as_bytes());
-                                    println!("  🔍 Data repr: {data:?}");
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("  ❌ SSE parse error: {e}");
-                    }
-                }
-            }
-
-            println!("  📊 Total events processed: {events_processed}");
-            println!();
-        }
     }
 }

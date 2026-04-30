@@ -110,7 +110,15 @@ pub enum AnthropicStreamEvent {
     #[serde(rename = "content_block_stop")]
     ContentBlockStop { index: u32 },
     #[serde(rename = "message_delta")]
-    MessageDelta { delta: AnthropicMessageDelta },
+    MessageDelta {
+        delta: AnthropicMessageDelta,
+        // On the wire, `usage` is a top-level sibling of `delta` on
+        // `message_delta` events — NOT nested inside the delta. Decoding it as
+        // a sibling here means the cumulative output_tokens reported by
+        // Anthropic actually reaches our state machine.
+        #[serde(default)]
+        usage: Option<AnthropicUsage>,
+    },
     #[serde(rename = "message_stop")]
     MessageStop,
     #[serde(rename = "ping")]
@@ -127,13 +135,17 @@ pub enum AnthropicContentDelta {
     InputJsonDelta { partial_json: String },
 }
 
-/// Delta for message-level changes.
+/// Delta for message-level changes carried by a `message_delta` event.
+///
+/// Note: `usage` is intentionally NOT a field here. Per Anthropic's wire
+/// format, the `usage` object on `message_delta` is a sibling of `delta`, not
+/// nested inside it — the parent enum variant carries it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnthropicMessageDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub stop_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<AnthropicUsage>,
+    #[serde(default)]
+    pub stop_sequence: Option<String>,
 }
 
 impl From<AnthropicUsage> for Usage {

@@ -46,16 +46,16 @@ impl ProviderTestSetup for GoogleTestSetup {
                     "parts": [{"text": "What's the weather like in Paris?"}]
                 }
             ],
-            "system_instruction": {
+            "systemInstruction": {
                 "role": "user",
                 "parts": [{"text": "You have access to weather data. Use the get_weather function when asked about weather."}]
             },
-            "generation_config": {
+            "generationConfig": {
                 "temperature": 0.7,
-                "max_output_tokens": 150
+                "maxOutputTokens": 150
             },
             "tools": [{
-                "function_declarations": [{
+                "functionDeclarations": [{
                     "name": weather_tool.function.name,
                     "description": weather_tool.function.description,
                     "parameters": weather_tool.function.parameters
@@ -91,13 +91,13 @@ impl ProviderTestSetup for GoogleTestSetup {
                     }]
                 }
             ],
-            "system_instruction": {
+            "systemInstruction": {
                 "role": "user",
                 "parts": [{"text": "You have access to weather data. Use the get_weather function when asked about weather."}]
             },
-            "generation_config": {
+            "generationConfig": {
                 "temperature": 0.7,
-                "max_output_tokens": 150
+                "maxOutputTokens": 150
             }
         });
 

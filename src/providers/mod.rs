@@ -5,4 +5,4 @@ pub mod vertex;
 
 // Re-export commonly used provider types
 pub use openai::OpenAIProvider;
-pub use vertex::{AnthropicViaVertexAuth, AnthropicViaVertexProvider, GoogleAuth, GoogleProvider};
+pub use vertex::{AnthropicViaVertexProvider, GoogleProvider, VertexAuth, VertexTransport};
