@@ -24,6 +24,22 @@ pub struct Usage {
     pub cached_tokens: Option<u32>,
 }
 
+/// Strategy for how the model should use available tools.
+///
+/// Each provider has its own wire shape for this; the conversion happens
+/// inside each provider's `convert_request`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolChoice {
+    /// Default. The model picks whether to call a tool.
+    Auto,
+    /// Disable tools for this request even if `tools` is non-empty.
+    None,
+    /// Force the model to call exactly one tool (any tool).
+    Required,
+    /// Force the model to call this specific tool.
+    Function { name: String },
+}
+
 /// Request structure used by LLM providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LLMRequest {
@@ -36,6 +52,18 @@ pub struct LLMRequest {
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub tools: Option<Vec<super::message::Tool>>,
+    /// How the model should choose among tools.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip)]
+    pub tool_choice: Option<ToolChoice>,
+    /// Whether to allow more than one tool call per turn (OpenAI). `None`
+    /// uses the provider's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// Whether OpenAI should retain the response server-side for use with
+    /// `previous_response_id` chaining. `None` uses the provider's default
+    /// (which is currently `true` for OpenAI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
 }
 
 impl LLMRequest {
@@ -51,6 +79,9 @@ impl LLMRequest {
             presence_penalty: None,
             frequency_penalty: None,
             tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            store: None,
         }
     }
 
@@ -98,6 +129,24 @@ impl LLMRequest {
     /// Set tools/functions for function calling.
     pub fn tools(mut self, tools: Vec<super::message::Tool>) -> Self {
         self.tools = Some(tools);
+        self
+    }
+
+    /// Set the tool choice strategy.
+    pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = Some(choice);
+        self
+    }
+
+    /// Allow or disallow parallel tool calls (OpenAI).
+    pub fn parallel_tool_calls(mut self, parallel: bool) -> Self {
+        self.parallel_tool_calls = Some(parallel);
+        self
+    }
+
+    /// Whether to store the response server-side (OpenAI).
+    pub fn store(mut self, store: bool) -> Self {
+        self.store = Some(store);
         self
     }
 }

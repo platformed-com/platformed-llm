@@ -1,5 +1,6 @@
-use super::types::{ResponsesRequest, ResponsesStreamEvent};
+use super::types::{OpenAIToolChoice, ResponsesRequest, ResponsesStreamEvent};
 use crate::provider::LLMProvider;
+use crate::types::ToolChoice;
 use crate::{Error, LLMRequest, Response, StreamEvent};
 use futures::TryStreamExt as _;
 use reqwest::Client;
@@ -65,11 +66,14 @@ impl OpenAIProvider {
                 .tools
                 .as_ref()
                 .map(|tools| Self::convert_tools(tools)),
-            tool_choice: None, // Will be set later when we add function calling
-            parallel_tool_calls: Some(true),
+            tool_choice: request.tool_choice.as_ref().map(convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
             previous_response_id: None, // Will be set when we add conversation support
             stream: None,               // Will be set by the generate methods
-            store: Some(false),         // Don't store by default for our abstraction
+            // Default to opt-out so callers don't accidentally have prompts
+            // retained server-side. Override via LLMRequest::store(true) when
+            // intentionally chaining via `previous_response_id`.
+            store: Some(request.store.unwrap_or(false)),
         }
     }
 
@@ -109,6 +113,7 @@ impl OpenAIProvider {
     }
 
     /// Convert our internal tools to OpenAI Responses API format.
+    #[allow(clippy::ptr_arg)]
     fn convert_tools(tools: &[crate::types::Tool]) -> Vec<super::types::OpenAITool> {
         tools
             .iter()
@@ -123,6 +128,21 @@ impl OpenAIProvider {
             .collect()
     }
 
+}
+
+fn convert_tool_choice(choice: &ToolChoice) -> OpenAIToolChoice {
+    match choice {
+        ToolChoice::Auto => OpenAIToolChoice::Mode("auto"),
+        ToolChoice::None => OpenAIToolChoice::Mode("none"),
+        ToolChoice::Required => OpenAIToolChoice::Mode("required"),
+        ToolChoice::Function { name } => OpenAIToolChoice::Function {
+            kind: "function",
+            name: name.clone(),
+        },
+    }
+}
+
+impl OpenAIProvider {
     /// Convert an OpenAI streaming event to our `StreamEvent`s.
     ///
     /// `pub(crate)` so unit tests can drive this with synthetic events.
@@ -285,6 +305,60 @@ mod tests {
         assert!(provider.is_ok());
     }
 
+    fn provider() -> OpenAIProvider {
+        OpenAIProvider::new("k".to_string()).unwrap()
+    }
+
+    fn request_with_tool_choice(choice: ToolChoice) -> LLMRequest {
+        LLMRequest::from_prompt("gpt-4", &Prompt::user("hi")).tool_choice(choice)
+    }
+
+    /// `tool_choice` must serialize to OpenAI's expected wire forms:
+    /// the bare strings `"auto"` / `"none"` / `"required"` for modes, and
+    /// `{"type":"function","name":"…"}` for a forced specific tool.
+    #[test]
+    fn tool_choice_serializes_modes_as_strings() {
+        for (choice, expected) in [
+            (ToolChoice::Auto, serde_json::json!("auto")),
+            (ToolChoice::None, serde_json::json!("none")),
+            (ToolChoice::Required, serde_json::json!("required")),
+        ] {
+            let req = provider().convert_request(&request_with_tool_choice(choice.clone()));
+            let json = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                json["tool_choice"], expected,
+                "ToolChoice::{choice:?} should serialize to {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn tool_choice_serializes_function_as_typed_object() {
+        let req = provider().convert_request(&request_with_tool_choice(ToolChoice::Function {
+            name: "get_weather".to_string(),
+        }));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            json["tool_choice"],
+            serde_json::json!({"type": "function", "name": "get_weather"}),
+        );
+    }
+
+    /// `parallel_tool_calls` and `store` should reach the wire when the
+    /// caller sets them, and stay absent when not. Default `store` is false
+    /// (opt-out) so we don't unintentionally retain prompts server-side.
+    #[test]
+    fn parallel_tool_calls_and_store_are_caller_controlled() {
+        let req = provider().convert_request(
+            &LLMRequest::from_prompt("gpt-4", &Prompt::user("hi"))
+                .parallel_tool_calls(false)
+                .store(true),
+        );
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["parallel_tool_calls"], false);
+        assert_eq!(json["store"], true);
+    }
+
     /// On a `response.output_item.done` for a `function_call`, the unified
     /// `FunctionCallComplete.call_id` MUST come from the API's `call_id`
     /// (`call_…`) — not the output item id (`fc_…`). The two are not
@@ -358,6 +432,9 @@ mod tests {
             presence_penalty: None,
             frequency_penalty: None,
             tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            store: None,
         };
 
         let openai_request = provider.convert_request(&request);

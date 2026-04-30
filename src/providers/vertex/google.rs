@@ -519,6 +519,9 @@ mod tests {
             presence_penalty: None,
             frequency_penalty: None,
             tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            store: None,
         };
         let provider = GoogleProvider::new(
             "p".to_string(),
@@ -556,6 +559,9 @@ mod tests {
             presence_penalty: None,
             frequency_penalty: None,
             tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            store: None,
         };
         let provider = GoogleProvider::new(
             "p".to_string(),
@@ -584,9 +590,9 @@ mod tests {
     /// can assert how the latter gets shaped into Vertex's `functionResponse`.
     fn request_with_tool_output(call_id: &str, output: &str) -> LLMRequest {
         use crate::types::{FunctionCall, InputItem};
-        LLMRequest {
-            model: "gemini".to_string(),
-            messages: vec![
+        LLMRequest::new(
+            "gemini",
+            vec![
                 InputItem::user("hi"),
                 InputItem::FunctionCall(FunctionCall {
                     call_id: call_id.to_string(),
@@ -595,14 +601,7 @@ mod tests {
                 }),
                 InputItem::function_call_output(call_id.to_string(), output.to_string()),
             ],
-            temperature: None,
-            max_tokens: None,
-            top_p: None,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            tools: None,
-        }
+        )
     }
 
     fn extract_function_response(req: &GoogleRequest) -> serde_json::Value {
@@ -744,6 +743,9 @@ mod tests {
             presence_penalty: None,
             frequency_penalty: None,
             tools: Some(vec![tool]),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            store: None,
         };
 
         let provider = GoogleProvider::new(

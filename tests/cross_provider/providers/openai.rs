@@ -58,7 +58,6 @@ impl ProviderTestSetup for OpenAITestSetup {
                     "parameters": weather_tool.function.parameters
                 }
             ],
-            "parallel_tool_calls": true,
             "stream": true,
             "store": false
         });
@@ -95,7 +94,6 @@ impl ProviderTestSetup for OpenAITestSetup {
             ],
             "temperature": 0.7,
             "max_output_tokens": 150,
-            "parallel_tool_calls": true,
             "stream": true,
             "store": false
         });

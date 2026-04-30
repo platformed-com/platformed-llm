@@ -49,7 +49,7 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<OpenAITool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<String>,
+    pub tool_choice: Option<OpenAIToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,6 +58,21 @@ pub struct ResponsesRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
+}
+
+/// OpenAI's `tool_choice` accepts either a string mode or a typed object
+/// pointing at a specific tool.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum OpenAIToolChoice {
+    /// `"auto"`, `"none"`, or `"required"`.
+    Mode(&'static str),
+    /// `{"type":"function","name":"..."}`.
+    Function {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        name: String,
+    },
 }
 
 /// OpenAI Responses API response.
