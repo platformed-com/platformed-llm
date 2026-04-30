@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use ijson::ijson;
+use ijson::{ijson, IValue};
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -153,7 +153,7 @@ impl GoogleProvider {
                             last_content.parts.push(GooglePart::FunctionResponse {
                                 function_response: GoogleFunctionResponse {
                                     name: function_name,
-                                    response: ijson!({ "result": output }),
+                                    response: encode_function_output(output),
                                 },
                             });
                         }
@@ -164,7 +164,7 @@ impl GoogleProvider {
                             parts: vec![GooglePart::FunctionResponse {
                                 function_response: GoogleFunctionResponse {
                                     name: function_name,
-                                    response: ijson!({ "result": output }),
+                                    response: encode_function_output(output),
                                 },
                             }],
                         });
@@ -202,6 +202,26 @@ impl GoogleProvider {
         Ok(google_request)
     }
 
+}
+
+/// Shape a tool's output for Gemini's `functionResponse.response` field,
+/// which the API requires to be a JSON object.
+///
+/// - JSON objects pass through unchanged so the model receives structured
+///   data it can reason about.
+/// - JSON non-objects (numbers, arrays, strings, bools, null) are wrapped
+///   under `{"result": <value>}` so we still satisfy the object requirement
+///   without losing structure.
+/// - Non-JSON strings are wrapped under `{"result": "<string>"}`.
+fn encode_function_output(output: &str) -> IValue {
+    match serde_json::from_str::<IValue>(output) {
+        Ok(value) if value.is_object() => value,
+        Ok(value) => ijson!({ "result": value }),
+        Err(_) => ijson!({ "result": output }),
+    }
+}
+
+impl GoogleProvider {
     /// Find the function name associated with a call_id.
     /// This is a simplified implementation that assumes function responses are processed
     /// in the same order as function calls were made.
@@ -519,6 +539,91 @@ mod tests {
 
         // The Done event should be the last event
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    }
+
+    /// Build a request with one FunctionCall + one FunctionCallOutput so we
+    /// can assert how the latter gets shaped into Vertex's `functionResponse`.
+    fn request_with_tool_output(call_id: &str, output: &str) -> LLMRequest {
+        use crate::types::{FunctionCall, InputItem};
+        LLMRequest {
+            model: "gemini".to_string(),
+            messages: vec![
+                InputItem::user("hi"),
+                InputItem::FunctionCall(FunctionCall {
+                    call_id: call_id.to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: r#"{"city":"Paris"}"#.to_string(),
+                }),
+                InputItem::function_call_output(call_id.to_string(), output.to_string()),
+            ],
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools: None,
+        }
+    }
+
+    fn extract_function_response(req: &GoogleRequest) -> serde_json::Value {
+        let json = serde_json::to_value(req).unwrap();
+        let contents = json["contents"].as_array().unwrap();
+        for content in contents.iter().rev() {
+            for part in content["parts"].as_array().unwrap() {
+                if let Some(fr) = part.get("functionResponse") {
+                    return fr["response"].clone();
+                }
+            }
+        }
+        panic!("no functionResponse part found in: {json}");
+    }
+
+    /// JSON-shaped tool output (the common case) should reach Gemini as
+    /// structured JSON. The previous behaviour wrapped every output under
+    /// `{"result": "<json string>"}` so the model only ever saw a stringified
+    /// blob it had to re-parse — and silently double-encoded JSON outputs.
+    #[test]
+    fn function_call_output_with_json_object_is_unwrapped() {
+        let provider = GoogleProvider::new(
+            "p".to_string(),
+            "us-east1".to_string(),
+            "tok".to_string(),
+        )
+        .unwrap();
+        let req = provider
+            .convert_request(&request_with_tool_output(
+                "c1",
+                r#"{"temp":72,"unit":"F"}"#,
+            ))
+            .unwrap();
+        let response = extract_function_response(&req);
+        assert_eq!(
+            response,
+            serde_json::json!({"temp":72,"unit":"F"}),
+            "JSON object outputs should be passed through, not wrapped",
+        );
+    }
+
+    /// Non-JSON string outputs still need to satisfy Gemini's "response must
+    /// be a JSON object" requirement, so wrap under `{"result": "..."}`.
+    #[test]
+    fn function_call_output_with_plain_string_is_wrapped_under_result() {
+        let provider = GoogleProvider::new(
+            "p".to_string(),
+            "us-east1".to_string(),
+            "tok".to_string(),
+        )
+        .unwrap();
+        let req = provider
+            .convert_request(&request_with_tool_output("c1", "Sunny, 72F"))
+            .unwrap();
+        let response = extract_function_response(&req);
+        assert_eq!(
+            response,
+            serde_json::json!({"result": "Sunny, 72F"}),
+            "non-JSON outputs are wrapped under 'result'",
+        );
     }
 
     /// When Vertex blocks a prompt at the safety layer, it returns
