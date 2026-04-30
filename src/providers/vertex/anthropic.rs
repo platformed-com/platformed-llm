@@ -304,11 +304,11 @@ fn merge_anthropic_usage(target: &mut Usage, src: &AnthropicUsage) {
     if let Some(t) = src.output_tokens {
         target.output_tokens = t;
     }
-    // Note: `cache_creation_input_tokens` is currently aliased onto
-    // `cached_tokens` for parity with the existing `From` impl; Phase 3.4 will
-    // split this out properly into separate cache_read / cache_create fields.
+    if let Some(t) = src.cache_read_input_tokens {
+        target.cache_read_input_tokens = Some(t);
+    }
     if let Some(t) = src.cache_creation_input_tokens {
-        target.cached_tokens = Some(t);
+        target.cache_creation_input_tokens = Some(t);
     }
 }
 
@@ -487,6 +487,37 @@ mod tests {
             );
         }
         out
+    }
+
+    /// Anthropic distinguishes `cache_creation_input_tokens` (writes,
+    /// 1.25× billing) from `cache_read_input_tokens` (hits, ~10% billing).
+    /// The previous mapping conflated the two; both now reach the unified
+    /// `Usage` on their own fields.
+    #[test]
+    fn anthropic_cache_tokens_split_correctly() {
+        let mut state = StreamState::default();
+        let evt = parse(
+            r#"{
+                "type":"message_start",
+                "message":{
+                    "id":"m","model":"c","role":"assistant","content":[],
+                    "usage":{
+                        "input_tokens":1,"output_tokens":0,
+                        "cache_creation_input_tokens":3,
+                        "cache_read_input_tokens":4
+                    }
+                }
+            }"#,
+        );
+        let _ = convert_stream_event_stateful(evt, &mut state).unwrap();
+        let evt = parse(r#"{"type":"message_stop"}"#);
+        let events = convert_stream_event_stateful(evt, &mut state).unwrap();
+        let usage = match &events[0] {
+            StreamEvent::Done { usage, .. } => usage.clone(),
+            other => panic!("expected Done, got {other:?}"),
+        };
+        assert_eq!(usage.cache_creation_input_tokens, Some(3));
+        assert_eq!(usage.cache_read_input_tokens, Some(4));
     }
 
     /// `message_delta` carries the canonical `stop_reason` (and on the wire,

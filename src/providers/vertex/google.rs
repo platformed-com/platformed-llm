@@ -586,6 +586,39 @@ mod tests {
         );
     }
 
+    /// Gemini 2.5 thinking models report tokens spent on internal
+    /// reasoning under `thoughtsTokenCount`, and prompt-cache hits under
+    /// `cachedContentTokenCount`. Both must reach the unified `Usage`.
+    #[test]
+    fn gemini_thoughts_and_cache_tokens_propagate() {
+        let json = r#"{
+            "candidates":[{
+                "content":{"role":"model","parts":[{"text":""}]},
+                "finishReason":"STOP"
+            }],
+            "usageMetadata":{
+                "promptTokenCount":10,
+                "candidatesTokenCount":20,
+                "thoughtsTokenCount":15,
+                "cachedContentTokenCount":5
+            }
+        }"#;
+        let response: GoogleResponse = serde_json::from_str(json).unwrap();
+        let mut state = GoogleStreamState::default();
+        let events = convert_response_stateful(response, &mut state).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Done { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .expect("Done event with usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.reasoning_tokens, Some(15));
+        assert_eq!(usage.cache_read_input_tokens, Some(5));
+    }
+
     /// Build a request with one FunctionCall + one FunctionCallOutput so we
     /// can assert how the latter gets shaped into Vertex's `functionResponse`.
     fn request_with_tool_output(call_id: &str, output: &str) -> LLMRequest {

@@ -16,12 +16,31 @@ pub enum ProviderConfig {
     },
 }
 
-/// Token usage information.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Token usage information across providers.
+///
+/// Not every provider populates every field — fields specific to one
+/// provider's billing model (cache create/read, reasoning) are `Option`
+/// and stay `None` for providers that don't report them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
+    /// Tokens in the prompt.
     pub input_tokens: u32,
+    /// Tokens in the completion.
     pub output_tokens: u32,
-    pub cached_tokens: Option<u32>,
+    /// Cached input tokens that were *read* from the prompt cache (charged
+    /// at a discount). Reported by Anthropic as `cache_read_input_tokens`,
+    /// by OpenAI under `input_tokens_details.cached_tokens`, and by Gemini
+    /// as `cachedContentTokenCount`.
+    pub cache_read_input_tokens: Option<u32>,
+    /// Input tokens *written* to the cache on this request (Anthropic-only;
+    /// charged at a 1.25× premium). Reported as
+    /// `cache_creation_input_tokens`.
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Output tokens spent on the model's internal reasoning (gpt-5 /
+    /// o-series and Gemini thinking). OpenAI reports this under
+    /// `output_tokens_details.reasoning_tokens`; Gemini reports it as
+    /// `thoughtsTokenCount`.
+    pub reasoning_tokens: Option<u32>,
 }
 
 /// Strategy for how the model should use available tools.

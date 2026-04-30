@@ -126,12 +126,19 @@ pub struct GoogleCandidate {
 /// Google usage metadata.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GoogleUsageMetadata {
-    #[serde(rename = "promptTokenCount")]
+    #[serde(default, rename = "promptTokenCount")]
     pub prompt_token_count: Option<u32>,
-    #[serde(rename = "candidatesTokenCount")]
+    #[serde(default, rename = "candidatesTokenCount")]
     pub candidates_token_count: Option<u32>,
-    #[serde(rename = "totalTokenCount")]
+    #[serde(default, rename = "totalTokenCount")]
     pub total_token_count: Option<u32>,
+    /// Output tokens used for the model's internal reasoning, on Gemini 2.5
+    /// thinking models.
+    #[serde(default, rename = "thoughtsTokenCount")]
+    pub thoughts_token_count: Option<u32>,
+    /// Tokens served from the prompt cache.
+    #[serde(default, rename = "cachedContentTokenCount")]
+    pub cached_content_token_count: Option<u32>,
 }
 
 impl From<GoogleUsageMetadata> for Usage {
@@ -139,7 +146,9 @@ impl From<GoogleUsageMetadata> for Usage {
         Usage {
             input_tokens: metadata.prompt_token_count.unwrap_or(0),
             output_tokens: metadata.candidates_token_count.unwrap_or(0),
-            cached_tokens: None, // Google doesn't provide cached token info
+            cache_read_input_tokens: metadata.cached_content_token_count,
+            cache_creation_input_tokens: None,
+            reasoning_tokens: metadata.thoughts_token_count,
         }
     }
 }
