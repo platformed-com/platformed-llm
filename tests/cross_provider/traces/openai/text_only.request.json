@@ -1,0 +1,13 @@
+{
+  "input": [
+    {
+      "content": "Say the single word 'hello' and nothing else.",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 256,
+  "model": "gpt-4o-mini",
+  "store": false,
+  "stream": true
+}

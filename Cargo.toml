@@ -38,7 +38,10 @@ gcp_auth = "0.12"
 uuid = { version = "1.0", features = ["v4"] }
 
 [dev-dependencies]
-tokio = { version = "1.40", features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1.40", features = ["macros", "rt", "rt-multi-thread", "process"] }
+# Lib leaves TLS to the downstream consumer; tests/examples need to make
+# real HTTPS calls so we enable rustls-tls only here.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 wiremock = "0.6"
 dotenvy = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

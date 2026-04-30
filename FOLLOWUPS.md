@@ -165,19 +165,27 @@ Easy fix once decided whether to wire them or remove them from
 
 ## Testing gaps
 
-- **No real-HTTP integration tests against any provider.** All current
-  tests either drive the conversion / state-machine functions directly
-  with synthetic events, or use `wiremock` against fixture SSE bodies.
-  The fixtures came from real captured traffic for the function-calling
-  e2e tests, but the rest of the test surface is built from spec/docs
-  and could drift if a provider changes its wire format.
-- **SSE byte-builder helper** (Phase 0.5): originally planned, deferred
-  because the existing fixtures + free-function conversion tests covered
-  Phase 1-3 needs. Worth picking up alongside fuzz/property tests for
-  the SSE parser.
+- **Trace capture system is in place** (`cargo run --example
+  capture_traces`) but no traces have been committed yet. The first run
+  of the binary against a real account will populate
+  `tests/cross_provider/traces/` and unlock `cargo test --test
+  replay_traces` as a meaningful regression check. Until then the
+  replay test no-ops.
 - **OpenAI HTTP error mapping is unit-tested but not e2e-tested.**
   `parse_openai_error` has unit tests for 401/429/500; the wiremock
   cross-provider suite never asserts that a 429 surfaces as
-  `Error::RateLimit` end-to-end through `generate()`.
+  `Error::RateLimit` end-to-end through `generate()`. Easy to add
+  alongside the trace-driven tests.
 - **No tests for cancellation.** Dropping a `Response` mid-stream
-  should abort the underlying request. Behavior is unverified.
+  should abort the underlying request. Behaviour is unverified.
+- **No property/fuzz tests on the SSE parser.** Worth adding
+  proptest-style tests that feed arbitrary chunk boundaries through
+  the parser and verify event ordering is invariant.
+- **Snapshot-style tests on the unified event stream.** A trace
+  replayed through the parser produces a deterministic sequence of
+  unified events. Snapshotting that sequence (via `insta` or similar)
+  would make wire-shape regressions trivial to review as a PR diff.
+- **No error-path captures.** The capture tool currently only handles
+  the success path. Worth extending it to capture deliberately failing
+  requests (bad key → 401, malformed body → 400, etc.) so the typed
+  error mapping has real-world data to verify against.

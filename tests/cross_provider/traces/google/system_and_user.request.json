@@ -1,0 +1,23 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "PARROT"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 256
+  },
+  "systemInstruction": {
+    "parts": [
+      {
+        "text": "You are a terse parrot. Reply with exactly the word the user gives you, lowercased."
+      }
+    ],
+    "role": "system"
+  }
+}
