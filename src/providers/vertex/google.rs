@@ -45,130 +45,85 @@ impl GoogleProvider {
 
     /// Convert internal request to Google format.
     fn convert_request(&self, request: &LLMRequest) -> Result<GoogleRequest, Error> {
-        let mut contents = Vec::new();
+        let mut contents: Vec<GoogleContent> = Vec::new();
         let mut system_instruction = None;
+
+        // Append a part to the last content with the same role, otherwise
+        // start a new content. Vertex rejects consecutive same-role contents,
+        // and this also matches how function_call / function_response
+        // sequences need to fold into the surrounding model/user turns.
+        fn push_part(contents: &mut Vec<GoogleContent>, role: &str, part: GooglePart) {
+            if let Some(last) = contents.last_mut() {
+                if last.role == role {
+                    last.parts.push(part);
+                    return;
+                }
+            }
+            contents.push(GoogleContent {
+                role: role.to_string(),
+                parts: vec![part],
+            });
+        }
 
         for item in &request.messages {
             match item {
-                InputItem::Message(msg) => {
-                    match msg.role {
-                        Role::System => {
-                            // Google uses system_instruction field for system messages
-                            system_instruction = Some(GoogleContent {
-                                role: "user".to_string(), // System instructions are treated as user content
-                                parts: vec![GooglePart::Text {
-                                    text: msg.content.clone(),
-                                }],
-                            });
-                        }
-                        Role::User => {
-                            contents.push(GoogleContent {
-                                role: "user".to_string(),
-                                parts: vec![GooglePart::Text {
-                                    text: msg.content.clone(),
-                                }],
-                            });
-                        }
-                        Role::Assistant => {
-                            contents.push(GoogleContent {
-                                role: "model".to_string(),
-                                parts: vec![GooglePart::Text {
-                                    text: msg.content.clone(),
-                                }],
-                            });
-                        }
-                    }
-                }
-                InputItem::FunctionCall(call) => {
-                    // Add function call to the last model response or create a new one
-                    if let Some(last_content) = contents.last_mut() {
-                        if last_content.role == "model" {
-                            last_content.parts.push(GooglePart::FunctionCall {
-                                function_call: GoogleFunctionCall {
-                                    name: call.name.clone(),
-                                    args: serde_json::from_str(&call.arguments).map_err(|e| {
-                                        Error::provider(
-                                            "Google",
-                                            format!("Invalid function arguments: {e}"),
-                                        )
-                                    })?,
-                                },
-                            });
-                        } else {
-                            // Create a new model content with the function call
-                            contents.push(GoogleContent {
-                                role: "model".to_string(),
-                                parts: vec![GooglePart::FunctionCall {
-                                    function_call: GoogleFunctionCall {
-                                        name: call.name.clone(),
-                                        args: serde_json::from_str(&call.arguments).map_err(
-                                            |e| {
-                                                Error::provider(
-                                                    "Google",
-                                                    format!("Invalid function arguments: {e}"),
-                                                )
-                                            },
-                                        )?,
-                                    },
-                                }],
-                            });
-                        }
-                    } else {
-                        contents.push(GoogleContent {
-                            role: "model".to_string(),
-                            parts: vec![GooglePart::FunctionCall {
-                                function_call: GoogleFunctionCall {
-                                    name: call.name.clone(),
-                                    args: serde_json::from_str(&call.arguments).map_err(|e| {
-                                        Error::provider(
-                                            "Google",
-                                            format!("Invalid function arguments: {e}"),
-                                        )
-                                    })?,
-                                },
+                InputItem::Message(msg) => match msg.role {
+                    Role::System => {
+                        // Vertex's `systemInstruction` doesn't take a role.
+                        // Setting it to "system" is the conventional choice
+                        // when a role is required by the type; "user" was
+                        // both wrong and misleading.
+                        system_instruction = Some(GoogleContent {
+                            role: "system".to_string(),
+                            parts: vec![GooglePart::Text {
+                                text: msg.content.clone(),
                             }],
                         });
                     }
+                    Role::User => push_part(
+                        &mut contents,
+                        "user",
+                        GooglePart::Text {
+                            text: msg.content.clone(),
+                        },
+                    ),
+                    Role::Assistant => push_part(
+                        &mut contents,
+                        "model",
+                        GooglePart::Text {
+                            text: msg.content.clone(),
+                        },
+                    ),
+                },
+                InputItem::FunctionCall(call) => {
+                    let args = serde_json::from_str(&call.arguments).map_err(|e| {
+                        Error::provider("Google", format!("Invalid function arguments: {e}"))
+                    })?;
+                    push_part(
+                        &mut contents,
+                        "model",
+                        GooglePart::FunctionCall {
+                            function_call: GoogleFunctionCall {
+                                name: call.name.clone(),
+                                args,
+                            },
+                        },
+                    );
                 }
                 InputItem::FunctionCallOutput { call_id, output } => {
-                    // Find the function name for this call_id
                     let function_name = self
                         .find_function_name_by_call_id(&contents, call_id)
                         .unwrap_or_else(|| "unknown".to_string());
-
-                    // Check if the last content is already a user message with function responses
-                    let should_append = if let Some(last_content) = contents.last() {
-                        last_content.role == "user"
-                            && last_content
-                                .parts
-                                .iter()
-                                .any(|p| matches!(p, GooglePart::FunctionResponse { .. }))
-                    } else {
-                        false
-                    };
-
-                    if should_append {
-                        // Add this response to the existing user message
-                        if let Some(last_content) = contents.last_mut() {
-                            last_content.parts.push(GooglePart::FunctionResponse {
-                                function_response: GoogleFunctionResponse {
-                                    name: function_name,
-                                    response: encode_function_output(output),
-                                },
-                            });
-                        }
-                    } else {
-                        // Create a new user message with the function response
-                        contents.push(GoogleContent {
-                            role: "user".to_string(),
-                            parts: vec![GooglePart::FunctionResponse {
-                                function_response: GoogleFunctionResponse {
-                                    name: function_name,
-                                    response: encode_function_output(output),
-                                },
-                            }],
-                        });
-                    }
+                    push_part(
+                        &mut contents,
+                        "user",
+                        GooglePart::FunctionResponse {
+                            function_response: GoogleFunctionResponse {
+                                name: function_name,
+                                response: encode_function_output(output),
+                            },
+                        },
+                    );
                 }
             }
         }
@@ -539,6 +494,87 @@ mod tests {
 
         // The Done event should be the last event
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    }
+
+    /// Vertex's `systemInstruction` should NOT carry `role: "user"`. The
+    /// canonical role for a system instruction is `"system"` (or omitted).
+    /// The previous code mislabeled it as `"user"`, which is misleading and
+    /// may confuse some models.
+    #[test]
+    fn system_instruction_role_is_not_user() {
+        use crate::types::InputItem;
+        let req = LLMRequest {
+            model: "gemini".to_string(),
+            messages: vec![
+                InputItem::system("you are helpful"),
+                InputItem::user("hi"),
+            ],
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools: None,
+        };
+        let provider = GoogleProvider::new(
+            "p".to_string(),
+            "us-east1".to_string(),
+            "tok".to_string(),
+        )
+        .unwrap();
+        let body = provider.convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let role = json["systemInstruction"]["role"].as_str();
+        assert!(
+            role != Some("user"),
+            "systemInstruction must not carry role: 'user' (got {role:?})",
+        );
+    }
+
+    /// Vertex rejects consecutive same-role contents in `contents`. If the
+    /// caller hands us two adjacent assistant messages, fold them into a
+    /// single content entry with multiple parts.
+    #[test]
+    fn consecutive_same_role_messages_are_merged() {
+        use crate::types::InputItem;
+        let req = LLMRequest {
+            model: "gemini".to_string(),
+            messages: vec![
+                InputItem::user("first user"),
+                InputItem::assistant("first assistant"),
+                InputItem::assistant("second assistant"),
+                InputItem::user("second user"),
+            ],
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools: None,
+        };
+        let provider = GoogleProvider::new(
+            "p".to_string(),
+            "us-east1".to_string(),
+            "tok".to_string(),
+        )
+        .unwrap();
+        let body = provider.convert_request(&req).unwrap();
+        // Expect exactly 3 contents: user, model (with 2 parts), user.
+        assert_eq!(
+            body.contents.len(),
+            3,
+            "consecutive same-role messages should fold; got {} entries: {:?}",
+            body.contents.len(),
+            body.contents.iter().map(|c| &c.role).collect::<Vec<_>>(),
+        );
+        assert_eq!(body.contents[1].role, "model");
+        assert_eq!(
+            body.contents[1].parts.len(),
+            2,
+            "merged model content should have two text parts",
+        );
     }
 
     /// Build a request with one FunctionCall + one FunctionCallOutput so we

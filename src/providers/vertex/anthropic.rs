@@ -111,10 +111,14 @@ impl AnthropicViaVertexProvider {
                     }
                 }
                 InputItem::FunctionCallOutput { call_id, output } => {
-                    // Add tool result to a user message
+                    // Add tool result to a user message. Anthropic's content
+                    // is text-based; we preserve the output verbatim. Future
+                    // work (multi-modal tool returns / explicit is_error)
+                    // can lift the InputItem to carry richer info.
                     let tool_result_block = AnthropicContentBlock::ToolResult {
                         tool_use_id: call_id.clone(),
-                        content: output.clone(),
+                        content: AnthropicToolResultContent::Text(output.clone()),
+                        is_error: None,
                     };
 
                     // Check if the last message is already a user message with tool results
@@ -587,6 +591,54 @@ mod tests {
             "deltas must accumulate, got: {:?}",
             call.arguments,
         );
+    }
+
+    /// `tool_result` blocks must support both string content (the common
+    /// case) and the array-of-blocks form (used when a tool returns
+    /// images or text-with-images), plus an optional `is_error` flag.
+    #[test]
+    fn tool_result_round_trips_string_and_block_array_forms() {
+        // String content
+        let v: AnthropicContentBlock = serde_json::from_str(
+            r#"{"type":"tool_result","tool_use_id":"t1","content":"plain string"}"#,
+        )
+        .expect("string content should parse");
+        match &v {
+            AnthropicContentBlock::ToolResult {
+                content,
+                is_error,
+                tool_use_id,
+            } => {
+                assert_eq!(tool_use_id, "t1");
+                assert!(is_error.is_none());
+                assert!(matches!(
+                    content,
+                    AnthropicToolResultContent::Text(s) if s == "plain string"
+                ));
+            }
+            _ => panic!("expected ToolResult, got {v:?}"),
+        }
+
+        // Block array content with is_error
+        let v: AnthropicContentBlock = serde_json::from_str(
+            r#"{"type":"tool_result","tool_use_id":"t2","is_error":true,
+                "content":[{"type":"text","text":"oops"}]}"#,
+        )
+        .expect("block-array content should parse");
+        match &v {
+            AnthropicContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(*is_error, Some(true));
+                match content {
+                    AnthropicToolResultContent::Blocks(blocks) => {
+                        assert_eq!(blocks.len(), 1);
+                    }
+                    _ => panic!("expected Blocks, got {content:?}"),
+                }
+            }
+            _ => panic!("expected ToolResult"),
+        }
     }
 
     /// Extended-thinking blocks must parse — the previous schema only knew

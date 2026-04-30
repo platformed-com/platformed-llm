@@ -53,7 +53,11 @@ pub enum AnthropicContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: AnthropicToolResultContent,
+        /// Set to `true` to signal the tool failed. The model uses this to
+        /// distinguish error returns from success returns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
     },
     /// Extended-thinking block. The model's chain-of-thought reasoning;
     /// `signature` must be echoed back unchanged in subsequent turns to
@@ -70,6 +74,26 @@ pub enum AnthropicContentBlock {
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
     /// Image content block (request side).
+    #[serde(rename = "image")]
+    Image { source: IValue },
+}
+
+/// `tool_result.content` accepts either a plain string or an array of
+/// content blocks (the latter is used when a tool returns multi-modal
+/// content — e.g. an image alongside text).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AnthropicToolResultContent {
+    Text(String),
+    Blocks(Vec<AnthropicToolResultBlock>),
+}
+
+/// Block forms acceptable inside a `tool_result.content` array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AnthropicToolResultBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
     #[serde(rename = "image")]
     Image { source: IValue },
 }

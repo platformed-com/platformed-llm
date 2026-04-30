@@ -47,7 +47,7 @@ impl ProviderTestSetup for GoogleTestSetup {
                 }
             ],
             "systemInstruction": {
-                "role": "user",
+                "role": "system",
                 "parts": [{"text": "You have access to weather data. Use the get_weather function when asked about weather."}]
             },
             "generationConfig": {
@@ -92,7 +92,7 @@ impl ProviderTestSetup for GoogleTestSetup {
                 }
             ],
             "systemInstruction": {
-                "role": "user",
+                "role": "system",
                 "parts": [{"text": "You have access to weather data. Use the get_weather function when asked about weather."}]
             },
             "generationConfig": {
