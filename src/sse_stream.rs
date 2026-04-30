@@ -100,7 +100,12 @@ impl EventBuffer {
             .map_err(|e| Error::streaming(format!("Invalid UTF-8 in SSE event: {e}")))?;
 
         if line.is_empty() {
+            // A blank line terminates the in-flight event. Crucially, return
+            // here — falling through into the field/value parsing below was
+            // harmless (the empty `field` hit the comment branch) but
+            // fragile.
             self.dispatch_event();
+            return Ok(());
         }
 
         let (field, mut value) = line.split_once(':').unwrap_or((line, ""));
@@ -196,20 +201,21 @@ where
             {
                 self.parse_buffer(&chunk)?;
             } else {
+                // EOF. Per the SSE spec, dispatch any in-flight event
+                // rather than erroring. Some servers omit the final
+                // `\n\n` after their last frame; previous code surfaced
+                // that as an "Incomplete event at end of stream" error
+                // which masked the real payload.
                 if !self.line_buffer.is_empty() {
-                    return Poll::Ready(Some(Err(Error::streaming(format!(
-                        "Incomplete line buffer at end of stream: {}",
-                        String::from_utf8_lossy(&self.line_buffer)
-                    )))));
+                    let line = std::mem::take(&mut self.line_buffer);
+                    self.events.process_line(&line)?;
                 }
-
                 if !self.events.current_event.is_empty() {
-                    return Poll::Ready(Some(Err(Error::streaming(format!(
-                        "Incomplete event at end of stream: {:?}",
-                        self.events.current_event
-                    )))));
+                    self.events.dispatch_event();
                 }
-
+                if let Some(event) = self.events.pop() {
+                    return Poll::Ready(Some(Ok(event)));
+                }
                 return Poll::Ready(None);
             };
         }
@@ -480,6 +486,54 @@ mod tests {
         assert_eq!(event2.data, "event");
 
         assert!(sse_stream2.next().await.is_none());
+    }
+
+    /// Per the SSE spec, lines starting with `:` are comments and must
+    /// produce no event. The comment-only event must NOT be dispatched as
+    /// a phantom message.
+    #[tokio::test]
+    async fn comments_do_not_dispatch_events() {
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![Ok(bytes::Bytes::from(
+            ":keep-alive\n\n: another comment\n\ndata: hello\n\n",
+        ))];
+        let mut stream = stream::iter(chunks).sse_events();
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            event.data, "hello",
+            "comments should be skipped and only data: hello should fire",
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    /// A keep-alive comment followed by data on the same conceptual event
+    /// should still dispatch the data event correctly.
+    #[tokio::test]
+    async fn comment_inside_event_does_not_break_parsing() {
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+            vec![Ok(bytes::Bytes::from(":heartbeat\nevent: m\ndata: x\n\n"))];
+        let mut stream = stream::iter(chunks).sse_events();
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.event_type, "m");
+        assert_eq!(event.data, "x");
+    }
+
+    /// Per the SSE spec, EOF should dispatch any in-flight event rather
+    /// than producing an error. Some servers omit the final `\n\n` after
+    /// the last data line; the previous code surfaced that as an
+    /// "Incomplete event at end of stream" error which masked the real
+    /// payload.
+    #[tokio::test]
+    async fn eof_without_blank_line_dispatches_pending_event() {
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+            vec![Ok(bytes::Bytes::from("data: final"))];
+        let mut stream = stream::iter(chunks).sse_events();
+        let event = stream
+            .next()
+            .await
+            .expect("should yield the in-flight event")
+            .expect("not error");
+        assert_eq!(event.data, "final");
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
