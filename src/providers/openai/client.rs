@@ -319,6 +319,54 @@ impl OpenAIProvider {
                     }));
                 }
             }
+            "response.incomplete" => {
+                // Terminal event when the model didn't run to completion
+                // (typically a max_output_tokens hit, sometimes a content
+                // filter). Map `incomplete_details.reason` onto our
+                // FinishReason so callers can branch on Length /
+                // ContentFilter without poking at provider-specific
+                // payloads.
+                if let Some(response) = event.response {
+                    let finish_reason = match response
+                        .incomplete_details
+                        .as_ref()
+                        .map(|d| d.reason.as_str())
+                    {
+                        Some("max_output_tokens") => crate::types::FinishReason::Length,
+                        Some("content_filter") => crate::types::FinishReason::ContentFilter,
+                        // Forward-compat: unknown reasons still produce a
+                        // Done so the stream terminates cleanly.
+                        _ => crate::types::FinishReason::Stop,
+                    };
+                    return Ok(Some(StreamEvent::Done {
+                        finish_reason,
+                        usage: response.usage.unwrap_or_default(),
+                    }));
+                }
+            }
+            "response.failed" => {
+                // Terminal failure — surface it as a streaming-level error
+                // so the caller's `?` short-circuits. We don't emit a Done
+                // because the model did not produce a usable response.
+                if let Some(response) = event.response {
+                    let message = response
+                        .error
+                        .as_ref()
+                        .map(|e| format!("{}: {}", e.r#type, e.message))
+                        .unwrap_or_else(|| "response failed without error details".to_string());
+                    return Err(Error::provider("OpenAI", format!("response.failed — {message}")));
+                }
+                if let Some(error) = &event.error {
+                    return Err(Error::provider(
+                        "OpenAI",
+                        format!("response.failed — {}: {}", error.r#type, error.message),
+                    ));
+                }
+                return Err(Error::provider(
+                    "OpenAI",
+                    "response.failed without details",
+                ));
+            }
             _ => {
                 // Ignore other event types for now
             }

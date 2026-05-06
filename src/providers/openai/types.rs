@@ -97,6 +97,19 @@ pub struct ResponsesResponse {
     pub model: String,
     pub output: Vec<ResponseItem>,
     pub usage: Option<Usage>,
+    /// Populated by `response.incomplete` events with `{ reason: ... }`
+    /// where `reason` is one of `max_output_tokens`, `content_filter`,
+    /// or similar. We map this onto `FinishReason::Length` /
+    /// `ContentFilter` so callers see a sensible terminal state.
+    #[serde(default)]
+    pub incomplete_details: Option<IncompleteDetails>,
+    /// Populated by `response.failed` events with details on why the
+    /// model run could not complete (rate limits, server error, etc.).
+    /// Mapped onto `FinishReason::ContentFilter` only when the failure
+    /// was an explicit safety/policy block; otherwise treated as a
+    /// streaming-level error.
+    #[serde(default)]
+    pub error: Option<ErrorDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,6 +157,15 @@ pub struct ErrorDetails {
     pub param: Option<String>,
     #[allow(unused)]
     pub code: Option<String>,
+}
+
+/// `response.incomplete_details` payload — the model didn't run to
+/// completion. `reason` is `"max_output_tokens"`, `"content_filter"`, or
+/// (rarely) something else; treat unknown values as `Stop` so the
+/// terminal event still fires.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IncompleteDetails {
+    pub reason: String,
 }
 
 /// OpenAI streaming Responses API event.
