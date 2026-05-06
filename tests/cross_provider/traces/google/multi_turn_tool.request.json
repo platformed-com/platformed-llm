@@ -34,12 +34,7 @@
               "temperature_c": 22
             }
           }
-        }
-      ],
-      "role": "user"
-    },
-    {
-      "parts": [
+        },
         {
           "text": "Summarise it in one short sentence."
         }

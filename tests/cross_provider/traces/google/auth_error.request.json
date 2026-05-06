@@ -8,5 +8,6 @@
       ],
       "role": "user"
     }
-  ]
+  ],
+  "generationConfig": {}
 }

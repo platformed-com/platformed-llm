@@ -1,4 +1,4 @@
 OutputItemAdded text
-ContentDelta "The weather in Paris is sunny with a temperature of 22"
-ContentDelta " degrees Celsius."
-Done finish=Stop input=52 output=16 reasoning=61
+ContentDelta "\n"
+ContentDelta "The weather in Paris is sunny with a temperature of 22 degrees Celsius."
+Done finish=Stop input=52 output=17

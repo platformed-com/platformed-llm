@@ -1,11 +1,11 @@
 {
-  "captured_at_unix": 1778071585,
+  "captured_at_unix": 1778075568,
   "endpoint": "https://europe-west1-aiplatform.googleapis.com/v1/projects/platformed-dev/locations/europe-west1/publishers/google/models/gemini-this-model-does-not-exist:streamGenerateContent?alt=sse",
   "expect_failure": true,
   "headers": {
     "content-type": "text/event-stream"
   },
-  "latency_ms": 83,
+  "latency_ms": 172,
   "model": "gemini-this-model-does-not-exist",
   "provider": "google",
   "response_bytes": 416,
