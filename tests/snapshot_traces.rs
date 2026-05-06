@@ -271,6 +271,24 @@ fn format_events(events: &[StreamEvent]) -> String {
     out
 }
 
+/// Shape sanity that must hold for any captured success-path replay,
+/// independent of the snapshot. Run *before* write/compare so a buggy
+/// bootstrap can't silently bake bad behaviour into the golden file.
+fn validate_event_sequence(events: &[StreamEvent]) -> Result<(), String> {
+    let dones = events
+        .iter()
+        .filter(|e| matches!(e, StreamEvent::Done { .. }))
+        .count();
+    if dones != 1 {
+        return Err(format!("expected exactly one Done event, got {dones}"));
+    }
+    let last_is_done = matches!(events.last(), Some(StreamEvent::Done { .. }));
+    if !last_is_done {
+        return Err("Done event is not the last event in the stream".to_string());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn unified_event_snapshots_match() {
     let traces = load_all_traces();
@@ -284,6 +302,12 @@ async fn unified_event_snapshots_match() {
     for trace in &traces {
         let label = format!("{}/{}", trace.provider.dir_name(), trace.scenario);
         let events = replay(trace).await;
+
+        if let Err(msg) = validate_event_sequence(&events) {
+            failures.push(format!("{label}: {msg}"));
+            continue;
+        }
+
         let actual = format_events(&events);
 
         let snapshot_exists = trace.snapshot_path.exists();
