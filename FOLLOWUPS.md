@@ -147,10 +147,6 @@ Easy fix once decided whether to wire them or remove them from
 - **OpenAI refusal handling**: `response.refusal.delta` / `.done` events
   are silently dropped. Should surface as a typed `StreamEvent::Refusal`
   (or fold into `Error::ContentFilter`).
-- **OpenAI `response.failed` / `response.incomplete`**: not handled,
-  which means `FinishReason::ContentFilter` / `Length` are unreachable
-  via OpenAI today. The dispatcher needs `incomplete_details.reason`
-  mapping.
 - **OpenAI `OpenAI-Organization` / `OpenAI-Project` headers**: optional,
   but multi-org / project-scoped keys won't work without them.
 - **Anthropic `cache_control: Ephemeral`** on tools / system / message
@@ -184,6 +180,19 @@ Done in the testing-gap sweep:
   `Vec<StreamEvent>` against a checked-in `.events.txt`. Volatile IDs
   are masked to `<id-N>` so wire-shape regressions show up cleanly in
   the PR diff. `UPDATE_SNAPSHOTS=1` regenerates.
+- Real-API scenario coverage broadened: scenario schema now supports
+  per-provider overrides (`model`, `auth_override`, `extra_body`,
+  `skip`), `expect_failure`, and richer message shapes (assistant
+  `tool_calls`, `tool` role). New captures cover `multi_turn_tool`,
+  `length_limit`, `parallel_tools`, `reasoning_request` (OpenAI
+  gpt-5-mini), `auth_error` (real 401 envelopes), and
+  `model_not_found` (real 4xx envelopes).
+- Real error-path captures with typed-error verification:
+  `tests/error_traces_e2e.rs` walks captures with `meta.status != 200`,
+  replays each through the matching provider's `generate()` via
+  wiremock with the captured status + body, and asserts the typed
+  `Error` variant matches expectations. `http_errors_e2e.rs` covers
+  the same parser against synthetic bodies.
 
 Still open:
 
@@ -191,8 +200,13 @@ Still open:
   multi-region work needed first, plus a project that has Claude
   enabled in Vertex Model Garden). Replay/snapshot tests no-op for
   Anthropic until then.
-- **No error-path captures.** The capture tool only handles the
-  success path. Extend it to capture deliberately failing requests
-  (bad key → 401, malformed body → 400, etc.) so typed-error mapping
-  has real-world data to verify against — currently the wiremock e2e
-  tests use synthetic OpenAI-shaped error bodies.
+- **Google / Anthropic typed-error mapping**: the Vertex providers
+  collapse every non-2xx into `Error::Provider("Google", "API
+  error: ...")` / `Error::Provider("Anthropic", ...)`. The captured
+  Vertex 401 body has `"status": "UNAUTHENTICATED"` and a 404 has
+  `"status": "NOT_FOUND"` — easy mappings to `Error::Auth` /
+  `Error::ModelNotAvailable` once the Phase 5 error redesign lands.
+- **OpenAI `response.refusal.delta` / `.done`**: still dropped; the
+  captured suite doesn't currently hit a real refusal scenario. Worth
+  adding once we have a prompt that reliably elicits one without
+  poking the policy boundaries.
