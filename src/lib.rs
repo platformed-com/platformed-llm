@@ -10,6 +10,7 @@ pub mod provider;
 pub mod providers;
 pub mod response;
 pub mod sse_stream;
+pub mod transport;
 pub mod types;
 
 // Re-export core types for easy usage
@@ -20,4 +21,5 @@ pub use provider::LLMProvider;
 pub use providers::*;
 pub use response::*;
 pub use sse_stream::SseEvent;
+pub use transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
 pub use types::*;
