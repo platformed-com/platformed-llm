@@ -1,0 +1,36 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "What is the weather in Paris, London, and Tokyo right now? Call the tool once per city."
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 256
+  },
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "description": "Get the current weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ]
+}

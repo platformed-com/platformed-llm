@@ -1,0 +1,16 @@
+OutputItemAdded text
+ContentDelta "The"
+ContentDelta " weather"
+ContentDelta " in"
+ContentDelta " Paris"
+ContentDelta " is"
+ContentDelta " sunny"
+ContentDelta " with"
+ContentDelta " a"
+ContentDelta " temperature"
+ContentDelta " of"
+ContentDelta " "
+ContentDelta "22"
+ContentDelta "°C"
+ContentDelta "."
+Done finish=Stop input=100 output=16

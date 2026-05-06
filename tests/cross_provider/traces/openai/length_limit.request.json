@@ -1,0 +1,13 @@
+{
+  "input": [
+    {
+      "content": "Write a detailed five-paragraph essay about the history of clouds.",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 16,
+  "model": "gpt-4o-mini",
+  "store": false,
+  "stream": true
+}

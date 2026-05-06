@@ -1,0 +1,18 @@
+OutputItemAdded text
+ContentDelta "##"
+ContentDelta " The"
+ContentDelta " History"
+ContentDelta " of"
+ContentDelta " Clouds"
+ContentDelta ":"
+ContentDelta " From"
+ContentDelta " Ancient"
+ContentDelta " Observ"
+ContentDelta "ations"
+ContentDelta " to"
+ContentDelta " Modern"
+ContentDelta " Science"
+ContentDelta "\n\n"
+ContentDelta "Throughout"
+ContentDelta " human"
+Done finish=Length input=20 output=16

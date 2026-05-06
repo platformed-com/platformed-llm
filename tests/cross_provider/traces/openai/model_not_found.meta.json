@@ -1,0 +1,18 @@
+{
+  "captured_at_unix": 1778071623,
+  "endpoint": "https://api.openai.com/v1/responses",
+  "expect_failure": true,
+  "headers": {
+    "content-type": "application/json",
+    "openai-organization": "platformed-02snf0",
+    "openai-processing-ms": "311",
+    "openai-version": "2020-10-01",
+    "x-request-id": "req_841e22801d6c4e5ca7742972bc93269e"
+  },
+  "latency_ms": 1062,
+  "model": "gpt-5-this-model-does-not-exist",
+  "provider": "openai",
+  "response_bytes": 197,
+  "scenario": "model_not_found",
+  "status": 400
+}

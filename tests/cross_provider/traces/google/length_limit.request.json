@@ -1,0 +1,15 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Write a detailed five-paragraph essay about the history of clouds."
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 16
+  }
+}

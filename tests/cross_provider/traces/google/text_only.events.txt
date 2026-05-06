@@ -1,3 +1,3 @@
 OutputItemAdded text
 ContentDelta "hello"
-Done finish=Stop input=11 output=1 reasoning=21
+Done finish=Stop input=11 output=1 reasoning=19

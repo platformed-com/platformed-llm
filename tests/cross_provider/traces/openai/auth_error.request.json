@@ -1,0 +1,12 @@
+{
+  "input": [
+    {
+      "content": "Hello.",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "model": "gpt-4o-mini",
+  "store": false,
+  "stream": true
+}

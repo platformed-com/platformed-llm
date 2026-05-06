@@ -1,0 +1,15 @@
+{
+  "captured_at_unix": 1778071622,
+  "endpoint": "https://api.openai.com/v1/responses",
+  "expect_failure": true,
+  "headers": {
+    "content-type": "text/plain",
+    "x-request-id": "req_45355480b0bb4b0d94663c4b6e70286f"
+  },
+  "latency_ms": 297,
+  "model": "gpt-4o-mini",
+  "provider": "openai",
+  "response_bytes": 271,
+  "scenario": "auth_error",
+  "status": 401
+}
