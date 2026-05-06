@@ -1,0 +1,4 @@
+OutputItemAdded text
+ContentDelta "par"
+ContentDelta "rot"
+Done finish=Stop input=34 output=3

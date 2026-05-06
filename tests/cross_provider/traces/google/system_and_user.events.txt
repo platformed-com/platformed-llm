@@ -1,0 +1,3 @@
+OutputItemAdded text
+ContentDelta "parrot"
+Done finish=Stop input=22 output=1 reasoning=24
