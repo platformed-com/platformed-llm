@@ -1,50 +1,46 @@
 use super::types::{OpenAIReasoning, OpenAIToolChoice, ResponsesRequest, ResponsesStreamEvent};
 use crate::provider::LLMProvider;
+use crate::transport::{Transport, TransportRequest};
 use crate::types::{ReasoningConfig, ReasoningEffort, ReasoningSummary, ToolChoice};
 use crate::{Error, LLMRequest, Response, StreamEvent};
 use futures::TryStreamExt as _;
-use reqwest::Client;
-use std::time::Duration;
 use tracing::debug;
 
 /// OpenAI provider implementation.
 pub struct OpenAIProvider {
-    client: Client,
+    transport: Transport,
     api_key: String,
     base_url: String,
 }
 
-/// Connect timeout for the underlying HTTP client.
-///
-/// We deliberately do **not** set a total request timeout — streaming
-/// reasoning responses (gpt-5 / o-series) can legitimately run for many
-/// minutes, and a whole-request timeout aborts them mid-stream.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn build_client() -> Result<Client, Error> {
-    Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(Error::from)
-}
-
 impl OpenAIProvider {
-    /// Create a new OpenAI provider.
+    /// Create a new OpenAI provider with the default reqwest-backed transport.
     pub fn new(api_key: String) -> Result<Self, Error> {
         Ok(Self {
-            client: build_client()?,
+            transport: Transport::reqwest()?,
             api_key,
             base_url: "https://api.openai.com/v1".to_string(),
         })
     }
 
-    /// Create a new OpenAI provider with custom base URL.
+    /// Create a new OpenAI provider with a custom base URL and the default transport.
     pub fn new_with_base_url(api_key: String, base_url: String) -> Result<Self, Error> {
         Ok(Self {
-            client: build_client()?,
+            transport: Transport::reqwest()?,
             api_key,
             base_url,
         })
+    }
+
+    /// Create a new OpenAI provider with a caller-supplied transport. Lets
+    /// downstream consumers (or tests) plug in a recording / replaying /
+    /// retrying [`Transport`] without touching the rest of the provider.
+    pub fn with_transport(api_key: String, base_url: String, transport: Transport) -> Self {
+        Self {
+            transport,
+            api_key,
+            base_url,
+        }
     }
 
     /// Convert internal request to OpenAI Responses API format.
@@ -388,32 +384,34 @@ impl LLMProvider for OpenAIProvider {
             "sending OpenAI Responses API request"
         );
 
-        let response = self
-            .client
-            .post(format!("{}/responses", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&openai_request)
-            .send()
-            .await?;
+        let body = serde_json::to_vec(&openai_request)?;
+        let req = TransportRequest {
+            url: format!("{}/responses", self.base_url),
+            headers: vec![
+                (
+                    "Authorization".to_string(),
+                    format!("Bearer {}", self.api_key),
+                ),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            body,
+        };
+        let response = self.transport.send(req).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
+        if !(200..300).contains(&response.status) {
+            let status = response.status;
             let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
+                .header("retry-after")
                 .and_then(|s| s.parse::<u64>().ok());
-            let body = response.text().await.unwrap_or_default();
-            return Err(parse_openai_error(status, retry_after, &body));
+            let body_bytes = response.collect_body().await.unwrap_or_default();
+            let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+            return Err(parse_openai_error(status, retry_after, &body_str));
         }
-
-        // Create a stream from the response bytes
-        let byte_stream = response.bytes_stream();
 
         // Use the clean SSE stream adapter
         use crate::sse_stream::SseStreamExt;
-        let event_stream = byte_stream
+        let event_stream = response
+            .body
             .sse_events()
             .try_filter_map(|sse_event| async move {
                 debug!(event = ?sse_event, "received OpenAI SSE event");
