@@ -1,33 +1,28 @@
-//! Shared transport for Vertex AI providers.
+//! Shared auth + URL routing for Vertex AI providers.
 //!
 //! Both `GoogleProvider` (Gemini) and `AnthropicViaVertexProvider` (Claude on
 //! Vertex) hit `https://{location}-aiplatform.googleapis.com` with the same
-//! auth, the same client, and almost identical URL shapes. This module owns
-//! that plumbing in one place so each provider only has to translate
-//! request/response payloads.
+//! Google auth flow and almost identical URL shapes. This module owns those
+//! two pieces — *not* the HTTP client, which is now a top-level
+//! [`crate::Transport`] each provider holds independently.
 //!
-//! The transport supports both static access tokens and Application Default
-//! Credentials (via `gcp_auth`). For tests, callers can override the host with
-//! [`VertexTransport::with_base_url`].
+//! The endpoint supports both static access tokens and Application Default
+//! Credentials (via `gcp_auth`). Tests can override the host with
+//! [`VertexEndpoint::with_base_url`].
+//!
+//! Renamed from `VertexTransport` once the actual HTTP transport became a
+//! lib-wide concept; calling this a "transport" was misleading because it
+//! never carried bytes.
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use gcp_auth::TokenProvider;
-use reqwest::{Client, RequestBuilder};
 
 use crate::Error;
 
 /// OAuth scope used for all Vertex AI calls.
 const VERTEX_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
-
-/// Connect timeout for the underlying HTTP client.
-///
-/// We deliberately do **not** set a total request timeout — streaming
-/// responses (especially with extended thinking / reasoning) can run for
-/// many minutes, and a whole-request timeout would abort them mid-stream.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Authentication state for Vertex AI.
 #[derive(Clone)]
@@ -48,40 +43,38 @@ impl fmt::Debug for VertexAuth {
     }
 }
 
-/// Shared transport for Vertex AI providers.
+/// Vertex AI auth + URL helper. Cheap to clone (auth state is `Arc`d
+/// internally for the ADC variant).
 #[derive(Debug, Clone)]
-pub struct VertexTransport {
-    client: Client,
+pub struct VertexEndpoint {
     project_id: String,
     location: String,
     base_url: Option<String>,
     auth: VertexAuth,
 }
 
-impl VertexTransport {
-    /// Build a transport from a static access token (sync — no network calls).
+impl VertexEndpoint {
+    /// Build from a static access token (sync — no network calls).
     pub fn with_access_token(
         project_id: String,
         location: String,
         access_token: String,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            client: build_client()?,
+    ) -> Self {
+        Self {
             project_id,
             location,
             base_url: None,
             auth: VertexAuth::Static(access_token),
-        })
+        }
     }
 
-    /// Build a transport using Application Default Credentials. Async because
+    /// Build using Application Default Credentials. Async because
     /// `gcp_auth::provider()` may need to discover the credential source.
     pub async fn with_adc(project_id: String, location: String) -> Result<Self, Error> {
         let provider = gcp_auth::provider()
             .await
             .map_err(|e| Error::auth(format!("failed to create ADC provider: {e}")))?;
         Ok(Self {
-            client: build_client()?,
             project_id,
             location,
             base_url: None,
@@ -96,11 +89,6 @@ impl VertexTransport {
         self
     }
 
-    /// The HTTP client.
-    pub fn client(&self) -> &Client {
-        &self.client
-    }
-
     /// The configured location/region (e.g. `us-east1`, `global`).
     pub fn location(&self) -> &str {
         &self.location
@@ -113,7 +101,7 @@ impl VertexTransport {
     /// - `method` is the verb (`generateContent`, `streamGenerateContent`,
     ///   `rawPredict`, `streamRawPredict`).
     /// - `query` is appended verbatim after `?`, or omitted when `None`.
-    pub fn endpoint(
+    pub fn url(
         &self,
         publisher: &str,
         model: &str,
@@ -152,18 +140,13 @@ impl VertexTransport {
         }
     }
 
-    /// Attach `Authorization: Bearer …` to a request builder.
-    pub async fn authorize(&self, builder: RequestBuilder) -> Result<RequestBuilder, Error> {
+    /// Build the `Authorization: Bearer …` header tuple. Sugar over
+    /// [`access_token`] for the common case where the provider just needs
+    /// to attach it to a `TransportRequest.headers`.
+    pub async fn auth_header(&self) -> Result<(String, String), Error> {
         let token = self.access_token().await?;
-        Ok(builder.header("Authorization", format!("Bearer {token}")))
+        Ok(("Authorization".to_string(), format!("Bearer {token}")))
     }
-}
-
-fn build_client() -> Result<Client, Error> {
-    Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(Error::from)
 }
 
 /// Resolve the default Vertex AI host for a location.
@@ -186,63 +169,71 @@ fn default_host(location: &str) -> String {
 mod tests {
     use super::*;
 
-    fn transport(location: &str) -> VertexTransport {
-        VertexTransport::with_access_token(
+    fn endpoint(location: &str) -> VertexEndpoint {
+        VertexEndpoint::with_access_token(
             "proj-1".to_string(),
             location.to_string(),
             "tok".to_string(),
         )
-        .unwrap()
     }
 
     #[test]
-    fn endpoint_regional_with_query() {
-        let t = transport("us-east1");
+    fn url_regional_with_query() {
+        let t = endpoint("us-east1");
         assert_eq!(
-            t.endpoint("google", "gemini-1.5-pro", "streamGenerateContent", Some("alt=sse")),
+            t.url("google", "gemini-1.5-pro", "streamGenerateContent", Some("alt=sse")),
             "https://us-east1-aiplatform.googleapis.com/v1/projects/proj-1/locations/us-east1/publishers/google/models/gemini-1.5-pro:streamGenerateContent?alt=sse"
         );
     }
 
     #[test]
-    fn endpoint_regional_no_query() {
-        let t = transport("us-east1");
+    fn url_regional_no_query() {
+        let t = endpoint("us-east1");
         assert_eq!(
-            t.endpoint("anthropic", "claude-sonnet-4", "streamRawPredict", None),
+            t.url("anthropic", "claude-sonnet-4", "streamRawPredict", None),
             "https://us-east1-aiplatform.googleapis.com/v1/projects/proj-1/locations/us-east1/publishers/anthropic/models/claude-sonnet-4:streamRawPredict"
         );
     }
 
     #[test]
-    fn endpoint_global_uses_unprefixed_host() {
-        let t = transport("global");
+    fn url_global_uses_unprefixed_host() {
+        let t = endpoint("global");
         assert_eq!(
-            t.endpoint("anthropic", "claude-sonnet-4", "streamRawPredict", None),
+            t.url("anthropic", "claude-sonnet-4", "streamRawPredict", None),
             "https://aiplatform.googleapis.com/v1/projects/proj-1/locations/global/publishers/anthropic/models/claude-sonnet-4:streamRawPredict"
         );
     }
 
     #[test]
-    fn endpoint_respects_base_url_override() {
-        let t = transport("us-east1").with_base_url("http://localhost:1234");
+    fn url_respects_base_url_override() {
+        let t = endpoint("us-east1").with_base_url("http://localhost:1234");
         assert_eq!(
-            t.endpoint("google", "gemini", "generateContent", None),
+            t.url("google", "gemini", "generateContent", None),
             "http://localhost:1234/v1/projects/proj-1/locations/us-east1/publishers/google/models/gemini:generateContent"
         );
     }
 
     #[test]
-    fn endpoint_strips_trailing_slash_from_base_url() {
-        let t = transport("us-east1").with_base_url("http://localhost:1234/");
+    fn url_strips_trailing_slash_from_base_url() {
+        let t = endpoint("us-east1").with_base_url("http://localhost:1234/");
         assert_eq!(
-            t.endpoint("google", "gemini", "generateContent", None),
+            t.url("google", "gemini", "generateContent", None),
             "http://localhost:1234/v1/projects/proj-1/locations/us-east1/publishers/google/models/gemini:generateContent"
         );
     }
 
     #[tokio::test]
     async fn access_token_returns_static_token() {
-        let t = transport("us-east1");
+        let t = endpoint("us-east1");
         assert_eq!(t.access_token().await.unwrap(), "tok");
+    }
+
+    #[tokio::test]
+    async fn auth_header_sugar() {
+        let t = endpoint("us-east1");
+        assert_eq!(
+            t.auth_header().await.unwrap(),
+            ("Authorization".to_string(), "Bearer tok".to_string()),
+        );
     }
 }

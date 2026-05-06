@@ -2,22 +2,25 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 
 use super::anthropic_types::*;
-use super::transport::VertexTransport;
+use super::endpoint::VertexEndpoint;
 use crate::provider::LLMProvider;
 use crate::sse_stream::SseStream;
+use crate::transport::{Transport, TransportRequest};
 use crate::types::{FinishReason, FunctionCall, InputItem, ReasoningEffort, Role, Usage};
 use crate::{Error, LLMRequest, Response, StreamEvent};
 
 /// Anthropic Claude provider implementation via Vertex AI.
 pub struct AnthropicViaVertexProvider {
-    transport: VertexTransport,
+    endpoint: VertexEndpoint,
+    transport: Transport,
 }
 
 impl AnthropicViaVertexProvider {
     /// Create a new Anthropic provider with access token authentication.
     pub fn new(project_id: String, location: String, access_token: String) -> Result<Self, Error> {
         Ok(Self {
-            transport: VertexTransport::with_access_token(project_id, location, access_token)?,
+            endpoint: VertexEndpoint::with_access_token(project_id, location, access_token),
+            transport: Transport::reqwest()?,
         })
     }
 
@@ -29,16 +32,24 @@ impl AnthropicViaVertexProvider {
         base_url: String,
     ) -> Result<Self, Error> {
         Ok(Self {
-            transport: VertexTransport::with_access_token(project_id, location, access_token)?
+            endpoint: VertexEndpoint::with_access_token(project_id, location, access_token)
                 .with_base_url(base_url),
+            transport: Transport::reqwest()?,
         })
     }
 
     /// Create a new Anthropic provider with Application Default Credentials.
     pub async fn with_adc(project_id: String, location: String) -> Result<Self, Error> {
         Ok(Self {
-            transport: VertexTransport::with_adc(project_id, location).await?,
+            endpoint: VertexEndpoint::with_adc(project_id, location).await?,
+            transport: Transport::reqwest()?,
         })
+    }
+
+    /// Create a new Anthropic provider with a caller-supplied [`Transport`]
+    /// and pre-built [`VertexEndpoint`].
+    pub fn with_transport(endpoint: VertexEndpoint, transport: Transport) -> Self {
+        Self { endpoint, transport }
     }
 
     /// Convert internal request to Anthropic format.
@@ -211,25 +222,27 @@ impl LLMProvider for AnthropicViaVertexProvider {
     async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
         let anthropic_request = self.convert_request(request)?;
 
-        let endpoint = self.transport.endpoint(
+        let url = self.endpoint.url(
             "anthropic",
             &request.model,
             "streamRawPredict",
             Some("alt=sse"),
         );
 
-        let builder = self
-            .transport
-            .client()
-            .post(&endpoint)
-            .header("Content-Type", "application/json")
-            .json(&anthropic_request);
-        let request_builder = self.transport.authorize(builder).await?;
+        let body = serde_json::to_vec(&anthropic_request)?;
+        let req = TransportRequest {
+            url,
+            headers: vec![
+                self.endpoint.auth_header().await?,
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            body,
+        };
+        let response = self.transport.send(req).await?;
 
-        let response = request_builder.send().await?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
+        if !(200..300).contains(&response.status) {
+            let body_bytes = response.collect_body().await.unwrap_or_default();
+            let error_text = String::from_utf8_lossy(&body_bytes);
             return Err(Error::provider(
                 "Anthropic",
                 format!("API error: {error_text}"),
@@ -237,8 +250,7 @@ impl LLMProvider for AnthropicViaVertexProvider {
         }
 
         // Create SSE stream from response
-        let byte_stream = response.bytes_stream();
-        let sse_stream = SseStream::new(byte_stream);
+        let sse_stream = SseStream::new(response.body);
 
         // Create a stateful processor for function call tracking
         let mut state = StreamState::default();

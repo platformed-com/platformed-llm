@@ -2,23 +2,26 @@ use futures_util::StreamExt;
 use ijson::{ijson, IValue};
 use uuid::Uuid;
 
+use super::endpoint::VertexEndpoint;
 use super::google_types::*;
-use super::transport::VertexTransport;
 use crate::provider::LLMProvider;
 use crate::sse_stream::SseStream;
+use crate::transport::{Transport, TransportRequest};
 use crate::types::{FinishReason, FunctionCall, InputItem, Role};
 use crate::{Error, LLMRequest, Response, StreamEvent};
 
 /// Google provider implementation via Vertex AI (for Gemini models).
 pub struct GoogleProvider {
-    transport: VertexTransport,
+    endpoint: VertexEndpoint,
+    transport: Transport,
 }
 
 impl GoogleProvider {
     /// Create a new Google provider with access token authentication.
     pub fn new(project_id: String, location: String, access_token: String) -> Result<Self, Error> {
         Ok(Self {
-            transport: VertexTransport::with_access_token(project_id, location, access_token)?,
+            endpoint: VertexEndpoint::with_access_token(project_id, location, access_token),
+            transport: Transport::reqwest()?,
         })
     }
 
@@ -30,16 +33,25 @@ impl GoogleProvider {
         base_url: String,
     ) -> Result<Self, Error> {
         Ok(Self {
-            transport: VertexTransport::with_access_token(project_id, location, access_token)?
+            endpoint: VertexEndpoint::with_access_token(project_id, location, access_token)
                 .with_base_url(base_url),
+            transport: Transport::reqwest()?,
         })
     }
 
     /// Create a new Google provider with Application Default Credentials.
     pub async fn with_adc(project_id: String, location: String) -> Result<Self, Error> {
         Ok(Self {
-            transport: VertexTransport::with_adc(project_id, location).await?,
+            endpoint: VertexEndpoint::with_adc(project_id, location).await?,
+            transport: Transport::reqwest()?,
         })
+    }
+
+    /// Create a new Google provider with a caller-supplied [`Transport`]
+    /// and pre-built [`VertexEndpoint`]. Lets downstream consumers / tests
+    /// plug in custom recording / replaying / retrying transports.
+    pub fn with_transport(endpoint: VertexEndpoint, transport: Transport) -> Self {
+        Self { endpoint, transport }
     }
 
     /// Convert internal request to Google format.
@@ -197,25 +209,27 @@ impl LLMProvider for GoogleProvider {
     async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
         let google_request = self.convert_request(request)?;
 
-        let endpoint = self.transport.endpoint(
+        let url = self.endpoint.url(
             "google",
             &request.model,
             "streamGenerateContent",
             Some("alt=sse"),
         );
 
-        let builder = self
-            .transport
-            .client()
-            .post(&endpoint)
-            .header("Content-Type", "application/json")
-            .json(&google_request);
-        let request_builder = self.transport.authorize(builder).await?;
+        let body = serde_json::to_vec(&google_request)?;
+        let req = TransportRequest {
+            url,
+            headers: vec![
+                self.endpoint.auth_header().await?,
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            body,
+        };
+        let response = self.transport.send(req).await?;
 
-        let response = request_builder.send().await?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
+        if !(200..300).contains(&response.status) {
+            let body_bytes = response.collect_body().await.unwrap_or_default();
+            let error_text = String::from_utf8_lossy(&body_bytes);
             return Err(Error::provider(
                 "Google",
                 format!("API error: {error_text}"),
@@ -223,8 +237,7 @@ impl LLMProvider for GoogleProvider {
         }
 
         // Create SSE stream from response (Gemini supports ?alt=sse)
-        let byte_stream = response.bytes_stream();
-        let sse_stream = SseStream::new(byte_stream);
+        let sse_stream = SseStream::new(response.body);
 
         // Create a stateful processor for tracking output items
         let mut state = GoogleStreamState::default();
