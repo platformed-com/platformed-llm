@@ -96,6 +96,17 @@ fn load_all_traces() -> Vec<Trace> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("model")
                 .to_string();
+            // Error captures don't have an SSE-shaped body. They're
+            // exercised by `error_traces_e2e` instead.
+            let meta = read_json(&dir.join(format!("{scenario}.meta.json")));
+            let status = meta
+                .as_ref()
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(200);
+            if status != 200 {
+                continue;
+            }
             let response_sse = fs::read(&path).unwrap();
             let snapshot_path = dir.join(format!("{scenario}.events.txt"));
             traces.push(Trace {

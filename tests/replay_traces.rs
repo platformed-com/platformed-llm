@@ -99,6 +99,14 @@ fn load_all_traces() -> Vec<Trace> {
             };
             let meta = read_json(&dir.join(format!("{scenario}.meta.json")))
                 .unwrap_or(Value::Object(Default::default()));
+            // Error captures (expect_failure scenarios) save the 4xx body
+            // verbatim — it's not SSE and it's tested separately by
+            // `error_traces_e2e`. Skip them here so this test stays focused
+            // on the SSE-success path.
+            let status = meta.get("status").and_then(|v| v.as_u64()).unwrap_or(200);
+            if status != 200 {
+                continue;
+            }
             let response_sse = fs::read(&path).unwrap();
             traces.push(Trace {
                 provider,

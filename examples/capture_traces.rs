@@ -34,8 +34,9 @@
 //!   capture timestamp, latency. Useful for debugging; tests should NOT
 //!   read volatile fields from this.
 //!
-//! Scenarios live in `tests/scenarios.json` (data, not code). To add a
-//! scenario, edit that file and re-run.
+//! Scenarios live in `tests/scenarios.json` (data, not code). See the
+//! comment at the top of that file for the full schema, including
+//! per-provider overrides and `expect_failure` for error-path captures.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -46,7 +47,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -75,15 +76,52 @@ struct Scenario {
     max_tokens: Option<u32>,
     #[serde(default)]
     temperature: Option<f32>,
+    #[serde(default)]
+    expect_failure: bool,
+    #[serde(default)]
+    providers: BTreeMap<String, ProviderOverride>,
     messages: Vec<ScenarioMessage>,
     #[serde(default)]
     tools: Vec<ScenarioTool>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct ProviderOverride {
+    #[serde(default)]
+    skip: bool,
+    #[serde(default)]
+    model: Option<String>,
+    /// Literal token to send instead of the resolved bearer. Useful for 401
+    /// captures. Never written to the saved request body.
+    #[serde(default)]
+    auth_override: Option<String>,
+    /// Free-form provider-specific JSON merged into the request body just
+    /// before send (e.g. `parallel_tool_calls`, `reasoning`,
+    /// `thinkingConfig`).
+    #[serde(default)]
+    extra_body: Option<Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ScenarioMessage {
     role: String,
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    /// Assistant role: prior tool calls the model emitted in this turn.
+    #[serde(default)]
+    tool_calls: Vec<ScenarioToolCall>,
+    /// `tool` role: which assistant tool call this message answers.
+    #[serde(default)]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ScenarioToolCall {
+    id: String,
+    name: String,
+    /// JSON-encoded string. Matches OpenAI's wire format; we re-parse for
+    /// Gemini/Anthropic.
+    arguments: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -151,15 +189,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(&dir)?;
 
         for scenario in &scenarios {
-            let model = match provider {
-                Provider::OpenAI => &config.defaults.models.openai,
-                Provider::Google => &config.defaults.models.google,
-                Provider::Anthropic => &config.defaults.models.anthropic,
-            };
+            let overrides = scenario
+                .providers
+                .get(provider.name())
+                .cloned()
+                .unwrap_or_default();
+            if overrides.skip {
+                println!("[{}] {} ... skip", provider.name(), scenario.name);
+                continue;
+            }
+            let model = overrides.model.clone().unwrap_or_else(|| {
+                match provider {
+                    Provider::OpenAI => config.defaults.models.openai.clone(),
+                    Provider::Google => config.defaults.models.google.clone(),
+                    Provider::Anthropic => config.defaults.models.anthropic.clone(),
+                }
+            });
             print!("[{}] {} ... ", provider.name(), scenario.name);
             std::io::Write::flush(&mut std::io::stdout()).ok();
             let started = Instant::now();
-            match capture_one(provider, scenario, model, &dir).await {
+            match capture_one(provider, scenario, &model, &overrides, &dir).await {
                 Ok(status) => println!("ok ({} in {:?})", status, started.elapsed()),
                 Err(e) => {
                     println!("ERR: {e}");
@@ -206,11 +255,18 @@ async fn capture_one(
     provider: Provider,
     scenario: &Scenario,
     model: &str,
+    overrides: &ProviderOverride,
     dir: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let body = build_body(provider, scenario, model);
+    let mut body = build_body(provider, scenario, model);
+    if let Some(extra) = &overrides.extra_body {
+        merge_into(&mut body, extra);
+    }
     let endpoint = endpoint_for(provider, model)?;
-    let token = token_for(provider).await?;
+    let token = match &overrides.auth_override {
+        Some(t) => t.clone(),
+        None => token_for(provider).await?,
+    };
 
     let client = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
@@ -264,18 +320,50 @@ async fn capture_one(
         "captured_at_unix": captured_at,
         "latency_ms": elapsed.as_millis(),
         "response_bytes": response_bytes.len(),
+        "expect_failure": scenario.expect_failure,
     });
     fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
 
-    if !status.is_success() {
+    let succeeded_http = status.is_success();
+    if scenario.expect_failure {
+        if succeeded_http {
+            return Err(format!(
+                "expected non-2xx but got HTTP {} (saved body to {})",
+                status,
+                resp_path.display(),
+            )
+            .into());
+        }
+        return Ok(format!(
+            "{} expect_failure status={}",
+            resp_path.display(),
+            status.as_u16(),
+        ));
+    }
+    if !succeeded_http {
         return Err(format!(
             "HTTP {} (saved body to {})",
             status,
-            resp_path.display()
+            resp_path.display(),
         )
         .into());
     }
     Ok(format!("{} status={}", resp_path.display(), status.as_u16()))
+}
+
+/// Recursively merge `src` into `dst`. Object keys from `src` overwrite
+/// scalars and merge into nested objects; arrays are replaced wholesale.
+fn merge_into(dst: &mut Value, src: &Value) {
+    match (dst, src) {
+        (Value::Object(d), Value::Object(s)) => {
+            for (k, v) in s {
+                merge_into(d.entry(k.clone()).or_insert(Value::Null), v);
+            }
+        }
+        (slot, other) => {
+            *slot = other.clone();
+        }
+    }
 }
 
 /// Headers worth keeping. Skip cookies, opaque IDs that vary per request, etc.
@@ -414,17 +502,47 @@ fn build_body(provider: Provider, scenario: &Scenario, model: &str) -> Value {
 }
 
 fn build_openai(scenario: &Scenario, model: &str) -> Value {
-    let input: Vec<Value> = scenario
-        .messages
-        .iter()
-        .map(|m| {
-            json!({
-                "type": "message",
-                "role": m.role,
-                "content": m.content,
-            })
-        })
-        .collect();
+    // OpenAI Responses API: function_call and function_call_output are
+    // top-level input items, not nested under role=assistant. Walk the
+    // unified scenario messages and split assistant turns with tool_calls
+    // into a message + N function_call items.
+    let mut input: Vec<Value> = Vec::new();
+    for m in &scenario.messages {
+        match m.role.as_str() {
+            "tool" => {
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "output": m.content.clone().unwrap_or_default(),
+                }));
+            }
+            "assistant" if !m.tool_calls.is_empty() => {
+                if let Some(text) = m.content.as_ref().filter(|s| !s.is_empty()) {
+                    input.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": text,
+                    }));
+                }
+                for tc in &m.tool_calls {
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    }));
+                }
+            }
+            other => {
+                input.push(json!({
+                    "type": "message",
+                    "role": other,
+                    "content": m.content.clone().unwrap_or_default(),
+                }));
+            }
+        }
+    }
+
     let mut body = json!({
         "model": model,
         "input": input,
@@ -457,23 +575,77 @@ fn build_openai(scenario: &Scenario, model: &str) -> Value {
 
 fn build_gemini(scenario: &Scenario, _model: &str) -> Value {
     // Gemini routes the system message to a separate `systemInstruction`
-    // field; everything else lands in `contents`.
+    // field; everything else lands in `contents` with role=user|model.
+    // Tool results go in role=user content with a functionResponse part;
+    // assistant tool calls go in role=model content with functionCall parts.
     let mut contents: Vec<Value> = Vec::new();
     let mut system_instruction: Option<Value> = None;
     for m in &scenario.messages {
-        let part = json!({ "text": m.content });
         match m.role.as_str() {
             "system" => {
-                system_instruction = Some(json!({
-                    "role": "system",
-                    "parts": [part],
+                if let Some(text) = m.content.as_ref() {
+                    system_instruction = Some(json!({
+                        "role": "system",
+                        "parts": [{ "text": text }],
+                    }));
+                }
+            }
+            "tool" => {
+                // functionResponse always lands under role=user per the
+                // Gemini contract. The `name` field must echo the original
+                // tool name; we don't have it directly here, so we leave it
+                // empty and rely on tests that need it to do their own
+                // wiring. In practice scenarios that exercise tool round-
+                // trip should pre-populate the `name` via the
+                // ScenarioMessage.tool_call_id mapped from the prior
+                // assistant turn.
+                let response = serde_json::from_str::<Value>(
+                    m.content.as_deref().unwrap_or("{}"),
+                )
+                .unwrap_or_else(|_| json!({ "result": m.content.clone().unwrap_or_default() }));
+                let tool_name = lookup_tool_name(scenario, m.tool_call_id.as_deref());
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": tool_name,
+                            "response": response,
+                        }
+                    }],
                 }));
             }
+            "assistant" if !m.tool_calls.is_empty() => {
+                let mut parts: Vec<Value> = Vec::new();
+                if let Some(text) = m.content.as_ref().filter(|s| !s.is_empty()) {
+                    parts.push(json!({ "text": text }));
+                }
+                for tc in &m.tool_calls {
+                    let args = serde_json::from_str::<Value>(&tc.arguments)
+                        .unwrap_or_else(|_| Value::String(tc.arguments.clone()));
+                    parts.push(json!({
+                        "functionCall": {
+                            "name": tc.name,
+                            "args": args,
+                        }
+                    }));
+                }
+                contents.push(json!({ "role": "model", "parts": parts }));
+            }
             "assistant" => {
-                contents.push(json!({ "role": "model", "parts": [part] }));
+                if let Some(text) = m.content.as_ref() {
+                    contents.push(json!({
+                        "role": "model",
+                        "parts": [{ "text": text }],
+                    }));
+                }
             }
             _ => {
-                contents.push(json!({ "role": "user", "parts": [part] }));
+                if let Some(text) = m.content.as_ref() {
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": [{ "text": text }],
+                    }));
+                }
             }
         }
     }
@@ -481,7 +653,7 @@ fn build_gemini(scenario: &Scenario, _model: &str) -> Value {
     if let Some(si) = system_instruction {
         body["systemInstruction"] = si;
     }
-    let mut gen_cfg = serde_json::Map::new();
+    let mut gen_cfg = Map::new();
     if let Some(t) = scenario.temperature {
         gen_cfg.insert("temperature".to_string(), json!(t));
     }
@@ -508,15 +680,69 @@ fn build_gemini(scenario: &Scenario, _model: &str) -> Value {
     body
 }
 
+/// Find the tool name that matches a given `tool_call_id` by scanning the
+/// scenario's prior assistant `tool_calls`. Falls back to the first
+/// declared tool if the id isn't found, which is the best we can do
+/// without a richer schema. Gemini requires the name on functionResponse.
+fn lookup_tool_name(scenario: &Scenario, call_id: Option<&str>) -> String {
+    if let Some(id) = call_id {
+        for m in &scenario.messages {
+            for tc in &m.tool_calls {
+                if tc.id == id {
+                    return tc.name.clone();
+                }
+            }
+        }
+    }
+    scenario
+        .tools
+        .first()
+        .map(|t| t.name.clone())
+        .unwrap_or_default()
+}
+
 fn build_anthropic(scenario: &Scenario, _model: &str) -> Value {
     // Anthropic via Vertex omits the top-level `model` field (model is in
-    // the URL) and pins `anthropic_version`.
+    // the URL) and pins `anthropic_version`. Assistant tool calls become
+    // tool_use blocks; tool results become user messages with tool_result
+    // blocks.
     let mut messages = Vec::<Value>::new();
     let mut system: Option<String> = None;
     for m in &scenario.messages {
         match m.role.as_str() {
-            "system" => system = Some(m.content.clone()),
-            role => messages.push(json!({ "role": role, "content": m.content })),
+            "system" => system = m.content.clone(),
+            "tool" => {
+                messages.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                        "content": m.content.clone().unwrap_or_default(),
+                    }],
+                }));
+            }
+            "assistant" if !m.tool_calls.is_empty() => {
+                let mut blocks: Vec<Value> = Vec::new();
+                if let Some(text) = m.content.as_ref().filter(|s| !s.is_empty()) {
+                    blocks.push(json!({ "type": "text", "text": text }));
+                }
+                for tc in &m.tool_calls {
+                    let input = serde_json::from_str::<Value>(&tc.arguments)
+                        .unwrap_or_else(|_| Value::String(tc.arguments.clone()));
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": input,
+                    }));
+                }
+                messages.push(json!({ "role": "assistant", "content": blocks }));
+            }
+            role => {
+                if let Some(text) = m.content.as_ref() {
+                    messages.push(json!({ "role": role, "content": text }));
+                }
+            }
         }
     }
     let mut body = json!({

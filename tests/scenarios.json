@@ -1,5 +1,5 @@
 {
-  "_comment": "Scenario definitions consumed by `cargo run --example capture_traces` and `cargo test --test replay_traces`. Add or edit scenarios here without touching any .rs file. Each scenario is a real prompt + tools setup that we send to every provider. The captured request / response live under tests/cross_provider/traces/<provider>/<scenario>.{request.json,response.sse,meta.json}.",
+  "_comment": "Scenario definitions consumed by `cargo run --example capture_traces` and `cargo test --test replay_traces`. Every scenario is a real prompt + tools setup that we send to every provider unless gated by `providers.<name>.skip`. Captures land in tests/cross_provider/traces/<provider>/<scenario>.{request.json,response.sse,meta.json}.\n\n## Schema\n\n- name: required, used as the file stem.\n- description: human-readable purpose / what wire shape it pins.\n- max_tokens, temperature: optional generation params.\n- expect_failure: if true, a non-2xx response is the success case (the body is still saved so error-shape tests can replay it).\n- providers.<openai|google|anthropic>: optional per-provider overrides:\n    - skip: skip this provider entirely.\n    - model: override the default model for this scenario.\n    - auth_override: literal bearer token to send instead of the resolved one (useful for 401 captures — value never round-trips into the saved request body).\n    - extra_body: object merged into the request body before sending (e.g. reasoning, thinkingConfig, parallel_tool_calls).\n- messages: array of items. Each item is one of:\n    - { role: system|user|assistant, content: \"...\" }\n    - { role: assistant, content: \"...\", tool_calls: [{ id, name, arguments }] }   // assistant emitted these calls in a prior turn\n    - { role: tool, tool_call_id: \"...\", content: \"...\" }                          // tool result for that call_id\n- tools: optional list of { name, description, parameters }.",
 
   "defaults": {
     "models": {
@@ -18,6 +18,7 @@
         { "role": "user", "content": "Say the single word 'hello' and nothing else." }
       ]
     },
+
     {
       "name": "system_and_user",
       "description": "System instruction + user prompt — exercises role mapping and (for Vertex) systemInstruction routing.",
@@ -27,6 +28,7 @@
         { "role": "user", "content": "PARROT" }
       ]
     },
+
     {
       "name": "function_call",
       "description": "Prompt + one tool, expect the model to emit a function call. Locks in the tool-call wire shape.",
@@ -46,6 +48,118 @@
             "required": ["city"]
           }
         }
+      ]
+    },
+
+    {
+      "name": "multi_turn_tool",
+      "description": "Pre-populated history with a prior assistant tool call + tool result. Pins the wire shape we send back into each provider for function_call_output / functionResponse / tool_result, and the model's handling of an in-progress tool conversation.",
+      "max_tokens": 256,
+      "messages": [
+        { "role": "user", "content": "What's the weather in Paris?" },
+        {
+          "role": "assistant",
+          "content": "Let me check that for you.",
+          "tool_calls": [
+            { "id": "call_capture_demo_1", "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_capture_demo_1", "content": "{\"temperature_c\":22,\"condition\":\"sunny\"}" },
+        { "role": "user", "content": "Summarise it in one short sentence." }
+      ],
+      "tools": [
+        {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": { "type": "string" }
+            },
+            "required": ["city"]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "length_limit",
+      "description": "Small max_tokens against a long-answer prompt. Forces FinishReason::Length / response.incomplete on OpenAI and MAX_TOKENS on Gemini — wires we previously had no real example of. 16 is the OpenAI minimum for max_output_tokens (smaller bodies are rejected as 400).",
+      "max_tokens": 16,
+      "messages": [
+        { "role": "user", "content": "Write a detailed five-paragraph essay about the history of clouds." }
+      ]
+    },
+
+    {
+      "name": "parallel_tools",
+      "description": "Ask for the weather in three cities in one turn. Most current models will batch this as multiple function calls in a single response — exercises the parallel function-call wire shape (multiple function_call output items on OpenAI, multiple functionCall parts on Gemini).",
+      "max_tokens": 256,
+      "providers": {
+        "openai": { "extra_body": { "parallel_tool_calls": true } }
+      },
+      "messages": [
+        { "role": "user", "content": "What is the weather in Paris, London, and Tokyo right now? Call the tool once per city." }
+      ],
+      "tools": [
+        {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": { "type": "string" }
+            },
+            "required": ["city"]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "reasoning_request",
+      "description": "Request a reasoning model with effort=medium and a summary so we capture reasoning_summary_text deltas on the wire. OpenAI-only: Gemini 2.5 already exposes reasoning token *counts* via thoughtsTokenCount in the existing captures, but doesn't stream reasoning *text* by default and the lib doesn't yet parse thought parts.",
+      "max_tokens": 1024,
+      "providers": {
+        "openai": {
+          "model": "gpt-5-mini",
+          "extra_body": {
+            "reasoning": { "effort": "medium", "summary": "auto" }
+          }
+        },
+        "google": { "skip": true },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "If a train leaves Paris at 3pm at 80 km/h heading toward Lyon (470 km away) and another leaves Lyon at 4pm at 100 km/h heading toward Paris, at what time and how far from Paris do they meet? Show your working briefly." }
+      ]
+    },
+
+    {
+      "name": "auth_error",
+      "description": "Send a deliberately-bogus bearer token. Captures the real 4xx error envelope from each provider so the typed-error mapping has ground truth to test against.",
+      "expect_failure": true,
+      "providers": {
+        "openai":    { "auth_override": "sk-deliberately-bogus-key" },
+        "google":    { "auth_override": "ya29.deliberately-bogus-token" },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "Hello." }
+      ]
+    },
+
+    {
+      "name": "model_not_found",
+      "description": "Request a non-existent model. On OpenAI this is a 404 with `error.code = model_not_found`; on Vertex this is 404 with a structured google.rpc.Status body. Locks in the body shape so error-mapping tests can match against real responses.",
+      "expect_failure": true,
+      "providers": {
+        "openai":    { "model": "gpt-5-this-model-does-not-exist" },
+        "google":    { "model": "gemini-this-model-does-not-exist" },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "Hello." }
       ]
     }
   ]
