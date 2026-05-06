@@ -165,27 +165,34 @@ Easy fix once decided whether to wire them or remove them from
 
 ## Testing gaps
 
-- **Trace capture system is in place** (`cargo run --example
-  capture_traces`) but no traces have been committed yet. The first run
-  of the binary against a real account will populate
-  `tests/cross_provider/traces/` and unlock `cargo test --test
-  replay_traces` as a meaningful regression check. Until then the
-  replay test no-ops.
-- **OpenAI HTTP error mapping is unit-tested but not e2e-tested.**
-  `parse_openai_error` has unit tests for 401/429/500; the wiremock
-  cross-provider suite never asserts that a 429 surfaces as
-  `Error::RateLimit` end-to-end through `generate()`. Easy to add
-  alongside the trace-driven tests.
-- **No tests for cancellation.** Dropping a `Response` mid-stream
-  should abort the underlying request. Behaviour is unverified.
-- **No property/fuzz tests on the SSE parser.** Worth adding
-  proptest-style tests that feed arbitrary chunk boundaries through
-  the parser and verify event ordering is invariant.
-- **Snapshot-style tests on the unified event stream.** A trace
-  replayed through the parser produces a deterministic sequence of
-  unified events. Snapshotting that sequence (via `insta` or similar)
-  would make wire-shape regressions trivial to review as a PR diff.
-- **No error-path captures.** The capture tool currently only handles
-  the success path. Worth extending it to capture deliberately failing
-  requests (bad key → 401, malformed body → 400, etc.) so the typed
-  error mapping has real-world data to verify against.
+Done in the testing-gap sweep:
+
+- OpenAI HTTP error mapping is e2e-tested (`tests/http_errors_e2e.rs`)
+  — 429 → `Error::RateLimit` (with and without `Retry-After`), 401 →
+  `Error::Auth`, 500 + non-JSON bodies → `Error::Provider`, all
+  through real wiremock + `generate()`.
+- Cancellation: `tests/cancellation.rs` stands up a raw
+  `tokio::net::TcpListener`, sends one chunked SSE event, then verifies
+  that dropping the `Response` mid-stream produces a peer FIN observed
+  via `read() == Ok(0)` on the server side.
+- SSE parser chunk-boundary invariant: `sse_stream.rs::tests`
+  exhaustively splits a synthetic corpus byte-by-byte and across
+  randomized chunk patterns, plus a real captured trace, and asserts
+  the event sequence is identical to the single-chunk baseline.
+- Unified-event snapshots: `tests/snapshot_traces.rs` replays each
+  captured trace through the provider pipeline and diffs the produced
+  `Vec<StreamEvent>` against a checked-in `.events.txt`. Volatile IDs
+  are masked to `<id-N>` so wire-shape regressions show up cleanly in
+  the PR diff. `UPDATE_SNAPSHOTS=1` regenerates.
+
+Still open:
+
+- **Anthropic captures aren't checked in** (Phase 1.6 / Vertex
+  multi-region work needed first, plus a project that has Claude
+  enabled in Vertex Model Garden). Replay/snapshot tests no-op for
+  Anthropic until then.
+- **No error-path captures.** The capture tool only handles the
+  success path. Extend it to capture deliberately failing requests
+  (bad key → 401, malformed body → 400, etc.) so typed-error mapping
+  has real-world data to verify against — currently the wiremock e2e
+  tests use synthetic OpenAI-shaped error bodies.
