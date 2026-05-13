@@ -12,11 +12,38 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::pin::Pin;
 
-use platformed_llm::{Error, GoogleProvider, LLMProvider, LLMRequest, OpenAIProvider, Prompt};
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::Stream;
+use platformed_llm::{
+    Error, GoogleProvider, LLMProvider, LLMRequest, OpenAIProvider, Prompt, Transport,
+    TransportImpl, TransportRequest, TransportResponse, VertexEndpoint,
+};
 use serde_json::Value;
-use wiremock::matchers::{method, path_regex};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Test-only `TransportImpl` returning a fixed status + body. Used here
+/// to feed the captured 4xx envelope into the provider's error path
+/// without spinning up wiremock.
+struct StaticTransport {
+    status: u16,
+    body: Vec<u8>,
+}
+
+#[async_trait]
+impl TransportImpl for StaticTransport {
+    async fn send(&self, _req: TransportRequest) -> Result<TransportResponse, Error> {
+        let body = Bytes::from(self.body.clone());
+        let stream: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> =
+            Box::pin(futures_util::stream::iter(vec![Ok(body)]));
+        Ok(TransportResponse {
+            status: self.status,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: stream,
+        })
+    }
+}
 
 const TRACES_ROOT: &str = "tests/cross_provider/traces";
 
@@ -103,37 +130,31 @@ fn load_error_traces() -> Vec<ErrorTrace> {
 }
 
 async fn replay_error(trace: &ErrorTrace) -> Error {
-    let server = MockServer::start().await;
-    let body_clone = trace.body.clone();
-    Mock::given(method("POST"))
-        .and(path_regex(".*"))
-        .respond_with(
-            ResponseTemplate::new(trace.status)
-                .insert_header("content-type", "application/json")
-                .set_body_raw(body_clone, "application/json"),
-        )
-        .mount(&server)
-        .await;
-
+    let transport = Transport::new(StaticTransport {
+        status: trace.status,
+        body: trace.body.clone(),
+    });
     let req = LLMRequest::from_prompt("model", &Prompt::user("hi"));
     match trace.provider {
         Provider::OpenAI => {
-            let p =
-                OpenAIProvider::new_with_base_url("test".to_string(), server.uri()).unwrap();
+            let p = OpenAIProvider::with_transport(
+                "test".to_string(),
+                "http://placeholder".to_string(),
+                transport,
+            );
             p.generate(&req)
                 .await
                 .err()
                 .expect("4xx must produce an error")
         }
         Provider::Google => {
-            let p = GoogleProvider::new_with_base_url(
+            let endpoint = VertexEndpoint::with_access_token(
                 "p".to_string(),
                 "us-east1".to_string(),
                 "tok".to_string(),
-                server.uri(),
-            )
-            .unwrap();
-            p.generate(&req)
+            );
+            GoogleProvider::with_transport(endpoint, transport)
+                .generate(&req)
                 .await
                 .err()
                 .expect("4xx must produce an error")

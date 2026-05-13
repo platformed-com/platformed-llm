@@ -15,15 +15,40 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
-use futures_util::StreamExt;
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use platformed_llm::{
-    AnthropicViaVertexProvider, GoogleProvider, LLMProvider, LLMRequest, OpenAIProvider, Prompt,
-    StreamEvent,
+    AnthropicViaVertexProvider, Error, GoogleProvider, LLMProvider, LLMRequest, OpenAIProvider,
+    Prompt, StreamEvent, Transport, TransportImpl, TransportRequest, TransportResponse,
+    VertexEndpoint,
 };
 use serde_json::Value;
-use wiremock::matchers::{method, path_regex};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Test-only `TransportImpl` that always returns a fixed status + body,
+/// regardless of the request. Replaces wiremock for the snapshot replay —
+/// we don't need an actual HTTP server to feed bytes into the lib's
+/// parser pipeline.
+struct StaticTransport {
+    status: u16,
+    body: Vec<u8>,
+}
+
+#[async_trait]
+impl TransportImpl for StaticTransport {
+    async fn send(&self, _req: TransportRequest) -> Result<TransportResponse, Error> {
+        let body = Bytes::from(self.body.clone());
+        let stream: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> =
+            Box::pin(futures_util::stream::iter(vec![Ok(body)]));
+        Ok(TransportResponse {
+            status: self.status,
+            headers: vec![("content-type".to_string(), "text/event-stream".to_string())],
+            body: stream,
+        })
+    }
+}
 
 const TRACES_ROOT: &str = "tests/cross_provider/traces";
 
@@ -127,42 +152,42 @@ fn read_json(path: &Path) -> Option<Value> {
 }
 
 async fn replay(trace: &Trace) -> Vec<StreamEvent> {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path_regex(".*"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(trace.response_sse.clone(), "text/event-stream"),
-        )
-        .mount(&server)
-        .await;
-
+    let transport = Transport::new(StaticTransport {
+        status: 200,
+        body: trace.response_sse.clone(),
+    });
     let req = LLMRequest::from_prompt(trace.request_model.clone(), &Prompt::user("replay"));
     let response = match trace.provider {
         Provider::OpenAI => {
-            let p = OpenAIProvider::new_with_base_url("test".to_string(), server.uri()).unwrap();
+            let p = OpenAIProvider::with_transport(
+                "test".to_string(),
+                "http://placeholder".to_string(),
+                transport,
+            );
             p.generate(&req).await.unwrap()
         }
-        Provider::Google => GoogleProvider::new_with_base_url(
-            "p".to_string(),
-            "us-east1".to_string(),
-            "tok".to_string(),
-            server.uri(),
-        )
-        .unwrap()
-        .generate(&req)
-        .await
-        .unwrap(),
-        Provider::Anthropic => AnthropicViaVertexProvider::new_with_base_url(
-            "p".to_string(),
-            "us-east1".to_string(),
-            "tok".to_string(),
-            server.uri(),
-        )
-        .unwrap()
-        .generate(&req)
-        .await
-        .unwrap(),
+        Provider::Google => {
+            let endpoint = VertexEndpoint::with_access_token(
+                "p".to_string(),
+                "us-east1".to_string(),
+                "tok".to_string(),
+            );
+            GoogleProvider::with_transport(endpoint, transport)
+                .generate(&req)
+                .await
+                .unwrap()
+        }
+        Provider::Anthropic => {
+            let endpoint = VertexEndpoint::with_access_token(
+                "p".to_string(),
+                "us-east1".to_string(),
+                "tok".to_string(),
+            );
+            AnthropicViaVertexProvider::with_transport(endpoint, transport)
+                .generate(&req)
+                .await
+                .unwrap()
+        }
     };
 
     let mut events = Vec::new();
