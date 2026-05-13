@@ -52,12 +52,20 @@ pub enum AnthropicContent {
 #[serde(tag = "type")]
 pub enum AnthropicContentBlock {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        /// Anthropic prompt-caching hint. Marks the prefix up to this
+        /// block as cacheable. Up to 4 breakpoints per request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
         name: String,
         input: IValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -84,7 +92,18 @@ pub enum AnthropicContentBlock {
     RedactedThinking { data: String },
     /// Image content block (request side).
     #[serde(rename = "image")]
-    Image { source: IValue },
+    Image {
+        source: IValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
+    },
+}
+
+/// Anthropic cache-control hint on a content block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnthropicCacheControl {
+    #[serde(rename = "type")]
+    pub r#type: String,
 }
 
 /// `tool_result.content` accepts either a plain string or an array of

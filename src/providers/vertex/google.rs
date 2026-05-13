@@ -144,8 +144,26 @@ impl GoogleProvider {
                                     },
                                 );
                             }
-                            UserPart::Image(_)
-                            | UserPart::Audio(_)
+                            UserPart::Image(src) => {
+                                let part = match src {
+                                    crate::types::ImageSource::Base64 { data, media_type } => {
+                                        GooglePart::InlineData {
+                                            inline_data: GoogleInlineData {
+                                                mime_type: media_type.clone(),
+                                                data: data.clone(),
+                                            },
+                                        }
+                                    }
+                                    crate::types::ImageSource::Url(u) => GooglePart::FileData {
+                                        file_data: GoogleFileData {
+                                            mime_type: "image/*".to_string(),
+                                            file_uri: u.clone(),
+                                        },
+                                    },
+                                };
+                                push_part(&mut contents, "user", part);
+                            }
+                            UserPart::Audio(_)
                             | UserPart::Document(_)
                             | UserPart::CacheBreakpoint => {
                                 tracing::debug!(
@@ -485,8 +503,10 @@ pub(crate) fn convert_response_stateful(
                         arguments,
                     );
                 }
-                GooglePart::FunctionResponse { .. } => {
-                    // Function responses are user-side, not model output.
+                GooglePart::FunctionResponse { .. }
+                | GooglePart::InlineData { .. }
+                | GooglePart::FileData { .. } => {
+                    // Request-side parts; not expected on response stream.
                 }
             }
         }

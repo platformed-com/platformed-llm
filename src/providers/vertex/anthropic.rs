@@ -71,7 +71,7 @@ impl AnthropicViaVertexProvider {
                         continue;
                     }
                     if blocks.len() == 1 {
-                        if let AnthropicContentBlock::Text { text } = &blocks[0] {
+                        if let AnthropicContentBlock::Text { text, .. } = &blocks[0] {
                             messages.push(AnthropicMessage {
                                 role: "user".to_string(),
                                 content: AnthropicContent::Text(text.clone()),
@@ -90,7 +90,7 @@ impl AnthropicViaVertexProvider {
                         continue;
                     }
                     if blocks.len() == 1 {
-                        if let AnthropicContentBlock::Text { text } = &blocks[0] {
+                        if let AnthropicContentBlock::Text { text, .. } = &blocks[0] {
                             messages.push(AnthropicMessage {
                                 role: "assistant".to_string(),
                                 content: AnthropicContent::Text(text.clone()),
@@ -185,14 +185,34 @@ impl AnthropicViaVertexProvider {
     }
 }
 
-/// Translate user-side parts into Anthropic content blocks. Text parts
-/// coalesce; tool results map to `tool_result` blocks; multi-modal
-/// parts are not yet wired (Phase 5 follow-up).
+/// Translate user-side parts into Anthropic content blocks. A
+/// `CacheBreakpoint` attaches `cache_control: {type: "ephemeral"}` to
+/// the most recently emitted block.
 fn build_user_blocks(parts: &[UserPart]) -> Result<Vec<AnthropicContentBlock>, Error> {
     let mut blocks = Vec::new();
     for part in parts {
         match part {
-            UserPart::Text(s) => blocks.push(AnthropicContentBlock::Text { text: s.clone() }),
+            UserPart::Text(s) => blocks.push(AnthropicContentBlock::Text {
+                text: s.clone(),
+                cache_control: None,
+            }),
+            UserPart::Image(src) => {
+                let source = match src {
+                    crate::types::ImageSource::Url(u) => ijson::ijson!({
+                        "type": "url",
+                        "url": u.clone(),
+                    }),
+                    crate::types::ImageSource::Base64 { data, media_type } => ijson::ijson!({
+                        "type": "base64",
+                        "media_type": media_type.clone(),
+                        "data": data.clone(),
+                    }),
+                };
+                blocks.push(AnthropicContentBlock::Image {
+                    source,
+                    cache_control: None,
+                });
+            }
             UserPart::ToolResult { call_id, content } => {
                 let text = flatten_user_parts_to_text(content);
                 blocks.push(AnthropicContentBlock::ToolResult {
@@ -201,17 +221,46 @@ fn build_user_blocks(parts: &[UserPart]) -> Result<Vec<AnthropicContentBlock>, E
                     is_error: None,
                 });
             }
-            UserPart::Image(_) | UserPart::Audio(_) | UserPart::Document(_) => {
-                tracing::debug!("Anthropic provider dropping unsupported user part");
+            UserPart::Audio(_) | UserPart::Document(_) => {
+                tracing::debug!(
+                    "Anthropic provider dropping audio/document user part during request build"
+                );
             }
-            UserPart::CacheBreakpoint => {
-                // Phase 5 follow-up: emit `cache_control: ephemeral` on
-                // the preceding block.
-                tracing::debug!("Anthropic provider has no cache_control wiring yet");
-            }
+            UserPart::CacheBreakpoint => attach_cache_control(blocks.last_mut()),
         }
     }
     Ok(blocks)
+}
+
+/// Attach a `cache_control: {type: "ephemeral"}` hint to the most-
+/// recently-emitted block (the one immediately before the
+/// CacheBreakpoint in source order). Anthropic recognises this on
+/// text, tool_use, and image blocks; other variants silently ignore
+/// because the wire shape doesn't model the hint there.
+fn attach_cache_control(last: Option<&mut AnthropicContentBlock>) {
+    if let Some(block) = last {
+        let hint = AnthropicCacheControl {
+            r#type: "ephemeral".to_string(),
+        };
+        match block {
+            AnthropicContentBlock::Text { cache_control, .. } => {
+                *cache_control = Some(hint);
+            }
+            AnthropicContentBlock::ToolUse { cache_control, .. } => {
+                *cache_control = Some(hint);
+            }
+            AnthropicContentBlock::Image { cache_control, .. } => {
+                *cache_control = Some(hint);
+            }
+            _ => {
+                tracing::debug!(
+                    "CacheBreakpoint preceded by a block type that doesn't accept cache_control; ignoring"
+                );
+            }
+        }
+    } else {
+        tracing::debug!("CacheBreakpoint with no preceding block; ignoring");
+    }
 }
 
 /// Translate assistant-side parts into Anthropic content blocks. Text +
@@ -224,6 +273,7 @@ fn build_assistant_blocks(parts: &[AssistantPart]) -> Result<Vec<AnthropicConten
             AssistantPart::Text { content, .. } => {
                 blocks.push(AnthropicContentBlock::Text {
                     text: content.clone(),
+                    cache_control: None,
                 });
             }
             AssistantPart::Reasoning { content, signature } => {
@@ -237,7 +287,10 @@ fn build_assistant_blocks(parts: &[AssistantPart]) -> Result<Vec<AnthropicConten
             }
             AssistantPart::Refusal(s) => {
                 // Anthropic has no typed refusal channel; surface as text.
-                blocks.push(AnthropicContentBlock::Text { text: s.clone() });
+                blocks.push(AnthropicContentBlock::Text {
+                    text: s.clone(),
+                    cache_control: None,
+                });
             }
             AssistantPart::ToolCall(call) => {
                 let input = serde_json::from_str(&call.arguments).map_err(|e| {
@@ -247,11 +300,10 @@ fn build_assistant_blocks(parts: &[AssistantPart]) -> Result<Vec<AnthropicConten
                     id: call.call_id.clone(),
                     name: call.name.clone(),
                     input,
+                    cache_control: None,
                 });
             }
-            AssistantPart::CacheBreakpoint => {
-                tracing::debug!("Anthropic provider has no cache_control wiring yet");
-            }
+            AssistantPart::CacheBreakpoint => attach_cache_control(blocks.last_mut()),
         }
     }
     Ok(blocks)
@@ -431,7 +483,7 @@ pub(crate) fn convert_stream_event_stateful(
             content_block,
             index,
         } => match content_block {
-            AnthropicContentBlock::Text { text } => {
+            AnthropicContentBlock::Text { text, .. } => {
                 let (lib_idx, ev) = state.tracker.open(index, PartKind::Text);
                 events.push(ev);
                 if !text.is_empty() {
@@ -441,7 +493,7 @@ pub(crate) fn convert_stream_event_stateful(
                     });
                 }
             }
-            AnthropicContentBlock::ToolUse { id, name, input } => {
+            AnthropicContentBlock::ToolUse { id, name, input, .. } => {
                 let (_lib_idx, ev) = state.tracker.open(
                     index,
                     PartKind::ToolCall {
@@ -640,6 +692,7 @@ mod tests {
                 id: "toolu_xyz".to_string(),
                 name: "get_weather".to_string(),
                 input: ijson::ijson!({}),
+                cache_control: None,
             },
         };
         let events = convert_stream_event_stateful(start, &mut state).unwrap();

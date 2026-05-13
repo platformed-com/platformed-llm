@@ -6,21 +6,52 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 /// OpenAI input message format for Responses API.
+///
+/// The `Regular` variant supports both a bare string content (the
+/// common text-only case) and an array of content parts (used when any
+/// part is non-text — images, files, etc.) — distinguished by
+/// `OpenAIMessageContent`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum OpenAIInputMessage {
-    /// Regular message with role and content
+    /// Regular message with role and content.
     #[serde(rename = "message")]
-    Regular { role: String, content: String },
-    /// Function call output message
+    Regular {
+        role: String,
+        content: OpenAIMessageContent,
+    },
+    /// Function call output message.
     #[serde(rename = "function_call_output")]
     FunctionCallOutput { call_id: String, output: String },
-    /// Function call message (when sending previous function calls back)
+    /// Function call message (when sending previous function calls back).
     #[serde(rename = "function_call")]
     FunctionCall {
         call_id: String,
         name: String,
         arguments: String,
+    },
+}
+
+/// OpenAI message content: either a bare string (text-only) or an
+/// explicit array of content parts (mixed text + images / files /
+/// audio).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAIMessageContent {
+    Text(String),
+    Parts(Vec<OpenAIContentPart>),
+}
+
+/// Tagged content part within an OpenAI message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum OpenAIContentPart {
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "input_image")]
+    InputImage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image_url: Option<String>,
     },
 }
 

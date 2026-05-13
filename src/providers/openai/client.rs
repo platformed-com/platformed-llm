@@ -98,52 +98,55 @@ impl OpenAIProvider {
             InputItem::System(content) => {
                 out.push(OpenAIInputMessage::Regular {
                     role: "system".to_string(),
-                    content: content.clone(),
+                    content: crate::providers::openai::types::OpenAIMessageContent::Text(
+                        content.clone(),
+                    ),
                 });
             }
             InputItem::User { content } => {
-                let mut buffered_text = String::new();
+                use crate::providers::openai::types::{OpenAIContentPart, OpenAIMessageContent};
+                // Build a content-parts list. Tool results become their own
+                // top-level items; text and images become InputText /
+                // InputImage parts. If we end up with just one text part
+                // we collapse to a bare string for the common case.
+                let mut parts: Vec<OpenAIContentPart> = Vec::new();
                 for part in content {
                     match part {
-                        UserPart::Text(s) => {
-                            if !buffered_text.is_empty() {
-                                buffered_text.push('\n');
-                            }
-                            buffered_text.push_str(s);
+                        UserPart::Text(s) => parts.push(OpenAIContentPart::InputText {
+                            text: s.clone(),
+                        }),
+                        UserPart::Image(src) => {
+                            let url = match src {
+                                crate::types::ImageSource::Url(u) => u.clone(),
+                                crate::types::ImageSource::Base64 { data, media_type } => {
+                                    format!("data:{media_type};base64,{data}")
+                                }
+                            };
+                            parts.push(OpenAIContentPart::InputImage {
+                                image_url: Some(url),
+                            });
                         }
                         UserPart::ToolResult { call_id, content } => {
-                            if !buffered_text.is_empty() {
-                                out.push(OpenAIInputMessage::Regular {
-                                    role: "user".to_string(),
-                                    content: std::mem::take(&mut buffered_text),
-                                });
-                            }
+                            push_user_parts(out, &mut parts);
                             out.push(OpenAIInputMessage::FunctionCallOutput {
                                 call_id: call_id.clone(),
                                 output: flatten_user_parts_to_text(content),
                             });
                         }
-                        // Multi-modal / cache breakpoints not yet wired to
-                        // the OpenAI content-array shape — drop with a
-                        // tracing note. Phase 5 follow-up extends
-                        // OpenAIInputMessage::Regular to support array
-                        // content for images / audio / files.
-                        UserPart::Image(_)
-                        | UserPart::Audio(_)
-                        | UserPart::Document(_)
-                        | UserPart::CacheBreakpoint => {
+                        UserPart::Audio(_) | UserPart::Document(_) => {
                             tracing::debug!(
-                                "OpenAI provider dropping unsupported user part during request build"
+                                "OpenAI provider dropping audio/document user part during request build"
                             );
+                        }
+                        UserPart::CacheBreakpoint => {
+                            // OpenAI maps cache breakpoints onto a per-
+                            // request `prompt_cache_key` rather than
+                            // per-block markers; nothing to emit at the
+                            // part level.
                         }
                     }
                 }
-                if !buffered_text.is_empty() {
-                    out.push(OpenAIInputMessage::Regular {
-                        role: "user".to_string(),
-                        content: buffered_text,
-                    });
-                }
+                push_user_parts(out, &mut parts);
             }
             InputItem::Assistant { content } => {
                 let mut buffered_text = String::new();
@@ -156,9 +159,6 @@ impl OpenAIProvider {
                             buffered_text.push_str(content);
                         }
                         AssistantPart::Refusal(s) => {
-                            // Translate refusal back to plain assistant text on
-                            // egress (we don't currently emit OpenAI's typed
-                            // refusal content-part shape on the way back in).
                             if !buffered_text.is_empty() {
                                 buffered_text.push('\n');
                             }
@@ -168,7 +168,9 @@ impl OpenAIProvider {
                             if !buffered_text.is_empty() {
                                 out.push(OpenAIInputMessage::Regular {
                                     role: "assistant".to_string(),
-                                    content: std::mem::take(&mut buffered_text),
+                                    content: crate::providers::openai::types::OpenAIMessageContent::Text(
+                                        std::mem::take(&mut buffered_text),
+                                    ),
                                 });
                             }
                             out.push(OpenAIInputMessage::FunctionCall {
@@ -177,10 +179,6 @@ impl OpenAIProvider {
                                 arguments: call.arguments.clone(),
                             });
                         }
-                        // Reasoning round-trip on OpenAI requires the
-                        // server-side response id chain (previous_response_id)
-                        // OR re-emitting reasoning items with their original
-                        // id — both unwired right now. Drop with a note.
                         AssistantPart::Reasoning { .. }
                         | AssistantPart::RedactedReasoning { .. }
                         | AssistantPart::CacheBreakpoint => {
@@ -193,7 +191,9 @@ impl OpenAIProvider {
                 if !buffered_text.is_empty() {
                     out.push(OpenAIInputMessage::Regular {
                         role: "assistant".to_string(),
-                        content: buffered_text,
+                        content: crate::providers::openai::types::OpenAIMessageContent::Text(
+                            buffered_text,
+                        ),
                     });
                 }
             }
@@ -311,6 +311,37 @@ pub(crate) fn parse_openai_error(
             format!("HTTP {status} ({kind} {code}): {message}"),
         ),
     }
+}
+
+/// Flush a buffered user-content-parts list as an
+/// `OpenAIInputMessage::Regular`. Collapses single-text to the bare-
+/// string content form (OpenAI accepts both, but the bare string is
+/// the canonical shape and matches our pre-multi-modal request bodies).
+fn push_user_parts(
+    out: &mut Vec<crate::providers::openai::types::OpenAIInputMessage>,
+    parts: &mut Vec<crate::providers::openai::types::OpenAIContentPart>,
+) {
+    use crate::providers::openai::types::{
+        OpenAIContentPart, OpenAIInputMessage, OpenAIMessageContent,
+    };
+    if parts.is_empty() {
+        return;
+    }
+    let drained: Vec<OpenAIContentPart> = std::mem::take(parts);
+    // Single text part → bare string; anything else → parts array.
+    if drained.len() == 1 {
+        if let OpenAIContentPart::InputText { text } = &drained[0] {
+            out.push(OpenAIInputMessage::Regular {
+                role: "user".to_string(),
+                content: OpenAIMessageContent::Text(text.clone()),
+            });
+            return;
+        }
+    }
+    out.push(OpenAIInputMessage::Regular {
+        role: "user".to_string(),
+        content: OpenAIMessageContent::Parts(drained),
+    });
 }
 
 /// Best-effort flatten of a tool-result content array into a single string.

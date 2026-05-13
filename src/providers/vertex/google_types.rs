@@ -44,6 +44,30 @@ pub enum GooglePart {
         #[serde(rename = "functionResponse")]
         function_response: GoogleFunctionResponse,
     },
+    /// Inline binary content (base64) — images, audio, video.
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: GoogleInlineData,
+    },
+    /// File reference by URI (Cloud Storage, etc.).
+    FileData {
+        #[serde(rename = "fileData")]
+        file_data: GoogleFileData,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleInlineData {
+    pub mime_type: String,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleFileData {
+    pub mime_type: String,
+    pub file_uri: String,
 }
 
 /// Google function call.
