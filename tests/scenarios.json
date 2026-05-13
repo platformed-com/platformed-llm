@@ -250,6 +250,34 @@
       "messages": [
         { "role": "user", "content": "What is the date today? Just give a brief answer." }
       ]
+    },
+
+    {
+      "name": "google_search",
+      "description": "Gemini googleSearch builtin tool — Vertex's grounding-via-search. Pins the wire shape with a separate { googleSearch: {} } entry in the tools array. OpenAI and Anthropic skipped.",
+      "max_tokens": 512,
+      "builtin_tools": ["google_search"],
+      "providers": {
+        "openai":    { "skip": true },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "What is the date today? Just give a brief answer." }
+      ]
+    },
+
+    {
+      "name": "code_execution",
+      "description": "Gemini codeExecution builtin — the model writes and runs Python to answer computational questions. Pins the wire shape with a { codeExecution: {} } entry. Lib currently drops the executableCode / codeExecutionResult response parts (they have no AssistantPart variant); the snapshot captures whatever surfaces as text.",
+      "max_tokens": 1024,
+      "builtin_tools": ["code_execution"],
+      "providers": {
+        "openai":    { "skip": true },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "What is 47 to the power of 5? Use code to compute it and give just the answer." }
+      ]
     }
   ]
 }

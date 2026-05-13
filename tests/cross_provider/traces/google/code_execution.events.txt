@@ -1,0 +1,14 @@
+PartStart[0] text
+Delta[0] "\n```python\nprint(47**5)\n\n```\n"
+PartEnd[0]
+PartStart[1] text
+Delta[1] "\n```\n229345007\n\n```\n(outcome: OUTCOME_OK)\n"
+Delta[1] "2"
+Delta[1] "29345007"
+PartEnd[1]
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+output[0].part[0] text "\n```python\nprint(47**5)\n\n```\n" annotations=0
+output[0].part[1] text "\n```\n229345007\n\n```\n(outcome: OUTCOME_OK)\n229345007" annotations=0

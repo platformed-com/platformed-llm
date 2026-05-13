@@ -32,9 +32,11 @@ exist in code but haven't been exercised end-to-end.
   Audio and Document scenarios still missing — would need a small
   base64 mp3 / PDF asset (or reference files via path) in the
   scenarios schema.
-- **Provider-builtin captures (partial)**: `WebSearch` is exercised
-  by the `web_search` scenario against OpenAI. `GoogleSearch` /
-  `CodeExecution` / `ComputerUse` still missing.
+- **Provider-builtin captures (partial)**: `WebSearch` (OpenAI),
+  `GoogleSearch` (Gemini), and `CodeExecution` (Gemini) are now
+  captured. `ComputerUse` still missing — would need an actual
+  computer-use session against OpenAI or Anthropic and isn't a
+  one-shot prompt.
 - **ProviderContinuation captures**: `OpenAI { response_id }` and
   `Gemini { cached_content }` wire through but no captured scenario
   exercises a real chained turn (would also need OpenAI's `store:

@@ -1,0 +1,20 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "What is the date today? Just give a brief answer."
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 512
+  },
+  "tools": [
+    {
+      "googleSearch": {}
+    }
+  ]
+}

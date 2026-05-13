@@ -79,6 +79,31 @@ pub enum GooglePart {
         #[serde(rename = "fileData")]
         file_data: GoogleFileData,
     },
+    /// Code the model wrote to execute via the `codeExecution` builtin.
+    ExecutableCode {
+        #[serde(rename = "executableCode")]
+        executable_code: GoogleExecutableCode,
+    },
+    /// Result of running `ExecutableCode`.
+    CodeExecutionResult {
+        #[serde(rename = "codeExecutionResult")]
+        code_execution_result: GoogleCodeExecutionResult,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoogleExecutableCode {
+    /// `"PYTHON"` is the only documented value today.
+    pub language: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoogleCodeExecutionResult {
+    /// `"OUTCOME_OK"`, `"OUTCOME_FAILED"`, etc.
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

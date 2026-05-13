@@ -1,0 +1,20 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "What is 47 to the power of 5? Use code to compute it and give just the answer."
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 1024
+  },
+  "tools": [
+    {
+      "codeExecution": {}
+    }
+  ]
+}

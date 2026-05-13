@@ -608,6 +608,41 @@ pub(crate) fn convert_response_stateful(
                         arguments,
                     );
                 }
+                GooglePart::ExecutableCode { executable_code } => {
+                    // Surface the model-written code as a text delta in
+                    // a fenced code block. The lib has no typed
+                    // AssistantPart for code execution; emitting it as
+                    // text means callers see what the model wrote and
+                    // ran. A future Phase could lift this into a typed
+                    // surface.
+                    state.close_text(&mut events);
+                    let idx = state.open_text(&mut events);
+                    let lang = executable_code.language.to_lowercase();
+                    events.push(StreamEvent::Delta {
+                        index: idx,
+                        delta: format!(
+                            "\n```{lang}\n{}\n```\n",
+                            executable_code.code
+                        ),
+                    });
+                }
+                GooglePart::CodeExecutionResult {
+                    code_execution_result,
+                } => {
+                    state.close_text(&mut events);
+                    let idx = state.open_text(&mut events);
+                    let body = code_execution_result
+                        .output
+                        .clone()
+                        .unwrap_or_else(String::new);
+                    events.push(StreamEvent::Delta {
+                        index: idx,
+                        delta: format!(
+                            "\n```\n{body}\n```\n(outcome: {})\n",
+                            code_execution_result.outcome
+                        ),
+                    });
+                }
                 GooglePart::FunctionResponse { .. }
                 | GooglePart::InlineData { .. }
                 | GooglePart::FileData { .. } => {

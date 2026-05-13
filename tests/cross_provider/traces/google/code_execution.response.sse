@@ -1,0 +1,8 @@
+data: {"candidates": [{"content": {"role": "model","parts": [{"executableCode": {"language": "PYTHON","code": "print(47**5)\n"}}]}}],"usageMetadata": {"trafficType": "ON_DEMAND"},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T16:37:30.705938Z","responseId": "yqgEapKLK_mt9fgP7-iguAQ"}
+
+data: {"candidates": [{"content": {"role": "model","parts": [{"codeExecutionResult": {"outcome": "OUTCOME_OK","output": "229345007\n"}}]}}],"usageMetadata": {"trafficType": "ON_DEMAND"},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T16:37:30.705938Z","responseId": "yqgEapKLK_mt9fgP7-iguAQ"}
+
+data: {"candidates": [{"content": {"role": "model","parts": [{"text": "2"}]}}],"usageMetadata": {"trafficType": "ON_DEMAND"},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T16:37:30.705938Z","responseId": "yqgEapKLK_mt9fgP7-iguAQ"}
+
+data: {"candidates": [{"content": {"role": "model","parts": [{"text": "29345007"}]},"finishReason": "STOP"}],"usageMetadata": {"promptTokenCount": 62,"candidatesTokenCount": 27,"totalTokenCount": 208,"trafficType": "ON_DEMAND","promptTokensDetails": [{"modality": "TEXT","tokenCount": 62}],"candidatesTokensDetails": [{"modality": "TEXT","tokenCount": 27}],"toolUsePromptTokensDetails": [{"modality": "TEXT","tokenCount": 80}],"toolUsePromptTokenCount": 80,"thoughtsTokenCount": 39},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T16:37:30.705938Z","responseId": "yqgEapKLK_mt9fgP7-iguAQ"}
+

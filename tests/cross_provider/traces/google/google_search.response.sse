@@ -1,0 +1,4 @@
+data: {"candidates": [{"content": {"role": "model","parts": [{"text": "Today's date is Wednesday, May 13, 2"}]},"groundingMetadata": {}}],"usageMetadata": {"trafficType": "ON_DEMAND"},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T16:36:16.723204Z","responseId": "gKgEaoSSLLuut_gPrLOywAc"}
+
+data: {"candidates": [{"content": {"role": "model","parts": [{"text": "026."}]},"finishReason": "STOP","groundingMetadata": {}}],"usageMetadata": {"promptTokenCount": 12,"candidatesTokenCount": 18,"totalTokenCount": 54,"trafficType": "ON_DEMAND","promptTokensDetails": [{"modality": "TEXT","tokenCount": 12}],"candidatesTokensDetails": [{"modality": "TEXT","tokenCount": 18}],"thoughtsTokenCount": 24},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T16:36:16.723204Z","responseId": "gKgEaoSSLLuut_gPrLOywAc"}
+
