@@ -4,7 +4,6 @@ pub mod openai;
 
 use platformed_llm::{Function, LLMProvider, Tool, ToolType};
 use std::pin::Pin;
-use wiremock::MockServer;
 
 /// Create a weather function tool for testing
 pub fn create_weather_tool() -> Tool {
@@ -35,20 +34,13 @@ pub fn create_weather_tool() -> Tool {
 pub struct ProviderConfig {
     pub name: &'static str,
     pub model: &'static str,
-    pub supports_custom_base_url: bool,
 }
 
-/// Trait for provider-specific test setup
-#[async_trait::async_trait]
+/// Provider-specific test setup. Each impl builds a fully-wired provider
+/// backed by a `ScriptedTransport` that asserts the lib's emitted request
+/// body matches the expected payload for each of the two scripted turns
+/// (initial tool-emitting call + follow-up after the tool result).
 pub trait ProviderTestSetup {
-    /// Get the provider configuration
     fn get_config() -> ProviderConfig;
-
-    /// Create the provider instance
-    fn create_provider(base_url: &str) -> Pin<Box<dyn LLMProvider>>;
-
-    /// Mount the required mocks for function calling test on the provided mock server
-    async fn mount_function_calling_mocks(
-        mock_server: &MockServer,
-    ) -> Result<(), Box<dyn std::error::Error>>;
+    fn build_provider() -> Pin<Box<dyn LLMProvider>>;
 }

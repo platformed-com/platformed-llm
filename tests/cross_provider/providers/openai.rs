@@ -1,40 +1,22 @@
 use super::{create_weather_tool, ProviderConfig, ProviderTestSetup};
-use platformed_llm::{LLMProvider, OpenAIProvider};
+use crate::cross_provider::scripted::{load_fixture, ScriptedTransport, ScriptedTurn};
+use platformed_llm::{LLMProvider, OpenAIProvider, Transport};
 use serde_json::json;
 use std::pin::Pin;
-use wiremock::matchers::{body_json, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub struct OpenAITestSetup;
 
-/// Load test fixture from file
-fn load_fixture(filename: &str) -> String {
-    std::fs::read_to_string(filename)
-        .unwrap_or_else(|_| panic!("Failed to load test fixture: {filename}"))
-}
-
-#[async_trait::async_trait]
 impl ProviderTestSetup for OpenAITestSetup {
     fn get_config() -> ProviderConfig {
         ProviderConfig {
             name: "OpenAI",
             model: "gpt-4o-mini",
-            supports_custom_base_url: true,
         }
     }
 
-    fn create_provider(base_url: &str) -> Pin<Box<dyn LLMProvider>> {
-        let provider =
-            OpenAIProvider::new_with_base_url("test-api-key".to_string(), base_url.to_string())
-                .expect("Failed to create OpenAI provider");
-        Box::pin(provider)
-    }
-
-    async fn mount_function_calling_mocks(
-        mock_server: &MockServer,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn build_provider() -> Pin<Box<dyn LLMProvider>> {
         let weather_tool = create_weather_tool();
-        let initial_request_payload = json!({
+        let initial = json!({
             "model": "gpt-4o-mini",
             "input": [
                 {
@@ -62,7 +44,7 @@ impl ProviderTestSetup for OpenAITestSetup {
             "store": false
         });
 
-        let followup_request_payload = json!({
+        let followup = json!({
             "model": "gpt-4o-mini",
             "input": [
                 {
@@ -98,38 +80,25 @@ impl ProviderTestSetup for OpenAITestSetup {
             "store": false
         });
 
-        // Mount initial request mock
-        Mock::given(method("POST"))
-            .and(path("/responses"))
-            .and(body_json(initial_request_payload))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(load_fixture(
-                        "tests/cross_provider/fixtures/openai/function_call_response.sse",
-                    ))
-                    .insert_header("content-type", "text/event-stream")
-                    .insert_header("cache-control", "no-cache"),
-            )
-            .expect(1)
-            .mount(mock_server)
-            .await;
-
-        // Mount follow-up request mock
-        Mock::given(method("POST"))
-            .and(path("/responses"))
-            .and(body_json(followup_request_payload))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(load_fixture(
-                        "tests/cross_provider/fixtures/openai/followup_response.sse",
-                    ))
-                    .insert_header("content-type", "text/event-stream")
-                    .insert_header("cache-control", "no-cache"),
-            )
-            .expect(1)
-            .mount(mock_server)
-            .await;
-
-        Ok(())
+        let scripted = ScriptedTransport::new(vec![
+            ScriptedTurn {
+                expected_body: initial,
+                response_sse: load_fixture(
+                    "tests/cross_provider/fixtures/openai/function_call_response.sse",
+                ),
+            },
+            ScriptedTurn {
+                expected_body: followup,
+                response_sse: load_fixture(
+                    "tests/cross_provider/fixtures/openai/followup_response.sse",
+                ),
+            },
+        ]);
+        let provider = OpenAIProvider::with_transport(
+            "test-api-key".to_string(),
+            "http://placeholder".to_string(),
+            Transport::new(scripted),
+        );
+        Box::pin(provider)
     }
 }

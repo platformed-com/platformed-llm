@@ -42,7 +42,6 @@ tokio = { version = "1.40", features = ["macros", "rt", "rt-multi-thread", "proc
 # Lib leaves TLS to the downstream consumer; tests/examples need to make
 # real HTTPS calls so we enable rustls-tls only here.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-wiremock = "0.6"
 dotenvy = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
