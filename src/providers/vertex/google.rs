@@ -322,12 +322,23 @@ impl LLMProvider for GoogleProvider {
         let response = self.transport.send(req).await?;
 
         if !(200..300).contains(&response.status) {
+            let status = response.status;
             let body_bytes = response.collect_body().await.unwrap_or_default();
-            let error_text = String::from_utf8_lossy(&body_bytes);
-            return Err(Error::provider(
-                "Google",
-                format!("API error: {error_text}"),
-            ));
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            // Vertex 4xx envelopes carry `"status": "UNAUTHENTICATED"` /
+            // `"NOT_FOUND"` — map them onto our typed variants where the
+            // mapping is clear.
+            return Err(match status {
+                401 | 403 => {
+                    Error::auth_with_status(status, format!("Google {status}: {body_text}"))
+                }
+                404 => Error::ModelNotAvailable(format!("Google 404: {body_text}")),
+                _ => Error::provider_with_status(
+                    "Google",
+                    status,
+                    format!("API error: {body_text}"),
+                ),
+            });
         }
 
         // Create SSE stream from response (Gemini supports ?alt=sse)

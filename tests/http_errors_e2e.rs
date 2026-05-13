@@ -76,10 +76,10 @@ async fn http_429_with_retry_after_surfaces_as_rate_limit() {
 
     match err {
         Error::RateLimit {
-            retry_after_seconds,
+            retry_after,
             message,
         } => {
-            assert_eq!(retry_after_seconds, Some(42));
+            assert_eq!(retry_after, Some(std::time::Duration::from_secs(42)));
             assert!(
                 message.contains("Rate limited"),
                 "message should contain provider text, got: {message}",
@@ -97,10 +97,7 @@ async fn http_429_without_retry_after_still_maps_to_rate_limit() {
         .expect_err("429 must error");
 
     match err {
-        Error::RateLimit {
-            retry_after_seconds,
-            ..
-        } => assert_eq!(retry_after_seconds, None),
+        Error::RateLimit { retry_after, .. } => assert_eq!(retry_after, None),
         other => panic!("expected RateLimit, got {other:?}"),
     }
 }
@@ -113,10 +110,13 @@ async fn http_401_surfaces_as_auth() {
         .expect_err("401 must error");
 
     match err {
-        Error::Auth(message) => assert!(
-            message.contains("Bad key"),
-            "auth message lost provider text: {message}",
-        ),
+        Error::Auth { status, message } => {
+            assert_eq!(status, Some(401));
+            assert!(
+                message.contains("Bad key"),
+                "auth message lost provider text: {message}",
+            );
+        }
         other => panic!("expected Auth, got {other:?}"),
     }
 }
@@ -129,7 +129,7 @@ async fn http_500_surfaces_as_provider() {
         .expect_err("500 must error");
 
     match err {
-        Error::Provider { provider, message } => {
+        Error::Provider { provider, message, .. } => {
             assert_eq!(provider, "OpenAI");
             assert!(message.contains("500"), "should mention status: {message}");
             assert!(message.contains("boom"), "should mention body: {message}");
@@ -148,7 +148,7 @@ async fn non_json_error_body_is_preserved() {
         .expect_err("503 must error");
 
     match err {
-        Error::Provider { provider, message } => {
+        Error::Provider { provider, message, .. } => {
             assert_eq!(provider, "OpenAI");
             assert!(message.contains("upstream proxy timeout"), "got: {message}");
         }

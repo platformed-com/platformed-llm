@@ -183,10 +183,34 @@ async fn captured_error_bodies_map_to_typed_errors() {
         );
         let err = replay_error(trace).await;
         let ok = match (trace.provider, trace.status, &err) {
-            (Provider::OpenAI, 401, Error::Auth(_)) => true,
-            (Provider::OpenAI, 429, Error::RateLimit { .. }) => true,
-            (Provider::OpenAI, _, Error::Provider { provider, .. }) if provider == "OpenAI" => true,
-            (Provider::Google, _, Error::Provider { provider, .. }) if provider == "Google" => true,
+            // 401 → Auth on both providers, now that Vertex maps it.
+            (Provider::OpenAI, 401, Error::Auth { status: Some(401), .. }) => true,
+            (Provider::Google, 401, Error::Auth { status: Some(401), .. }) => true,
+            // 429 → RateLimit (OpenAI-side; Vertex doesn't typically 429
+            // on the streaming endpoint, but if it does, accept either).
+            (_, 429, Error::RateLimit { .. }) => true,
+            // 404 → ModelNotAvailable on Vertex.
+            (Provider::Google, 404, Error::ModelNotAvailable(_)) => true,
+            // Any other 4xx/5xx on either provider → Provider with the
+            // correct provider name and a matching status code.
+            (
+                Provider::OpenAI,
+                _,
+                Error::Provider {
+                    provider: "OpenAI",
+                    status: Some(_),
+                    ..
+                },
+            ) => true,
+            (
+                Provider::Google,
+                _,
+                Error::Provider {
+                    provider: "Google",
+                    status: Some(_),
+                    ..
+                },
+            ) => true,
             _ => false,
         };
         if !ok {

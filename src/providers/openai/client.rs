@@ -300,13 +300,14 @@ pub(crate) fn parse_openai_error(
     let code = parsed.as_ref().and_then(|e| e.code).unwrap_or("");
 
     match status {
-        401 => Error::auth(format!("OpenAI 401 ({kind} {code}): {message}")),
+        401 => Error::auth_with_status(401, format!("OpenAI 401 ({kind} {code}): {message}")),
         429 => Error::rate_limit(
             retry_after_seconds,
             format!("OpenAI 429 ({kind} {code}): {message}"),
         ),
-        _ => Error::provider(
+        _ => Error::provider_with_status(
             "OpenAI",
+            status,
             format!("HTTP {status} ({kind} {code}): {message}"),
         ),
     }
@@ -688,10 +689,10 @@ mod tests {
         let err = parse_openai_error(429, Some(30), body);
         match err {
             Error::RateLimit {
-                retry_after_seconds,
+                retry_after,
                 message,
             } => {
-                assert_eq!(retry_after_seconds, Some(30));
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
                 assert!(message.contains("Rate limited"));
                 assert!(message.contains("rate_limit_error"));
             }
@@ -704,7 +705,7 @@ mod tests {
         let body =
             r#"{"error":{"message":"Bad key","type":"invalid_request_error","code":"invalid_api_key"}}"#;
         let err = parse_openai_error(401, None, body);
-        assert!(matches!(err, Error::Auth(_)), "got {err:?}");
+        assert!(matches!(err, Error::Auth { status: Some(401), .. }), "got {err:?}");
         assert!(format!("{err}").contains("Bad key"));
     }
 

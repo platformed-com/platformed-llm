@@ -294,12 +294,20 @@ impl LLMProvider for AnthropicViaVertexProvider {
         let response = self.transport.send(req).await?;
 
         if !(200..300).contains(&response.status) {
+            let status = response.status;
             let body_bytes = response.collect_body().await.unwrap_or_default();
-            let error_text = String::from_utf8_lossy(&body_bytes);
-            return Err(Error::provider(
-                "Anthropic",
-                format!("API error: {error_text}"),
-            ));
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            return Err(match status {
+                401 | 403 => {
+                    Error::auth_with_status(status, format!("Anthropic {status}: {body_text}"))
+                }
+                404 => Error::ModelNotAvailable(format!("Anthropic 404: {body_text}")),
+                _ => Error::provider_with_status(
+                    "Anthropic",
+                    status,
+                    format!("API error: {body_text}"),
+                ),
+            });
         }
 
         // Create SSE stream from response
