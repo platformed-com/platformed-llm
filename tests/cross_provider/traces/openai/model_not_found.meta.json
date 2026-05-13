@@ -1,15 +1,15 @@
 {
-  "captured_at_unix": 1778683061,
+  "captured_at_unix": 1778686036,
   "endpoint": "https://api.openai.com/v1/responses",
   "expect_failure": true,
   "headers": {
     "content-type": "application/json",
     "openai-organization": "platformed-02snf0",
-    "openai-processing-ms": "168",
+    "openai-processing-ms": "124",
     "openai-version": "2020-10-01",
-    "x-request-id": "req_82dc116b64634ab585be740821c9e986"
+    "x-request-id": "req_b9b7fc82783a4f5aa0884b3edbd74bd2"
   },
-  "latency_ms": 305,
+  "latency_ms": 241,
   "model": "gpt-5-this-model-does-not-exist",
   "provider": "openai",
   "response_bytes": 197,

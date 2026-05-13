@@ -1,72 +1,72 @@
 event: response.created
-data: {"type":"response.created","response":{"id":"resp_0da1e2517eabdab3016a048ca39bb48194b585eb062d4fbae6","object":"response","created_at":1778683043,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":16,"max_tool_calls":null,"model":"gpt-4o-mini-2024-07-18","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"in_memory","reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
+data: {"type":"response.created","response":{"id":"resp_0c65b70e9ab1eb11016a049843f88c8191b23ff32c6344b688","object":"response","created_at":1778686019,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":16,"max_tool_calls":null,"model":"gpt-4o-mini-2024-07-18","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"in_memory","reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
 
 event: response.in_progress
-data: {"type":"response.in_progress","response":{"id":"resp_0da1e2517eabdab3016a048ca39bb48194b585eb062d4fbae6","object":"response","created_at":1778683043,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":16,"max_tool_calls":null,"model":"gpt-4o-mini-2024-07-18","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"in_memory","reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
+data: {"type":"response.in_progress","response":{"id":"resp_0c65b70e9ab1eb11016a049843f88c8191b23ff32c6344b688","object":"response","created_at":1778686019,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":16,"max_tool_calls":null,"model":"gpt-4o-mini-2024-07-18","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"in_memory","reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
 
 event: response.output_item.added
-data: {"type":"response.output_item.added","item":{"id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","type":"message","status":"in_progress","content":[],"role":"assistant"},"output_index":0,"sequence_number":2}
+data: {"type":"response.output_item.added","item":{"id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","type":"message","status":"in_progress","content":[],"role":"assistant"},"output_index":0,"sequence_number":2}
 
 event: response.content_part.added
-data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","output_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""},"sequence_number":3}
+data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","output_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""},"sequence_number":3}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":"###","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"zxP23qW7XZk7y","output_index":0,"sequence_number":4}
+data: {"type":"response.output_text.delta","content_index":0,"delta":"###","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"6MbmKwKbwGaIU","output_index":0,"sequence_number":4}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":" The","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"y3tZi0zL4lhj","output_index":0,"sequence_number":5}
+data: {"type":"response.output_text.delta","content_index":0,"delta":" The","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"DCYKaq52J2g7","output_index":0,"sequence_number":5}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":" History","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"GxoAVDuK","output_index":0,"sequence_number":6}
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Fasc","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"zAJ8RBYjDVG","output_index":0,"sequence_number":6}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":" of","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"9G7ZbUEZQrzOX","output_index":0,"sequence_number":7}
+data: {"type":"response.output_text.delta","content_index":0,"delta":"inating","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"8qLIRJt0f","output_index":0,"sequence_number":7}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":" Clouds","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"cSDyFcEpr","output_index":0,"sequence_number":8}
+data: {"type":"response.output_text.delta","content_index":0,"delta":" History","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"XTnK9NW1","output_index":0,"sequence_number":8}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":":","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"z2ym1ZnWCoOruOH","output_index":0,"sequence_number":9}
+data: {"type":"response.output_text.delta","content_index":0,"delta":" of","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"ZSaBly56vykcz","output_index":0,"sequence_number":9}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":" A","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"IEkVPrmPTkLL8H","output_index":0,"sequence_number":10}
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Clouds","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"Y2nVnHZvS","output_index":0,"sequence_number":10}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":" Journey","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"k0kJ36jz","output_index":0,"sequence_number":11}
+data: {"type":"response.output_text.delta","content_index":0,"delta":"\n\n","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"z9hgdTBvbiuvSA","output_index":0,"sequence_number":11}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":" Through","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"8Zo8kdiV","output_index":0,"sequence_number":12}
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Cloud","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"10qpKxMHRHl","output_index":0,"sequence_number":12}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":" Time","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"fbbHqCKrIlf","output_index":0,"sequence_number":13}
+data: {"type":"response.output_text.delta","content_index":0,"delta":"s","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"oSiTKIAARAUJ4v4","output_index":0,"sequence_number":13}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":"\n\n","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"CH8lOqBNG6v0aB","output_index":0,"sequence_number":14}
+data: {"type":"response.output_text.delta","content_index":0,"delta":" have","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"xP2nbyHijoV","output_index":0,"sequence_number":14}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":"Cloud","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"FDb2PFFqIqR","output_index":0,"sequence_number":15}
+data: {"type":"response.output_text.delta","content_index":0,"delta":" captivated","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"GnSNF","output_index":0,"sequence_number":15}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":"s","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"ztTfu4FTQsXpJea","output_index":0,"sequence_number":16}
+data: {"type":"response.output_text.delta","content_index":0,"delta":" human","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"zrtFZweySL","output_index":0,"sequence_number":16}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":",","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"1rZRvzmHRDuclJe","output_index":0,"sequence_number":17}
+data: {"type":"response.output_text.delta","content_index":0,"delta":" imagination","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"D6Cc","output_index":0,"sequence_number":17}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":" those","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"PqrSgcXi67","output_index":0,"sequence_number":18}
+data: {"type":"response.output_text.delta","content_index":0,"delta":" and","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"OZDYOGjo28Lv","output_index":0,"sequence_number":18}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","content_index":0,"delta":" ephemeral","item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"obfuscation":"cIOWOL","output_index":0,"sequence_number":19}
+data: {"type":"response.output_text.delta","content_index":0,"delta":" influenced","item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"obfuscation":"tCVQ8","output_index":0,"sequence_number":19}
 
 event: response.output_text.done
-data: {"type":"response.output_text.done","content_index":0,"item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","logprobs":[],"output_index":0,"sequence_number":20,"text":"### The History of Clouds: A Journey Through Time\n\nClouds, those ephemeral"}
+data: {"type":"response.output_text.done","content_index":0,"item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","logprobs":[],"output_index":0,"sequence_number":20,"text":"### The Fascinating History of Clouds\n\nClouds have captivated human imagination and influenced"}
 
 event: response.content_part.done
-data: {"type":"response.content_part.done","content_index":0,"item_id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","output_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"### The History of Clouds: A Journey Through Time\n\nClouds, those ephemeral"},"sequence_number":21}
+data: {"type":"response.content_part.done","content_index":0,"item_id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","output_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"### The Fascinating History of Clouds\n\nClouds have captivated human imagination and influenced"},"sequence_number":21}
 
 event: response.output_item.done
-data: {"type":"response.output_item.done","item":{"id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","type":"message","status":"incomplete","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"### The History of Clouds: A Journey Through Time\n\nClouds, those ephemeral"}],"role":"assistant"},"output_index":0,"sequence_number":22}
+data: {"type":"response.output_item.done","item":{"id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","type":"message","status":"incomplete","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"### The Fascinating History of Clouds\n\nClouds have captivated human imagination and influenced"}],"role":"assistant"},"output_index":0,"sequence_number":22}
 
 event: response.incomplete
-data: {"type":"response.incomplete","response":{"id":"resp_0da1e2517eabdab3016a048ca39bb48194b585eb062d4fbae6","object":"response","created_at":1778683043,"status":"incomplete","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":{"reason":"max_output_tokens"},"instructions":null,"max_output_tokens":16,"max_tool_calls":null,"model":"gpt-4o-mini-2024-07-18","moderation":null,"output":[{"id":"msg_0da1e2517eabdab3016a048ca4dcdc8194ad3726d47bccf370","type":"message","status":"incomplete","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"### The History of Clouds: A Journey Through Time\n\nClouds, those ephemeral"}],"role":"assistant"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"in_memory","reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"default","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":0},"output_tokens":16,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":36},"user":null,"metadata":{}},"sequence_number":23}
+data: {"type":"response.incomplete","response":{"id":"resp_0c65b70e9ab1eb11016a049843f88c8191b23ff32c6344b688","object":"response","created_at":1778686019,"status":"incomplete","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":{"reason":"max_output_tokens"},"instructions":null,"max_output_tokens":16,"max_tool_calls":null,"model":"gpt-4o-mini-2024-07-18","moderation":null,"output":[{"id":"msg_0c65b70e9ab1eb11016a0498445a108191a9029b3e838bc970","type":"message","status":"incomplete","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"### The Fascinating History of Clouds\n\nClouds have captivated human imagination and influenced"}],"role":"assistant"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"in_memory","reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"default","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":0},"output_tokens":16,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":36},"user":null,"metadata":{}},"sequence_number":23}
 

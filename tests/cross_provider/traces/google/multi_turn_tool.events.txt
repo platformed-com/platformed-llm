@@ -1,8 +1,9 @@
 PartStart[0] text
 Delta[0] "\n"
+Delta[0] "The weather in Paris is sunny with a temperature of 22 degrees Celsius."
 PartEnd[0]
 Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
-output[0].part[0] text "\n" annotations=0
+output[0].part[0] text "\nThe weather in Paris is sunny with a temperature of 22 degrees Celsius." annotations=0

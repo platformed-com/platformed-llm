@@ -1,2 +1,2 @@
-data: {"candidates": [{"content": {"role": "model"},"finishReason": "MAX_TOKENS"}],"usageMetadata": {"promptTokenCount": 13,"totalTokenCount": 25,"trafficType": "ON_DEMAND","promptTokensDetails": [{"modality": "TEXT","tokenCount": 13}],"thoughtsTokenCount": 12},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T14:37:45.395535Z","responseId": "uYwEao-SGPei9fgP5pCUoQk"}
+data: {"candidates": [{"content": {"role": "model"},"finishReason": "MAX_TOKENS"}],"usageMetadata": {"promptTokenCount": 13,"totalTokenCount": 26,"trafficType": "ON_DEMAND","promptTokensDetails": [{"modality": "TEXT","tokenCount": 13}],"thoughtsTokenCount": 13},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T15:27:19.412111Z","responseId": "V5gEas-TGfXsmLAPpabqiQ4"}
 
