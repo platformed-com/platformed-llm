@@ -55,13 +55,22 @@ pub enum OpenAIContentPart {
     },
 }
 
-/// OpenAI tool format for Responses API.
+/// OpenAI tool entry in the Responses API `tools` array.
+///
+/// `Function` is the caller-defined case; the other variants are
+/// OpenAI's pre-baked builtin tools. Each builtin has its own wire
+/// shape — `web_search_preview` is a bare type marker, while
+/// `computer_use_preview` takes display dimensions and an environment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAITool {
-    pub r#type: String, // "function"
-    pub name: String,
-    pub description: String,
-    pub parameters: Cow<'static, RawValue>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpenAITool {
+    Function {
+        name: String,
+        description: String,
+        parameters: Cow<'static, RawValue>,
+    },
+    WebSearchPreview,
+    ComputerUsePreview,
 }
 
 /// OpenAI Responses API request.

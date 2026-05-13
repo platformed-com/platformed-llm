@@ -111,26 +111,21 @@ impl AnthropicViaVertexProvider {
             let converted: Vec<AnthropicTool> = tools
                 .iter()
                 .filter_map(|tool| match tool {
-                    Tool::Function(f) => Some(AnthropicTool {
+                    Tool::Function(f) => Some(AnthropicTool::Function {
                         name: f.name.clone(),
                         description: f.description.clone().unwrap_or_default(),
                         input_schema: f.parameters.clone(),
                     }),
+                    Tool::Builtin(ProviderBuiltin::WebSearch) => Some(AnthropicTool::Builtin {
+                        r#type: "web_search_20250305",
+                        name: "web_search",
+                    }),
+                    Tool::Builtin(ProviderBuiltin::ComputerUse) => Some(AnthropicTool::Builtin {
+                        r#type: "computer_20250124",
+                        name: "computer",
+                    }),
                     Tool::Builtin(b) => {
-                        // WebSearch / ComputerUse are Anthropic builtins
-                        // but use distinct wire shapes (separate tools array
-                        // entries with type=web_search_20250305 etc.).
-                        // Wiring is a Phase 5 follow-up; for now drop with
-                        // a tracing note so model-switching doesn't break.
-                        if !matches!(
-                            b,
-                            ProviderBuiltin::WebSearch | ProviderBuiltin::ComputerUse
-                        ) {
-                            tracing::debug!(
-                                ?b,
-                                "Anthropic provider dropping unsupported builtin tool"
-                            );
-                        }
+                        tracing::debug!(?b, "Anthropic provider dropping unsupported builtin");
                         None
                     }
                 })

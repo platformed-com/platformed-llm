@@ -133,12 +133,35 @@ pub struct GoogleThinkingConfig {
     pub thinking_budget: u32,
 }
 
-/// Google tool definition.
+/// Google tool entry in the `tools` array.
+///
+/// Gemini distinguishes function tools from builtins by which key is
+/// present on the entry. Serializes via `#[serde(untagged)]` so each
+/// variant produces the wire shape Gemini expects.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GoogleTool {
-    pub function_declarations: Vec<GoogleFunctionDeclaration>,
+#[serde(untagged)]
+pub enum GoogleTool {
+    /// Caller-defined function tools.
+    Functions {
+        #[serde(rename = "functionDeclarations")]
+        function_declarations: Vec<GoogleFunctionDeclaration>,
+    },
+    /// Built-in Google Search retrieval.
+    GoogleSearch {
+        #[serde(rename = "googleSearch")]
+        google_search: GoogleEmptyConfig,
+    },
+    /// Built-in code execution.
+    CodeExecution {
+        #[serde(rename = "codeExecution")]
+        code_execution: GoogleEmptyConfig,
+    },
 }
+
+/// Placeholder empty-object wire shape Gemini uses for parameterless
+/// builtin tools. Always serializes to `{}`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct GoogleEmptyConfig {}
 
 /// Google function declaration.
 #[derive(Debug, Clone, Serialize)]

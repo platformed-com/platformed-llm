@@ -244,40 +244,42 @@ impl GoogleProvider {
 
         let tools = request.tools.as_ref().and_then(|tools| {
             use crate::types::{ProviderBuiltin, Tool};
-            let declarations: Vec<GoogleFunctionDeclaration> = tools
-                .iter()
-                .filter_map(|tool| match tool {
-                    Tool::Function(f) => Some(GoogleFunctionDeclaration {
+            let mut function_decls: Vec<GoogleFunctionDeclaration> = Vec::new();
+            let mut entries: Vec<GoogleTool> = Vec::new();
+            for tool in tools {
+                match tool {
+                    Tool::Function(f) => function_decls.push(GoogleFunctionDeclaration {
                         name: f.name.clone(),
                         description: f.description.clone().unwrap_or_default(),
                         parameters: f.parameters.clone(),
                     }),
-                    Tool::Builtin(b) => {
-                        if !matches!(
-                            b,
-                            ProviderBuiltin::GoogleSearch | ProviderBuiltin::CodeExecution
-                        ) {
-                            tracing::debug!(
-                                ?b,
-                                "Google provider dropping unsupported builtin tool"
-                            );
-                        }
-                        // Builtins on Gemini use distinct wire shapes
-                        // (`google_search_retrieval`, `code_execution`) at
-                        // the GoogleTool level, not function_declarations.
-                        // Wiring those is a Phase 5 follow-up — for now we
-                        // drop them with a tracing note so model-switching
-                        // doesn't break.
-                        None
+                    Tool::Builtin(ProviderBuiltin::GoogleSearch) => {
+                        entries.push(GoogleTool::GoogleSearch {
+                            google_search: GoogleEmptyConfig::default(),
+                        });
                     }
-                })
-                .collect();
-            if declarations.is_empty() {
+                    Tool::Builtin(ProviderBuiltin::CodeExecution) => {
+                        entries.push(GoogleTool::CodeExecution {
+                            code_execution: GoogleEmptyConfig::default(),
+                        });
+                    }
+                    Tool::Builtin(b) => {
+                        tracing::debug!(?b, "Google provider dropping unsupported builtin tool");
+                    }
+                }
+            }
+            if !function_decls.is_empty() {
+                entries.insert(
+                    0,
+                    GoogleTool::Functions {
+                        function_declarations: function_decls,
+                    },
+                );
+            }
+            if entries.is_empty() {
                 None
             } else {
-                Some(vec![GoogleTool {
-                    function_declarations: declarations,
-                }])
+                Some(entries)
             }
         });
 
@@ -746,5 +748,25 @@ mod tests {
             json["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
             serde_json::json!(["get_weather"]),
         );
+    }
+
+    #[test]
+    fn google_search_builtin_emits_separate_tool_entry() {
+        use crate::types::{ProviderBuiltin, Tool};
+        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
+            .tools(vec![Tool::builtin(ProviderBuiltin::GoogleSearch)]);
+        let body = provider().convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["tools"], serde_json::json!([{ "googleSearch": {} }]));
+    }
+
+    #[test]
+    fn code_execution_builtin_emits_separate_tool_entry() {
+        use crate::types::{ProviderBuiltin, Tool};
+        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
+            .tools(vec![Tool::builtin(ProviderBuiltin::CodeExecution)]);
+        let body = provider().convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["tools"], serde_json::json!([{ "codeExecution": {} }]));
     }
 }

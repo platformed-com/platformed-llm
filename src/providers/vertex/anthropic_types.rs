@@ -143,12 +143,23 @@ pub enum AnthropicToolResultBlock {
     Image { source: IValue },
 }
 
-/// Anthropic tool definition.
+/// Anthropic tool entry. Function tools serialize without a `type`
+/// field (Anthropic infers it from the absence of a typed type); the
+/// builtin variants carry typed `type` markers like
+/// `"web_search_20250305"`.
 #[derive(Debug, Clone, Serialize)]
-pub struct AnthropicTool {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Cow<'static, RawValue>,
+#[serde(untagged)]
+pub enum AnthropicTool {
+    Function {
+        name: String,
+        description: String,
+        input_schema: Cow<'static, RawValue>,
+    },
+    Builtin {
+        #[serde(rename = "type")]
+        r#type: &'static str,
+        name: &'static str,
+    },
 }
 
 /// Anthropic API response.
