@@ -8,43 +8,195 @@ skipped, not forgotten. Delete sections as they land.
 These each touch every consumer of the crate, so they deserve their own
 dedicated commit/PR rather than being mixed into bug fixes.
 
-### Vec<ContentPart> message model
+### Guiding principles
 
-The single biggest gap. `Message::content: String` and `OutputItem::Text`
-can't represent:
-- Multi-modal (images / audio in user messages).
+The redesign aims to support **mid-conversation provider switching** as
+a first-class capability. Concretely:
+
+1. **Lossless canonical message model.** Every content type from every
+   supported provider has a representation in the internal model.
+   Round-tripping through the *same* provider preserves everything.
+2. **Silent, lossy egress when the target provider doesn't support a
+   variant.** No errors — switching providers in the middle of a
+   conversation must always *work*, even if quality degrades (less
+   context, no caching, no reasoning continuation). The lib drops or
+   best-effort-translates per-target.
+3. **Provider-specific optimizations are hints, not requirements.**
+   `previous_response_id`, cache breakpoints, provider-builtin tools —
+   all opt-in. The lib always supports running with none of them, and
+   silently ignores hints that don't apply to the target provider.
+4. **Opaque continuation tokens.** Responses carry provider-specific
+   state that the caller can pass back. The issuing provider uses it as
+   an optimization; other providers ignore it and fall back to sending
+   full message history.
+
+### Canonical message model
+
+The single biggest piece. `Message::content: String` and
+`OutputItem::Text` can't represent:
+- Multi-modal user content (images, audio, documents).
 - Reasoning blocks with `signature` (Anthropic). Currently
   `OutputItem::Reasoning { content, signature }` carries the signature,
   but `OutputItem::to_input_item` drops it on the way back into a
   request — so multi-turn thinking can't actually round-trip.
 - Anthropic `redacted_thinking` blocks (opaque blob; pass-through only).
-- Mixed text + tool_use within a single assistant turn (we currently
-  split them into separate `InputItem`s, which loses ordering when
-  reading back).
+- Interleaved text + thinking + tool_use within a single assistant turn
+  on Anthropic (we currently split them into separate `InputItem`s,
+  which loses ordering).
+- OpenAI typed `refusal` content parts.
+- Per-text-part citations / annotations.
+- Anthropic per-block `cache_control` hints (90% cost reduction on
+  cached prefixes — major lever).
 
 **Plan**:
 ```rust
-pub enum ContentPart {
-    Text(String),
-    Image { source: ImageSource },
-    Reasoning { content: String, signature: Option<String> },
-    RedactedReasoning { data: String },
+pub enum InputItem {
+    System(String),
+    User { content: Vec<UserPart> },
+    Assistant { content: Vec<AssistantPart> }, // includes ToolCall, in emit order
 }
 
-pub struct Message {
-    pub role: Role,
-    pub content: Vec<ContentPart>,
+pub enum UserPart {
+    Text(String),
+    Image(ImageSource),
+    Audio(AudioSource),
+    Document(DocumentSource),
+    /// Tool execution result. `call_id` correlates with a prior
+    /// `AssistantPart::ToolCall` in the same conversation. The content is
+    /// itself a `Vec<UserPart>` so tool results can carry images / docs
+    /// (e.g. a tool that returns a chart).
+    ToolResult { call_id: String, content: Vec<UserPart> },
+    /// Anthropic-only: marks the end of a cacheable prefix. Up to 4
+    /// breakpoints per request. On OpenAI we derive a stable
+    /// `prompt_cache_key` from a hash of the cached prefix (best-effort
+    /// equivalent). Dropped on Gemini.
+    CacheBreakpoint,
 }
+
+pub enum AssistantPart {
+    Text {
+        content: String,
+        /// Per-text citations, web-search results, file references.
+        /// Provider-specific shapes flatten into a uniform Annotation list.
+        annotations: Vec<Annotation>,
+    },
+    Reasoning {
+        content: String,
+        /// Anthropic's `thinking` signature. Dropped on cross-provider
+        /// conversion — the signature is meaningful only to the model
+        /// that produced it.
+        signature: Option<String>,
+    },
+    /// Anthropic `redacted_thinking` — opaque blob passed back to
+    /// Anthropic unchanged. Dropped on cross-provider conversion.
+    RedactedReasoning { data: String },
+    /// OpenAI typed refusal channel. Translated to plain text on
+    /// providers that don't surface refusals separately (so the caller
+    /// still sees the content).
+    Refusal(String),
+    ToolCall(FunctionCall),
+    /// Anthropic cache breakpoint marker. Same semantics as on `UserPart`.
+    CacheBreakpoint,
+}
+
+pub struct Annotation {
+    pub kind: AnnotationKind, // UrlCitation | FileCitation | WebSearch | …
+    pub start: usize, // byte offset in the containing text
+    pub end: usize,
+    pub source: String,
+}
+
+pub enum ImageSource {
+    Url(String),
+    Base64 { data: String, media_type: String },
+}
+// AudioSource and DocumentSource follow the same shape.
 
 pub enum OutputItem {
-    Message { content: Vec<ContentPart> },
-    FunctionCall { call: FunctionCall },
+    /// The model's full assistant turn, parts in emit order. Tool calls,
+    /// reasoning, refusals, and text are all parts of one turn.
+    Assistant { content: Vec<AssistantPart> },
 }
 ```
 
-Each provider's `convert_request` walks parts and emits the right wire
-shape; the accumulator coalesces adjacent text deltas into a single
-`ContentPart::Text`. Anthropic's signature now round-trips correctly.
+Each provider's `convert_request` walks the parts and:
+- **Anthropic**: emits each `AssistantPart` as a content block in the
+  assistant message — natural 1:1 mapping. Cache breakpoints become
+  `cache_control: {type: "ephemeral"}` on the preceding block.
+- **OpenAI**: flattens. Text → message content part. Reasoning → top-
+  level `reasoning` input item. ToolCall → top-level `function_call`
+  item. Refusal → message content part of type `refusal`. Cache
+  breakpoints → derive `prompt_cache_key` from a stable hash of bytes
+  up to that point.
+- **Gemini**: emits each `AssistantPart` as a part inside `role: model`
+  content. Reasoning text dropped (Gemini doesn't accept thinking back
+  as input). ToolCall → `functionCall` part. Refusal → plain text part.
+  Cache breakpoints dropped.
+
+The accumulator coalesces adjacent text deltas into a single
+`AssistantPart::Text` per logical text span.
+
+### Provider continuation tokens
+
+OpenAI's `previous_response_id` (and any future analogue from other
+providers) is a request-time optimization that lets the provider elide
+the message history when the previous response is still in
+server-side state.
+
+```rust
+pub struct LLMRequest {
+    // existing fields…
+    /// Optimization hint. If the target provider matches the issuer, use
+    /// it to skip re-sending history. Otherwise ignored — the lib falls
+    /// back to sending the full conversation.
+    pub continuation: Option<ProviderContinuation>,
+}
+
+pub enum ProviderContinuation {
+    OpenAI { response_id: String },
+    // Anthropic / Gemini have no analogous concept today. Adding one
+    // later is non-breaking.
+}
+
+pub struct CompleteResponse {
+    pub output: Vec<OutputItem>,
+    pub finish_reason: FinishReason,
+    pub usage: Usage,
+    /// Opaque token the caller can pass to the next request as
+    /// `LLMRequest::continuation`. Only meaningful when the next call
+    /// goes to the same provider.
+    pub continuation: Option<ProviderContinuation>,
+}
+```
+
+This is purely additive. Callers who don't care never see it; callers
+who do see meaningful token-cost savings on multi-turn reasoning.
+
+### Provider-builtin tools
+
+Each provider has its own pre-baked tools (`web_search`, `computer_use`,
+Gemini code execution, Google search retrieval). These are different
+from user-defined function tools — they're configured by name and the
+model invokes them via wire-shape that's provider-specific.
+
+```rust
+pub enum Tool {
+    Function(FunctionTool),
+    /// Provider-builtin: dropped from the tools array on providers that
+    /// don't offer it.
+    Builtin(ProviderBuiltin),
+}
+
+pub enum ProviderBuiltin {
+    WebSearch,         // OpenAI, Anthropic (different invocations)
+    GoogleSearch,      // Gemini
+    CodeExecution,     // Gemini
+    ComputerUse(ComputerConfig), // OpenAI, Anthropic
+}
+```
+
+Like everything else, unsupported builtins are silently dropped on
+egress. The model still gets a valid tools array, just smaller.
 
 ### Error redesign
 
@@ -134,14 +286,17 @@ Easy fix once decided whether to wire them or remove them from
 
 ## Other provider feature gaps
 
+Some of these are subsumed by Phase 5 once the canonical message model
+and the provider-builtin tool surface land — flagged below.
+
 - **OpenAI refusal handling**: `response.refusal.delta` / `.done` events
-  are silently dropped. Should surface as a typed `StreamEvent::Refusal`
-  (or fold into `Error::ContentFilter`). No captured trace currently
-  exercises a refusal — needs a prompt that elicits one reliably.
+  are silently dropped. *Phase 5 subsumes* — `AssistantPart::Refusal`
+  is the typed surface; this becomes wiring it up.
 - **OpenAI `OpenAI-Organization` / `OpenAI-Project` headers**: optional,
   but multi-org / project-scoped keys won't work without them.
 - **Anthropic `cache_control: Ephemeral`** on tools / system / message
-  blocks: prompt caching gate. Big cost lever.
+  blocks: prompt caching gate. Big cost lever. *Phase 5 subsumes* via
+  `UserPart::CacheBreakpoint` / `AssistantPart::CacheBreakpoint`.
 - **Anthropic `anthropic-beta` headers**: required for several beta
   features (computer use, fine-grained tool streaming).
 - **Gemini `toolConfig`**: forced tool mode (`AUTO` / `ANY` / `NONE`)
@@ -149,6 +304,9 @@ Easy fix once decided whether to wire them or remove them from
   OpenAI; Anthropic and Gemini still ignore it.
 - **Gemini structured output**: `responseMimeType` /
   `responseSchema` (JSON mode equivalent) — no surface.
+- **Provider-builtin tools** (OpenAI web_search, Anthropic computer_use,
+  Gemini google_search / code execution). *Phase 5 subsumes* via the
+  `Tool::Builtin(ProviderBuiltin)` variant.
 
 ## Testing gaps
 
