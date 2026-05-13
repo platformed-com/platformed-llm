@@ -136,6 +136,130 @@ Each provider's `convert_request` walks the parts and:
 The accumulator coalesces adjacent text deltas into a single
 `AssistantPart::Text` per logical text span.
 
+### Streaming event representation
+
+Today's `StreamEvent` is asymmetric — `ContentDelta` / `ReasoningDelta` are
+incremental, `FunctionCallComplete` is one-shot — and the accumulator
+carries implicit state ("the most-recent `OutputItemAdded` of kind X is
+where `ContentDelta` lands"). The big `match` in `process_event` has to
+special-case each kind. Annotations / citations have nowhere to attach
+because the event type doesn't carry an item identifier.
+
+Redesign every event to name its target part by index, with uniform
+streaming for every part type:
+
+```rust
+pub enum StreamEvent {
+    /// A new assistant part is opening. `index` is monotonically
+    /// increasing within the turn (0, 1, 2, …). One-shot parts
+    /// (RedactedReasoning) carry all their data in `kind` and emit no
+    /// subsequent Delta / PartUpdate events for this index.
+    PartStart { index: u32, kind: PartKind },
+
+    /// Append data to the part at `index`. Interpretation depends on
+    /// the part's kind: text-deltas for Text / Refusal, reasoning-text
+    /// deltas for Reasoning, JSON-argument deltas for ToolCall.
+    Delta { index: u32, delta: String },
+
+    /// Out-of-band metadata for a part. Always arrives before the
+    /// matching `PartEnd`. May arrive multiple times (e.g. several
+    /// annotations on one text span).
+    PartUpdate { index: u32, update: PartUpdate },
+
+    /// No further events will arrive for this part.
+    PartEnd { index: u32 },
+
+    /// The assistant turn is complete.
+    Done { finish_reason: FinishReason, usage: Usage },
+
+    /// Mid-stream fatal error. No further events arrive.
+    Error { error: String },
+}
+
+pub enum PartKind {
+    Text,
+    Reasoning,
+    /// Opaque blob (Anthropic). No Delta / PartUpdate follow.
+    RedactedReasoning { data: String },
+    Refusal,
+    /// Header for a streaming tool call. Arguments are built up via
+    /// Delta events at this index; parsed at PartEnd.
+    ToolCall { call_id: String, name: String },
+}
+
+pub enum PartUpdate {
+    /// Anthropic thinking signature, arriving after reasoning deltas.
+    Signature(String),
+    /// Citation / web-search annotation on the most-recent text span
+    /// in the part. May arrive multiple times per text part.
+    Annotation(Annotation),
+}
+```
+
+**Accumulator becomes ~10 lines plus three helpers**:
+
+```rust
+fn process(&mut self, event: StreamEvent) -> Result<(), Error> {
+    match event {
+        StreamEvent::PartStart { index, kind } => {
+            assert_eq!(self.parts.len() as u32, index, "out-of-order PartStart");
+            self.parts.push(start_part(kind));
+        }
+        StreamEvent::Delta { index, delta } =>
+            append_delta(&mut self.parts[index as usize], &delta),
+        StreamEvent::PartUpdate { index, update } =>
+            apply_update(&mut self.parts[index as usize], update),
+        StreamEvent::PartEnd { index } =>
+            finalize_part(&mut self.parts[index as usize])?,
+        StreamEvent::Done { finish_reason, usage } => {
+            self.finish = Some(finish_reason);
+            self.usage = Some(usage);
+        }
+        StreamEvent::Error { error } => return Err(Error::streaming(error)),
+    }
+    Ok(())
+}
+```
+
+**Provider mapping** (every wire event maps to one of six variants):
+
+| Provider event | Maps to |
+|---|---|
+| OpenAI `response.output_item.added` | `PartStart` |
+| OpenAI `response.output_text.delta` | `Delta` |
+| OpenAI `response.output_text.annotation.added` | `PartUpdate { Annotation }` |
+| OpenAI `response.reasoning_summary_text.delta` | `Delta` |
+| OpenAI `response.function_call_arguments.delta` | `Delta` |
+| OpenAI `response.output_item.done` | `PartEnd` |
+| OpenAI `response.completed` / `response.incomplete` | `Done` |
+| Anthropic `content_block_start` | `PartStart` |
+| Anthropic `content_block_delta` (text / thinking / input_json) | `Delta` |
+| Anthropic `content_block_delta` (signature_delta) | `PartUpdate { Signature }` |
+| Anthropic `content_block_stop` | `PartEnd` |
+| Anthropic `message_stop` | `Done` |
+| Gemini per-part emissions | synthesized `PartStart` + `Delta` + `PartEnd` triplets |
+| Gemini final chunk with `finishReason` + `usageMetadata` | `Done` |
+
+**Wins beyond reconstruction simplicity**:
+
+- Annotations / citations attach to the text part they belong to
+  instead of being dropped (today's accumulator has nowhere to put
+  `response.output_text.annotation.added`).
+- Tool call argument streaming becomes symmetric with text streaming —
+  callers can render progressive tool-call previews ("the model is
+  calling get_weather… city: 'Pa…'") instead of waiting for the whole
+  block.
+- Reasoning signature → reasoning part linkage is explicit by index
+  (today's `ReasoningSignature` is a free-floating event that happens
+  to work because only one reasoning block is ever in flight).
+- Out-of-order arrival is a structural assertion failure instead of
+  silent corruption.
+
+**Concession**: UI callers that just want a stream of visible text
+deltas have to filter `Delta` by checking `parts[index].kind`. Mitigated
+by convenience iterators on `Response` (`text_deltas()`,
+`reasoning_deltas()`) that do the filter once.
+
 ### Provider continuation tokens
 
 OpenAI's `previous_response_id` (and any future analogue from other
