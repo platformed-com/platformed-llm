@@ -87,115 +87,57 @@ impl ProviderConfig {
     }
 
     /// Create configuration from environment variables.
+    ///
+    /// **`PROVIDER_TYPE` is required.** Set it to one of `openai`,
+    /// `google`, or `anthropic`. The credential-sniffing fallback that
+    /// used to guess from which credential variable happened to be set
+    /// has been removed — it was ambiguous when multiple credentials
+    /// were present, and silently picked the wrong provider on
+    /// dev machines with leftover env state.
+    ///
+    /// Per-provider env vars:
+    /// - **openai**: `OPENAI_API_KEY` (required).
+    /// - **google** / **anthropic**: `GOOGLE_CLOUD_PROJECT` (required),
+    ///   `GOOGLE_CLOUD_REGION` (default `europe-west1`),
+    ///   `VERTEX_ACCESS_TOKEN` (optional — uses ADC when absent).
     pub fn from_env() -> Result<Self, Error> {
-        // Check for explicit provider type first
-        if let Ok(provider_type) = env::var("PROVIDER_TYPE") {
-            match provider_type.to_lowercase().as_str() {
-                "openai" => {
-                    let api_key = env::var("OPENAI_API_KEY").map_err(|_| {
-                        Error::config(
-                            "OPENAI_API_KEY environment variable is required for OpenAI provider",
-                        )
-                    })?;
-                    return Ok(Self::openai(api_key));
-                }
-                "google" => {
-                    let project_id = env::var("GOOGLE_CLOUD_PROJECT")
-                        .map_err(|_| Error::config("GOOGLE_CLOUD_PROJECT environment variable is required for Google provider"))?;
-                    let location = env::var("GOOGLE_CLOUD_REGION")
-                        .unwrap_or_else(|_| "europe-west1".to_string());
-
-                    if let Ok(access_token) = env::var("VERTEX_ACCESS_TOKEN") {
-                        return Self::vertex(
-                            ProviderType::Google,
-                            project_id,
-                            location,
-                            access_token,
-                        );
-                    } else {
-                        return Self::vertex_with_adc(
-                            ProviderType::Google,
-                            project_id,
-                            location,
-                        );
-                    }
-                }
-                "anthropic" => {
-                    let project_id = env::var("GOOGLE_CLOUD_PROJECT")
-                        .map_err(|_| Error::config("GOOGLE_CLOUD_PROJECT environment variable is required for Anthropic provider"))?;
-                    let location = env::var("GOOGLE_CLOUD_REGION")
-                        .unwrap_or_else(|_| "europe-west1".to_string());
-
-                    if let Ok(access_token) = env::var("VERTEX_ACCESS_TOKEN") {
-                        return Self::vertex(
-                            ProviderType::Anthropic,
-                            project_id,
-                            location,
-                            access_token,
-                        );
-                    } else {
-                        return Self::vertex_with_adc(
-                            ProviderType::Anthropic,
-                            project_id,
-                            location,
-                        );
-                    }
-                }
-                _ => {
-                    return Err(Error::config(format!(
-                        "Invalid PROVIDER_TYPE '{provider_type}'. Valid values are: openai, google, anthropic"
-                    )));
+        let provider_type = env::var("PROVIDER_TYPE").map_err(|_| {
+            Error::config(
+                "PROVIDER_TYPE environment variable is required (openai, google, or anthropic)",
+            )
+        })?;
+        match provider_type.to_lowercase().as_str() {
+            "openai" => {
+                let api_key = env::var("OPENAI_API_KEY").map_err(|_| {
+                    Error::config(
+                        "OPENAI_API_KEY environment variable is required for OpenAI provider",
+                    )
+                })?;
+                Ok(Self::openai(api_key))
+            }
+            kind @ ("google" | "anthropic") => {
+                let provider = if kind == "google" {
+                    ProviderType::Google
+                } else {
+                    ProviderType::Anthropic
+                };
+                let project_id = env::var("GOOGLE_CLOUD_PROJECT").map_err(|_| {
+                    Error::config(format!(
+                        "GOOGLE_CLOUD_PROJECT environment variable is required for {kind} provider"
+                    ))
+                })?;
+                let location = env::var("GOOGLE_CLOUD_REGION")
+                    .unwrap_or_else(|_| "europe-west1".to_string());
+                if let Ok(access_token) = env::var("VERTEX_ACCESS_TOKEN") {
+                    Self::vertex(provider, project_id, location, access_token)
+                } else {
+                    Self::vertex_with_adc(provider, project_id, location)
                 }
             }
+            other => Err(Error::config(format!(
+                "Invalid PROVIDER_TYPE '{other}'. Valid values are: openai, google, anthropic"
+            ))),
         }
-
-        // Fallback to credential-based inference for backward compatibility
-        // Try OpenAI first
-        if let Ok(api_key) = env::var("OPENAI_API_KEY") {
-            return Ok(Self::openai(api_key));
-        }
-
-        // Try Google/Vertex with access token
-        if let Ok(access_token) = env::var("VERTEX_ACCESS_TOKEN") {
-            let project_id = env::var("GOOGLE_CLOUD_PROJECT").map_err(|_| {
-                Error::config("GOOGLE_CLOUD_PROJECT environment variable is required for Google")
-            })?;
-            let location =
-                env::var("GOOGLE_CLOUD_REGION").unwrap_or_else(|_| "europe-west1".to_string());
-
-            return Self::vertex(ProviderType::Google, project_id, location, access_token);
-        }
-
-        // Try Anthropic/Vertex with access token
-        if let Ok(access_token) = env::var("ANTHROPIC_VERTEX_ACCESS_TOKEN") {
-            let project_id = env::var("GOOGLE_CLOUD_PROJECT").map_err(|_| {
-                Error::config("GOOGLE_CLOUD_PROJECT environment variable is required for Anthropic")
-            })?;
-            let location =
-                env::var("GOOGLE_CLOUD_REGION").unwrap_or_else(|_| "europe-west1".to_string());
-
-            return Self::vertex(ProviderType::Anthropic, project_id, location, access_token);
-        }
-
-        // Try Google/Vertex with Application Default Credentials
-        if env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok()
-            || env::var("GOOGLE_CLOUD_PROJECT").is_ok()
-        {
-            let project_id = env::var("GOOGLE_CLOUD_PROJECT").map_err(|_| {
-                Error::config("GOOGLE_CLOUD_PROJECT environment variable is required for Google")
-            })?;
-            let location =
-                env::var("GOOGLE_CLOUD_REGION").unwrap_or_else(|_| "europe-west1".to_string());
-
-            // Check if this should be Anthropic instead of Google
-            if env::var("ANTHROPIC_MODEL").is_ok() {
-                return Self::vertex_with_adc(ProviderType::Anthropic, project_id, location);
-            } else {
-                return Self::vertex_with_adc(ProviderType::Google, project_id, location);
-            }
-        }
-
-        Err(Error::config("No valid API credentials found in environment. Set PROVIDER_TYPE (openai/google/anthropic) with appropriate credentials"))
     }
 }
 
@@ -365,9 +307,6 @@ mod tests {
         "GOOGLE_CLOUD_PROJECT",
         "GOOGLE_CLOUD_REGION",
         "VERTEX_ACCESS_TOKEN",
-        "ANTHROPIC_VERTEX_ACCESS_TOKEN",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "ANTHROPIC_MODEL",
     ];
 
     struct EnvGuard {
@@ -503,38 +442,41 @@ mod tests {
     }
 
     #[test]
-    fn from_env_fallback_openai_from_api_key_alone() {
+    fn from_env_without_provider_type_errors() {
         let _l = lock();
         let g = EnvGuard::fresh();
-        // PROVIDER_TYPE unset → infer from credentials.
+        // Even with a credential set, no PROVIDER_TYPE is an error now —
+        // the credential-sniffing fallback has been removed.
         g.set("OPENAI_API_KEY", "sk-fallback");
 
-        let config = ProviderConfig::from_env().expect("openai fallback");
-        assert!(matches!(config.provider_type, ProviderType::OpenAI));
-        assert_eq!(config.api_key, Some("sk-fallback".to_string()));
+        let err = ProviderConfig::from_env().expect_err("missing PROVIDER_TYPE");
+        assert!(
+            err.to_string().contains("PROVIDER_TYPE"),
+            "error should mention PROVIDER_TYPE, got: {err}"
+        );
     }
 
     #[test]
-    fn from_env_fallback_anthropic_via_dedicated_token() {
+    fn from_env_anthropic_via_vertex_access_token() {
         let _l = lock();
         let g = EnvGuard::fresh();
-        g.set("ANTHROPIC_VERTEX_ACCESS_TOKEN", "ya29.anthropic");
+        g.set("PROVIDER_TYPE", "anthropic");
         g.set("GOOGLE_CLOUD_PROJECT", "proj-1");
+        g.set("VERTEX_ACCESS_TOKEN", "ya29.anthropic");
 
-        let config = ProviderConfig::from_env().expect("anthropic fallback");
+        let config = ProviderConfig::from_env().expect("anthropic config");
         assert!(matches!(config.provider_type, ProviderType::Anthropic));
         assert_eq!(config.access_token, Some("ya29.anthropic".to_string()));
     }
 
     #[test]
-    fn from_env_no_credentials_errors() {
+    fn from_env_with_nothing_set_errors() {
         let _l = lock();
         let _g = EnvGuard::fresh();
-        // Nothing set at all.
         let err = ProviderConfig::from_env().expect_err("no creds");
         assert!(
-            err.to_string().contains("No valid API credentials"),
-            "got: {err}"
+            err.to_string().contains("PROVIDER_TYPE"),
+            "error should mention PROVIDER_TYPE, got: {err}"
         );
     }
 }

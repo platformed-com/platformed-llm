@@ -2,31 +2,28 @@ pub mod anthropic;
 pub mod google;
 pub mod openai;
 
-use platformed_llm::{Function, LLMProvider, Tool, ToolType};
+use platformed_llm::{Function, LLMProvider, Tool};
 use std::pin::Pin;
 
 /// Create a weather function tool for testing
 pub fn create_weather_tool() -> Tool {
-    Tool {
-        r#type: ToolType::Function,
-        function: Function {
-            name: "get_weather".to_string(),
-            description: Some("Get the current weather for a location".to_string()),
-            parameters: serde_json::from_str(
-                r#"{
-                    "type": "object",
-                    "properties": {
-                        "location": {
-                            "type": "string",
-                            "description": "The city and state, e.g. San Francisco, CA"
-                        }
-                    },
-                    "required": ["location"]
-                }"#,
-            )
-            .unwrap(),
-        },
-    }
+    Tool::Function(Function {
+        name: "get_weather".to_string(),
+        description: Some("Get the current weather for a location".to_string()),
+        parameters: serde_json::from_str(
+            r#"{
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city and state, e.g. San Francisco, CA"
+                    }
+                },
+                "required": ["location"]
+            }"#,
+        )
+        .unwrap(),
+    })
 }
 
 /// Provider configuration for cross-provider testing

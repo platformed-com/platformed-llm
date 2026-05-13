@@ -30,9 +30,9 @@ impl ProviderTestSetup for AnthropicTestSetup {
             "temperature": 0.7,
             "tools": [
                 {
-                    "name": weather_tool.function.name,
-                    "description": weather_tool.function.description,
-                    "input_schema": weather_tool.function.parameters
+                    "name": weather_tool.as_function().unwrap().name,
+                    "description": weather_tool.as_function().unwrap().description,
+                    "input_schema": weather_tool.as_function().unwrap().parameters
                 }
             ],
             "stream": true

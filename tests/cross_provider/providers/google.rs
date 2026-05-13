@@ -34,9 +34,9 @@ impl ProviderTestSetup for GoogleTestSetup {
             },
             "tools": [{
                 "functionDeclarations": [{
-                    "name": weather_tool.function.name,
-                    "description": weather_tool.function.description,
-                    "parameters": weather_tool.function.parameters
+                    "name": weather_tool.as_function().unwrap().name,
+                    "description": weather_tool.as_function().unwrap().description,
+                    "parameters": weather_tool.as_function().unwrap().parameters
                 }]
             }]
         });

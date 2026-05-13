@@ -211,17 +211,43 @@ impl GoogleProvider {
             top_p: request.top_p,
         });
 
-        let tools = request.tools.as_ref().map(|tools| {
-            vec![GoogleTool {
-                function_declarations: tools
-                    .iter()
-                    .map(|tool| GoogleFunctionDeclaration {
-                        name: tool.function.name.clone(),
-                        description: tool.function.description.clone().unwrap_or_default(),
-                        parameters: tool.function.parameters.clone(),
-                    })
-                    .collect(),
-            }]
+        let tools = request.tools.as_ref().and_then(|tools| {
+            use crate::types::{ProviderBuiltin, Tool};
+            let declarations: Vec<GoogleFunctionDeclaration> = tools
+                .iter()
+                .filter_map(|tool| match tool {
+                    Tool::Function(f) => Some(GoogleFunctionDeclaration {
+                        name: f.name.clone(),
+                        description: f.description.clone().unwrap_or_default(),
+                        parameters: f.parameters.clone(),
+                    }),
+                    Tool::Builtin(b) => {
+                        if !matches!(
+                            b,
+                            ProviderBuiltin::GoogleSearch | ProviderBuiltin::CodeExecution
+                        ) {
+                            tracing::debug!(
+                                ?b,
+                                "Google provider dropping unsupported builtin tool"
+                            );
+                        }
+                        // Builtins on Gemini use distinct wire shapes
+                        // (`google_search_retrieval`, `code_execution`) at
+                        // the GoogleTool level, not function_declarations.
+                        // Wiring those is a Phase 5 follow-up — for now we
+                        // drop them with a tracing note so model-switching
+                        // doesn't break.
+                        None
+                    }
+                })
+                .collect();
+            if declarations.is_empty() {
+                None
+            } else {
+                Some(vec![GoogleTool {
+                    function_declarations: declarations,
+                }])
+            }
         });
 
         let google_request = GoogleRequest {

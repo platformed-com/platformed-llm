@@ -104,8 +104,22 @@ impl Response {
     }
 
     pub async fn buffer(self) -> Result<CompleteResponse, Error> {
+        Ok(self.collect().await?.1)
+    }
+
+    pub async fn text(self) -> Result<String, Error> {
+        let complete = self.buffer().await?;
+        Ok(complete.text())
+    }
+
+    /// Drain the stream and return BOTH the full event sequence and the
+    /// accumulated [`CompleteResponse`]. Use when you need to render
+    /// streaming UI events live AND want a buffered final result without
+    /// double-consuming the response.
+    pub async fn collect(self) -> Result<(Vec<StreamEvent>, CompleteResponse), Error> {
         let continuation = self.continuation.clone();
         let mut accumulator = crate::accumulator::ResponseAccumulator::new();
+        let mut events = Vec::new();
 
         use futures_util::StreamExt;
         let mut stream = self.stream;
@@ -113,6 +127,7 @@ impl Response {
             let event = event_result?;
             match &event {
                 StreamEvent::Done { .. } => {
+                    events.push(event.clone());
                     accumulator.process_event(event)?;
                     break;
                 }
@@ -120,6 +135,7 @@ impl Response {
                     return Err(Error::streaming(error.clone()));
                 }
                 _ => {
+                    events.push(event.clone());
                     accumulator.process_event(event)?;
                 }
             }
@@ -127,12 +143,7 @@ impl Response {
 
         let mut response = accumulator.finalize()?;
         response.continuation = continuation;
-        Ok(response)
-    }
-
-    pub async fn text(self) -> Result<String, Error> {
-        let complete = self.buffer().await?;
-        Ok(complete.text())
+        Ok((events, response))
     }
 
     pub fn stream(self) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>> {
@@ -234,6 +245,32 @@ mod tests {
             continuation: None,
         };
         assert_eq!(response.text(), "Hello, world!");
+    }
+
+    #[tokio::test]
+    async fn collect_returns_both_events_and_buffered_response() {
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::Text,
+            }),
+            Ok(StreamEvent::Delta {
+                index: 0,
+                delta: "hello".to_string(),
+            }),
+            Ok(StreamEvent::PartEnd { index: 0 }),
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ];
+        let stream = futures_util::stream::iter(events);
+        let (events, complete) = Response::from_stream(stream).collect().await.unwrap();
+        // Stream events include both lifecycle and content events.
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], StreamEvent::PartStart { .. }));
+        // Buffered response has the accumulated text.
+        assert_eq!(complete.text(), "hello");
     }
 
     #[test]

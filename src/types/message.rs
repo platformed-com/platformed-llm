@@ -163,12 +163,50 @@ pub enum DocumentSource {
 }
 
 /// Tool definition the model can call.
+///
+/// Most tools are caller-defined functions (`Tool::Function`). Some
+/// providers offer pre-baked tools (web search, computer use, code
+/// execution) configured by name — those land on `Tool::Builtin`, which
+/// is silently dropped from the tools array on providers that don't
+/// offer the same builtin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Tool {
-    pub r#type: ToolType,
-    pub function: Function,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Tool {
+    Function(Function),
+    Builtin(ProviderBuiltin),
 }
 
+impl Tool {
+    /// Convenience: build a function tool from name, description, and
+    /// a parsed JSON-schema parameters value.
+    pub fn function(
+        name: impl Into<String>,
+        description: impl Into<Option<String>>,
+        parameters: Cow<'static, RawValue>,
+    ) -> Self {
+        Tool::Function(Function {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        })
+    }
+
+    /// Convenience: a builtin tool by kind.
+    pub fn builtin(kind: ProviderBuiltin) -> Self {
+        Tool::Builtin(kind)
+    }
+
+    /// Borrow the inner [`Function`] if this is a function tool.
+    pub fn as_function(&self) -> Option<&Function> {
+        match self {
+            Tool::Function(f) => Some(f),
+            _ => None,
+        }
+    }
+}
+
+/// Legacy alias retained for documentation symmetry. New code should
+/// match on `Tool` directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolType {
@@ -181,6 +219,22 @@ pub struct Function {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parameters: Cow<'static, RawValue>,
+}
+
+/// Provider-builtin tools — pre-baked tool definitions the provider
+/// invokes natively rather than calling out to the caller. Dropped from
+/// the tools array on providers that don't offer the same builtin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderBuiltin {
+    /// OpenAI / Anthropic web search.
+    WebSearch,
+    /// Google Search retrieval (Gemini).
+    GoogleSearch,
+    /// Code execution (Gemini).
+    CodeExecution,
+    /// Computer use (OpenAI / Anthropic) — config TBD.
+    ComputerUse,
 }
 
 /// A tool call emitted by the assistant.

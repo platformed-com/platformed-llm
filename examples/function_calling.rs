@@ -63,13 +63,11 @@ async fn main() -> Result<(), Error> {
     println!();
 
     // Define function tools
-    let get_weather = Tool {
-        r#type: ToolType::Function,
-        function: Function {
-            name: "get_weather".to_string(),
-            description: Some("Get the current weather for a location".to_string()),
-            parameters: serde_json::from_str(
-                r#"{
+    let get_weather = Tool::Function(Function {
+        name: "get_weather".to_string(),
+        description: Some("Get the current weather for a location".to_string()),
+        parameters: serde_json::from_str(
+            r#"{
                 "type": "object",
                 "properties": {
                     "location": {
@@ -83,19 +81,16 @@ async fn main() -> Result<(), Error> {
                     }
                 },
                 "required": ["location"]
-            })"#,
-            )
-            .unwrap(),
-        },
-    };
+            }"#,
+        )
+        .unwrap(),
+    });
 
-    let calculate = Tool {
-        r#type: ToolType::Function,
-        function: Function {
-            name: "calculate".to_string(),
-            description: Some("Perform mathematical calculations".to_string()),
-            parameters: serde_json::from_str(
-                r#"{
+    let calculate = Tool::Function(Function {
+        name: "calculate".to_string(),
+        description: Some("Perform mathematical calculations".to_string()),
+        parameters: serde_json::from_str(
+            r#"{
                 "type": "object",
                 "properties": {
                     "expression": {
@@ -105,10 +100,9 @@ async fn main() -> Result<(), Error> {
                 },
                 "required": ["expression"]
             }"#,
-            )
-            .unwrap(),
-        },
-    };
+        )
+        .unwrap(),
+    });
 
     // Start a conversation with function calling
     println!("🛠️ Function Calling Demo");

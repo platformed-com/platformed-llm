@@ -201,21 +201,60 @@ impl OpenAIProvider {
     }
 
     /// Convert our internal tools to OpenAI Responses API format.
+    /// Builtin tools that OpenAI offers (web_search, computer_use) are
+    /// emitted as their typed wire shape; builtins OpenAI doesn't offer
+    /// are silently dropped — that's the model-switching contract.
     #[allow(clippy::ptr_arg)]
     fn convert_tools(tools: &[crate::types::Tool]) -> Vec<super::types::OpenAITool> {
-        tools
-            .iter()
-            .map(|tool| {
-                super::types::OpenAITool {
-                    r#type: "function".to_string(), // OpenAI Responses API expects "function"
-                    name: tool.function.name.clone(),
-                    description: tool.function.description.clone().unwrap_or_default(),
-                    parameters: tool.function.parameters.clone(),
-                }
-            })
-            .collect()
+        use crate::types::{ProviderBuiltin, Tool};
+        let mut out = Vec::new();
+        for tool in tools {
+            match tool {
+                Tool::Function(f) => out.push(super::types::OpenAITool {
+                    r#type: "function".to_string(),
+                    name: f.name.clone(),
+                    description: f.description.clone().unwrap_or_default(),
+                    parameters: f.parameters.clone(),
+                }),
+                Tool::Builtin(b) => match b {
+                    ProviderBuiltin::WebSearch => {
+                        // OpenAI's web_search tool. Description / parameters
+                        // are server-side; we just declare it.
+                        out.push(super::types::OpenAITool {
+                            r#type: "web_search_preview".to_string(),
+                            name: String::new(),
+                            description: String::new(),
+                            parameters: empty_parameters(),
+                        });
+                    }
+                    ProviderBuiltin::ComputerUse => {
+                        out.push(super::types::OpenAITool {
+                            r#type: "computer_use_preview".to_string(),
+                            name: String::new(),
+                            description: String::new(),
+                            parameters: empty_parameters(),
+                        });
+                    }
+                    ProviderBuiltin::GoogleSearch | ProviderBuiltin::CodeExecution => {
+                        tracing::debug!(
+                            ?b,
+                            "OpenAI provider dropping unsupported builtin tool"
+                        );
+                    }
+                },
+            }
+        }
+        out
     }
 
+}
+
+/// `{}` as a parsed `RawValue` for builtin tools that don't accept
+/// caller-side parameters.
+fn empty_parameters() -> std::borrow::Cow<'static, serde_json::value::RawValue> {
+    std::borrow::Cow::Owned(
+        serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+    )
 }
 
 /// Map an OpenAI HTTP error response onto our [`Error`] variants.

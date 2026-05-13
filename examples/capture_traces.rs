@@ -294,18 +294,15 @@ fn scenario_to_llm_request(
             // a JSON re-serialize since we built `parameters` from a Value.
             let raw = serde_json::value::RawValue::from_string(t.parameters.to_string())
                 .map_err(|e| format!("tool {} parameters: {e}", t.name))?;
-            tools.push(Tool {
-                r#type: ToolType::Function,
-                function: platformed_llm::Function {
-                    name: t.name.clone(),
-                    description: if t.description.is_empty() {
-                        None
-                    } else {
-                        Some(t.description.clone())
-                    },
-                    parameters: std::borrow::Cow::Owned(raw),
+            tools.push(Tool::Function(platformed_llm::Function {
+                name: t.name.clone(),
+                description: if t.description.is_empty() {
+                    None
+                } else {
+                    Some(t.description.clone())
                 },
-            });
+                parameters: std::borrow::Cow::Owned(raw),
+            }));
         }
         req = req.tools(tools);
     }

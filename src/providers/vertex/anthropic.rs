@@ -106,15 +106,40 @@ impl AnthropicViaVertexProvider {
             }
         }
 
-        let tools = request.tools.as_ref().map(|tools| {
-            tools
+        let tools = request.tools.as_ref().and_then(|tools| {
+            use crate::types::{ProviderBuiltin, Tool};
+            let converted: Vec<AnthropicTool> = tools
                 .iter()
-                .map(|tool| AnthropicTool {
-                    name: tool.function.name.clone(),
-                    description: tool.function.description.clone().unwrap_or_default(),
-                    input_schema: tool.function.parameters.clone(),
+                .filter_map(|tool| match tool {
+                    Tool::Function(f) => Some(AnthropicTool {
+                        name: f.name.clone(),
+                        description: f.description.clone().unwrap_or_default(),
+                        input_schema: f.parameters.clone(),
+                    }),
+                    Tool::Builtin(b) => {
+                        // WebSearch / ComputerUse are Anthropic builtins
+                        // but use distinct wire shapes (separate tools array
+                        // entries with type=web_search_20250305 etc.).
+                        // Wiring is a Phase 5 follow-up; for now drop with
+                        // a tracing note so model-switching doesn't break.
+                        if !matches!(
+                            b,
+                            ProviderBuiltin::WebSearch | ProviderBuiltin::ComputerUse
+                        ) {
+                            tracing::debug!(
+                                ?b,
+                                "Anthropic provider dropping unsupported builtin tool"
+                            );
+                        }
+                        None
+                    }
                 })
-                .collect()
+                .collect();
+            if converted.is_empty() {
+                None
+            } else {
+                Some(converted)
+            }
         });
 
         // Map our unified ReasoningConfig onto Anthropic's `thinking` field.
