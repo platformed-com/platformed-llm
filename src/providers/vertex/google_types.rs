@@ -16,6 +16,26 @@ pub struct GoogleRequest {
     pub tools: Option<Vec<GoogleTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_instruction: Option<GoogleContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_config: Option<GoogleToolConfig>,
+}
+
+/// Gemini `toolConfig`. Forces or disables tool calling per request.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleToolConfig {
+    pub function_calling_config: GoogleFunctionCallingConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleFunctionCallingConfig {
+    /// `AUTO` (default, model decides), `ANY` (model must call a tool),
+    /// `NONE` (no tool calls).
+    pub mode: &'static str,
+    /// When `mode == "ANY"`, restricts to a specific allowed set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_function_names: Option<Vec<String>>,
 }
 
 /// Google content (message) format.
@@ -94,6 +114,23 @@ pub struct GoogleGenerationConfig {
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// Gemini 2.5 thinking budget. Mirrors `ReasoningConfig.effort` via
+    /// rough mapping (Low → 2048, Medium → 8192, High → 16384).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_config: Option<GoogleThinkingConfig>,
+}
+
+/// Gemini thinking config.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleThinkingConfig {
+    pub thinking_budget: u32,
 }
 
 /// Google tool definition.

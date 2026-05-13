@@ -223,10 +223,23 @@ impl GoogleProvider {
             }
         }
 
+        let thinking_config = request.reasoning.as_ref().map(|cfg| {
+            let thinking_budget = match cfg.effort.unwrap_or(crate::types::ReasoningEffort::Medium) {
+                crate::types::ReasoningEffort::Low => 2048,
+                crate::types::ReasoningEffort::Medium => 8192,
+                crate::types::ReasoningEffort::High => 16384,
+            };
+            GoogleThinkingConfig { thinking_budget }
+        });
+
         let generation_config = Some(GoogleGenerationConfig {
             temperature: request.temperature,
             max_output_tokens: request.max_tokens,
             top_p: request.top_p,
+            stop_sequences: request.stop.clone(),
+            presence_penalty: request.presence_penalty,
+            frequency_penalty: request.frequency_penalty,
+            thinking_config,
         });
 
         let tools = request.tools.as_ref().and_then(|tools| {
@@ -268,11 +281,43 @@ impl GoogleProvider {
             }
         });
 
+        let tool_config =
+            request
+                .tool_choice
+                .as_ref()
+                .map(|choice| match choice {
+                    crate::types::ToolChoice::Auto => GoogleToolConfig {
+                        function_calling_config: GoogleFunctionCallingConfig {
+                            mode: "AUTO",
+                            allowed_function_names: None,
+                        },
+                    },
+                    crate::types::ToolChoice::None => GoogleToolConfig {
+                        function_calling_config: GoogleFunctionCallingConfig {
+                            mode: "NONE",
+                            allowed_function_names: None,
+                        },
+                    },
+                    crate::types::ToolChoice::Required => GoogleToolConfig {
+                        function_calling_config: GoogleFunctionCallingConfig {
+                            mode: "ANY",
+                            allowed_function_names: None,
+                        },
+                    },
+                    crate::types::ToolChoice::Function { name } => GoogleToolConfig {
+                        function_calling_config: GoogleFunctionCallingConfig {
+                            mode: "ANY",
+                            allowed_function_names: Some(vec![name.clone()]),
+                        },
+                    },
+                });
+
         let google_request = GoogleRequest {
             contents,
             generation_config,
             tools,
             system_instruction,
+            tool_config,
         };
 
         Ok(google_request)
@@ -623,5 +668,83 @@ mod tests {
         assert!(matches!(events[0], StreamEvent::PartStart { kind: PartKind::Text, .. }));
         assert!(matches!(events[1], StreamEvent::Delta { .. }));
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    }
+
+    fn provider() -> GoogleProvider {
+        GoogleProvider::new(
+            "p".to_string(),
+            "us-east1".to_string(),
+            "tok".to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stop_sequences_threaded_through_request() {
+        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
+            .stop(vec!["END".to_string(), "STOP".to_string()]);
+        let body = provider().convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["generationConfig"]["stopSequences"],
+            serde_json::json!(["END", "STOP"]),
+        );
+    }
+
+    #[test]
+    fn presence_and_frequency_penalty_threaded_through() {
+        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
+            .presence_penalty(0.5)
+            .frequency_penalty(0.25);
+        let body = provider().convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        // Use exact float values (0.5, 0.25) that survive f32 → JSON without
+        // representation drift.
+        assert_eq!(json["generationConfig"]["presencePenalty"], 0.5);
+        assert_eq!(json["generationConfig"]["frequencyPenalty"], 0.25);
+    }
+
+    #[test]
+    fn reasoning_config_emits_thinking_budget() {
+        use crate::types::{ReasoningConfig, ReasoningEffort};
+        let req = LLMRequest::from_prompt("gemini-2.5-flash", &crate::Prompt::user("hi"))
+            .reasoning(ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                summary: None,
+            });
+        let body = provider().convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            16384,
+        );
+    }
+
+    #[test]
+    fn tool_choice_required_maps_to_any_mode() {
+        use crate::types::ToolChoice;
+        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
+            .tool_choice(ToolChoice::Required);
+        let body = provider().convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["toolConfig"]["functionCallingConfig"]["mode"],
+            "ANY",
+        );
+    }
+
+    #[test]
+    fn tool_choice_function_restricts_allowed_names() {
+        use crate::types::ToolChoice;
+        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
+            .tool_choice(ToolChoice::Function {
+                name: "get_weather".to_string(),
+            });
+        let body = provider().convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+            serde_json::json!(["get_weather"]),
+        );
     }
 }

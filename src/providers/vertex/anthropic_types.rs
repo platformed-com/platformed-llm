@@ -23,6 +23,23 @@ pub struct AnthropicRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<AnthropicThinking>,
+    /// Stop sequences. Anthropic does not expose presence/frequency
+    /// penalties, only stops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
+    /// Forced tool mode. Anthropic accepts `auto`, `any`, `tool` (with
+    /// `name`), or `none`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<AnthropicToolChoice>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicToolChoice {
+    Auto,
+    Any,
+    Tool { name: String },
+    None,
 }
 
 /// Anthropic extended-thinking config.

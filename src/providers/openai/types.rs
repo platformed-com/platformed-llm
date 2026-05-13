@@ -91,6 +91,16 @@ pub struct ResponsesRequest {
     pub store: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<OpenAIReasoning>,
+    /// Stop sequences. OpenAI Responses API does not support `stop` on
+    /// reasoning models; for non-reasoning models it accepts up to 4
+    /// strings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    /// Presence / frequency penalty (non-reasoning models only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
 }
 
 /// OpenAI's `reasoning` request field for chain-of-thought models.

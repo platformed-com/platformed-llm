@@ -169,6 +169,15 @@ impl AnthropicViaVertexProvider {
             request.temperature
         };
 
+        let tool_choice = request.tool_choice.as_ref().map(|choice| match choice {
+            crate::types::ToolChoice::Auto => AnthropicToolChoice::Auto,
+            crate::types::ToolChoice::None => AnthropicToolChoice::None,
+            crate::types::ToolChoice::Required => AnthropicToolChoice::Any,
+            crate::types::ToolChoice::Function { name } => AnthropicToolChoice::Tool {
+                name: name.clone(),
+            },
+        });
+
         let anthropic_request = AnthropicRequest {
             messages,
             max_tokens: request.max_tokens.unwrap_or(1024),
@@ -179,7 +188,15 @@ impl AnthropicViaVertexProvider {
             tools,
             stream: Some(true), // Enable streaming for SSE responses
             thinking,
+            stop_sequences: request.stop.clone(),
+            tool_choice,
         };
+
+        if request.presence_penalty.is_some() || request.frequency_penalty.is_some() {
+            tracing::debug!(
+                "Anthropic provider does not support presence/frequency penalty; dropping"
+            );
+        }
 
         Ok(anthropic_request)
     }

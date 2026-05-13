@@ -79,6 +79,9 @@ impl OpenAIProvider {
             stream: None,
             store: Some(request.store.unwrap_or(false)),
             reasoning: request.reasoning.as_ref().map(convert_reasoning),
+            stop: request.stop.clone(),
+            presence_penalty: request.presence_penalty,
+            frequency_penalty: request.frequency_penalty,
         }
     }
 
