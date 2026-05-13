@@ -82,6 +82,7 @@ impl OpenAIProvider {
             stop: request.stop.clone(),
             presence_penalty: request.presence_penalty,
             frequency_penalty: request.frequency_penalty,
+            prompt_cache_key: derive_prompt_cache_key(&request.messages),
         }
     }
 
@@ -291,6 +292,83 @@ pub(crate) fn parse_openai_error(
             status,
             format!("HTTP {status} ({kind} {code}): {message}"),
         ),
+    }
+}
+
+/// Derive a stable cache key from the message prefix that precedes
+/// the first [`crate::UserPart::CacheBreakpoint`]. Returns `None` when
+/// no breakpoint is present (callers who don't opt into caching get
+/// the OpenAI default of no key).
+///
+/// Uses a deterministic blake3-style hash via `std::hash::DefaultHasher`
+/// — stable within a single build of the consuming binary, which is
+/// the unit of deployment that wants consistent cache hits.
+fn derive_prompt_cache_key(messages: &[crate::types::InputItem]) -> Option<String> {
+    use crate::types::{AssistantPart, InputItem, UserPart};
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut saw_breakpoint = false;
+
+    'outer: for item in messages {
+        match item {
+            InputItem::System(s) => {
+                "system".hash(&mut hasher);
+                s.hash(&mut hasher);
+            }
+            InputItem::User { content } => {
+                "user".hash(&mut hasher);
+                for part in content {
+                    match part {
+                        UserPart::Text(s) => s.hash(&mut hasher),
+                        UserPart::Image(_) | UserPart::Audio(_) | UserPart::Document(_) => {
+                            // Skip multi-modal payloads from the hash —
+                            // their base64 representation would dominate
+                            // and small re-encodings would defeat the key.
+                            "<media>".hash(&mut hasher);
+                        }
+                        UserPart::ToolResult { call_id, content } => {
+                            call_id.hash(&mut hasher);
+                            for inner in content {
+                                if let UserPart::Text(s) = inner {
+                                    s.hash(&mut hasher);
+                                }
+                            }
+                        }
+                        UserPart::CacheBreakpoint => {
+                            saw_breakpoint = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            InputItem::Assistant { content } => {
+                "assistant".hash(&mut hasher);
+                for part in content {
+                    match part {
+                        AssistantPart::Text { content, .. } => content.hash(&mut hasher),
+                        AssistantPart::ToolCall(call) => {
+                            call.call_id.hash(&mut hasher);
+                            call.name.hash(&mut hasher);
+                            call.arguments.hash(&mut hasher);
+                        }
+                        AssistantPart::Reasoning { content, .. } => content.hash(&mut hasher),
+                        AssistantPart::Refusal(s) => s.hash(&mut hasher),
+                        AssistantPart::RedactedReasoning { data } => data.hash(&mut hasher),
+                        AssistantPart::CacheBreakpoint => {
+                            saw_breakpoint = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if saw_breakpoint {
+        Some(format!("{:x}", hasher.finish()))
+    } else {
+        None
     }
 }
 
@@ -885,6 +963,59 @@ mod tests {
             result.is_err(),
             "function_call without call_id must error, got: {result:?}",
         );
+    }
+
+    /// `UserPart::CacheBreakpoint` should produce a stable
+    /// `prompt_cache_key` derived from the prefix bytes — same prefix
+    /// → same key, so OpenAI can group cacheable prefixes server-side.
+    #[test]
+    fn cache_breakpoint_derives_stable_prompt_cache_key() {
+        use crate::types::{InputItem, UserPart};
+        let make_prompt = || {
+            let mut p = Prompt::system("system instructions");
+            p = p.with_item(InputItem::User {
+                content: vec![
+                    UserPart::Text("cached context".into()),
+                    UserPart::CacheBreakpoint,
+                    UserPart::Text("variable suffix".into()),
+                ],
+            });
+            p
+        };
+        let req1 = provider().convert_request(&LLMRequest::from_prompt("gpt-5", &make_prompt()));
+        let req2 = provider().convert_request(&LLMRequest::from_prompt("gpt-5", &make_prompt()));
+        assert!(req1.prompt_cache_key.is_some());
+        assert_eq!(req1.prompt_cache_key, req2.prompt_cache_key);
+    }
+
+    #[test]
+    fn no_cache_breakpoint_means_no_prompt_cache_key() {
+        let req = provider().convert_request(
+            &LLMRequest::from_prompt("gpt-5", &Prompt::user("hi")),
+        );
+        assert!(req.prompt_cache_key.is_none());
+    }
+
+    /// Different prefixes BEFORE the breakpoint must produce different
+    /// keys; otherwise OpenAI would group unrelated requests.
+    #[test]
+    fn different_prefix_produces_different_key() {
+        use crate::types::{InputItem, UserPart};
+        let make = |prefix: &str| {
+            LLMRequest::from_prompt(
+                "gpt-5",
+                &Prompt::system(prefix).with_item(InputItem::User {
+                    content: vec![
+                        UserPart::Text("ctx".into()),
+                        UserPart::CacheBreakpoint,
+                    ],
+                }),
+            )
+        };
+        let k1 = provider().convert_request(&make("system one")).prompt_cache_key;
+        let k2 = provider().convert_request(&make("system two")).prompt_cache_key;
+        assert!(k1.is_some());
+        assert_ne!(k1, k2);
     }
 
     #[test]

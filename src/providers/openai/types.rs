@@ -110,6 +110,13 @@ pub struct ResponsesRequest {
     pub presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f32>,
+    /// Stable caller-side cache key. OpenAI groups requests that share
+    /// the same key for prefix-cache lookup. We derive it from a hash
+    /// of the message prefix before the first
+    /// [`crate::UserPart::CacheBreakpoint`] so two requests with the
+    /// same prefix produce the same key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
 }
 
 /// OpenAI's `reasoning` request field for chain-of-thought models.
