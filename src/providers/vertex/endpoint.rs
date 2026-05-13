@@ -151,17 +151,27 @@ impl VertexEndpoint {
 
 /// Resolve the default Vertex AI host for a location.
 ///
-/// - `global` → `https://aiplatform.googleapis.com`
-/// - any other location → `https://{location}-aiplatform.googleapis.com`
+/// Vertex AI exposes three URL patterns depending on what `location`
+/// refers to:
 ///
-/// Note: regional multi-region aliases (`us`, `eu`) currently fall through to
-/// the regional pattern. If/when we hit a regression on those, the fix lives
-/// here.
+/// | `location`                  | Host                                          |
+/// |-----------------------------|-----------------------------------------------|
+/// | `global`                    | `aiplatform.googleapis.com` (unprefixed)      |
+/// | `us` / `eu` (multi-region)  | `aiplatform.{location}.rep.googleapis.com`    |
+/// | anything else (specific region, e.g. `us-east1`) | `{location}-aiplatform.googleapis.com` |
+///
+/// The multi-region pattern routes across data centers in that geography
+/// (US or EU) for higher availability and data-residency guarantees — see
+/// the [Vertex AI deployments docs] and [Claude on Vertex AI docs] for the
+/// per-publisher availability matrix.
+///
+/// [Vertex AI deployments docs]: https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/locations
+/// [Claude on Vertex AI docs]: https://platform.claude.com/docs/en/build-with-claude/claude-on-vertex-ai
 fn default_host(location: &str) -> String {
-    if location == "global" {
-        "https://aiplatform.googleapis.com".to_string()
-    } else {
-        format!("https://{location}-aiplatform.googleapis.com")
+    match location {
+        "global" => "https://aiplatform.googleapis.com".to_string(),
+        "us" | "eu" => format!("https://aiplatform.{location}.rep.googleapis.com"),
+        region => format!("https://{region}-aiplatform.googleapis.com"),
     }
 }
 
@@ -201,6 +211,40 @@ mod tests {
         assert_eq!(
             t.url("anthropic", "claude-sonnet-4", "streamRawPredict", None),
             "https://aiplatform.googleapis.com/v1/projects/proj-1/locations/global/publishers/anthropic/models/claude-sonnet-4:streamRawPredict"
+        );
+    }
+
+    /// The multi-region `us` location routes to the `aiplatform.us.rep`
+    /// endpoint pool, NOT to a hypothetical `us-aiplatform.googleapis.com`
+    /// that would never have resolved.
+    #[test]
+    fn url_us_multi_region_uses_rep_host() {
+        let t = endpoint("us");
+        assert_eq!(
+            t.url("anthropic", "claude-opus-4-7", "streamRawPredict", None),
+            "https://aiplatform.us.rep.googleapis.com/v1/projects/proj-1/locations/us/publishers/anthropic/models/claude-opus-4-7:streamRawPredict"
+        );
+    }
+
+    #[test]
+    fn url_eu_multi_region_uses_rep_host() {
+        let t = endpoint("eu");
+        assert_eq!(
+            t.url("google", "gemini-2.5-flash", "streamGenerateContent", Some("alt=sse")),
+            "https://aiplatform.eu.rep.googleapis.com/v1/projects/proj-1/locations/eu/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+    }
+
+    /// Other two-letter / short location values that aren't `us` / `eu` /
+    /// `global` (e.g. `asia`, if Google adds it later) currently fall
+    /// through to the regional pattern. If that becomes a real location,
+    /// the multi-region arm extends to it.
+    #[test]
+    fn url_unknown_short_location_falls_through_to_regional() {
+        let t = endpoint("asia");
+        assert_eq!(
+            t.url("google", "gemini", "generateContent", None),
+            "https://asia-aiplatform.googleapis.com/v1/projects/proj-1/locations/asia/publishers/google/models/gemini:generateContent"
         );
     }
 

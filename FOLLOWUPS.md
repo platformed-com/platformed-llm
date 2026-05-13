@@ -4,33 +4,6 @@ Tracked work deferred from the testability + bug-fix sweep, the trace-
 capture work, and the Transport refactor. Items here are intentionally
 skipped, not forgotten. Delete sections as they land.
 
-## Phase 1.6 — Vertex multi-region host URLs
-
-`src/providers/vertex/endpoint.rs::default_host` knows two URL shapes:
-
-- `location == "global"` → `aiplatform.googleapis.com` (unprefixed).
-- any other value → `{location}-aiplatform.googleapis.com` (regional
-  pattern).
-
-Vertex also accepts two **multi-region** location codes — `us` and `eu` —
-that route across data centers in those continents. These need a third
-URL pattern: `aiplatform.{us,eu}.rep.googleapis.com`. Today they fall
-through to the regional branch and produce `us-aiplatform.googleapis.com`
-/ `eu-aiplatform.googleapis.com`, neither of which resolves.
-
-**Plan**:
-1. Verify the exact host pattern against current Vertex AI docs (or hit
-   it from a project that has multi-region routing enabled).
-2. Extend `default_host`:
-   ```rust
-   match location {
-       "global"     => "https://aiplatform.googleapis.com",
-       "us" | "eu"  => format!("https://aiplatform.{location}.rep.googleapis.com"),
-       region       => format!("https://{region}-aiplatform.googleapis.com"),
-   }
-   ```
-3. Add parametric tests in `endpoint::tests` covering each branch.
-
 ## Phase 5 — breaking API redesign
 
 These each touch every consumer of the crate, so they deserve their own
@@ -238,6 +211,7 @@ Still open:
   redesign lands.
 - **OpenAI refusal coverage**: still untested; needs a prompt that
   reliably elicits a refusal without poking policy boundaries.
-- **Multi-region Vertex host URLs**: see Phase 1.6 above. Test coverage
-  exists for `global` and regional patterns; the multi-region
-  (`us`, `eu`) pattern would land alongside the implementation fix.
+- **Anthropic multi-region captures**: the `us` / `eu` Vertex
+  multi-region URL handling has unit-test coverage but no captured
+  trace pins it against the real provider. Blocked on the same Model
+  Garden access as the regional Anthropic captures.
