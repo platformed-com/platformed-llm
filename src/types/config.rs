@@ -57,6 +57,21 @@ pub enum ReasoningSummary {
     Detailed,
 }
 
+/// Provider-specific continuation hint that the caller can carry from
+/// a [`crate::CompleteResponse`] into the next [`LLMRequest`].
+///
+/// When the next request targets the *same* provider that issued the
+/// hint, the provider uses it as an optimization (e.g. OpenAI's
+/// `previous_response_id` to elide the message history). When it
+/// targets a *different* provider, the hint is silently ignored and
+/// the lib falls back to sending the full conversation. Continuations
+/// are *always* optional — the lib works the same with or without one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderContinuation {
+    /// OpenAI Responses API `previous_response_id`.
+    OpenAI { response_id: String },
+}
+
 /// Strategy for how the model should use available tools.
 ///
 /// Each provider has its own wire shape for this; the conversion happens
@@ -101,6 +116,10 @@ pub struct LLMRequest {
     /// chain-of-thought reasoning.
     #[serde(default, skip_serializing_if = "Option::is_none", skip)]
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional provider continuation hint from a prior response.
+    /// Silently ignored on cross-provider switches.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip)]
+    pub continuation: Option<ProviderContinuation>,
 }
 
 impl LLMRequest {
@@ -120,6 +139,7 @@ impl LLMRequest {
             parallel_tool_calls: None,
             store: None,
             reasoning: None,
+            continuation: None,
         }
     }
 
@@ -191,6 +211,12 @@ impl LLMRequest {
     /// Configure reasoning (chain-of-thought) for the request.
     pub fn reasoning(mut self, reasoning: ReasoningConfig) -> Self {
         self.reasoning = Some(reasoning);
+        self
+    }
+
+    /// Attach a provider continuation hint from a prior response.
+    pub fn continuation(mut self, continuation: ProviderContinuation) -> Self {
+        self.continuation = Some(continuation);
         self
     }
 }

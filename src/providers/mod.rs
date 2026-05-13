@@ -1,6 +1,7 @@
 //! Provider implementations for different LLM services.
 
 pub mod openai;
+pub(crate) mod part_tracker;
 pub mod vertex;
 
 // Re-export commonly used provider types

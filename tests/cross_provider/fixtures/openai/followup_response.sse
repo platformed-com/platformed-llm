@@ -1,7 +1,12 @@
-data: {"type":"response.output_item.added","item":{"id":"msg_456","type":"message","role":"assistant","content":[]}}
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_456","type":"message","role":"assistant","content":[]}}
 
-data: {"type":"response.output_text.delta","delta":"Based on the weather data, the weather in Paris is currently sunny with a temperature of 22°C (72°F). It's a beautiful day!"}
+data: {"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text"}}
 
-data: {"type":"response.done","usage":{"input_tokens":156,"output_tokens":45}}
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Based on the weather data, the weather in Paris is currently sunny with a temperature of 22°C (72°F). It's a beautiful day!"}
 
+data: {"type":"response.content_part.done","output_index":0,"content_index":0}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_456","type":"message"}}
+
+data: {"type":"response.completed","response":{"id":"resp_2","object":"response","created_at":2,"status":"completed","model":"gpt-4o-mini","output":[{"id":"msg_456","type":"message","role":"assistant","content":[{"type":"output_text","text":"Based on the weather data, the weather in Paris is currently sunny with a temperature of 22°C (72°F). It's a beautiful day!"}]}],"usage":{"input_tokens":156,"output_tokens":45,"total_tokens":201}}}
 

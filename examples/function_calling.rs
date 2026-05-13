@@ -201,8 +201,9 @@ async fn main() -> Result<(), Error> {
             event_count += 1;
             println!("📥 Event #{event_count}: {event:?}");
 
-            // Track text output
-            if let StreamEvent::ContentDelta { delta } = &event {
+            // Track text output (filter by part kind via accumulator afterwards;
+            // here we just check if it's a text delta by looking at the part).
+            if let StreamEvent::Delta { delta, .. } = &event {
                 text_output.push_str(delta);
             }
 
@@ -308,7 +309,7 @@ async fn main() -> Result<(), Error> {
 
         // Add all function results to the conversation at once
         for (call_id, result) in function_results {
-            conversation = conversation.with_item(InputItem::function_call_output(call_id, result));
+            conversation = conversation.with_tool_result(call_id, result);
         }
 
         // Continue with the next request

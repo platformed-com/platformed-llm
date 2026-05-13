@@ -1,8 +1,9 @@
-OutputItemAdded text
-ContentDelta "par"
-ContentDelta "rot"
+PartStart[0] text
+Delta[0] "par"
+Delta[0] "rot"
+PartEnd[0]
 Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
-output[0] text "parrot"
+output[0].part[0] text "parrot" annotations=0

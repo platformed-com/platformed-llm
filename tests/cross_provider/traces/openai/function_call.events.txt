@@ -1,7 +1,12 @@
-OutputItemAdded function_call name="get_weather" id="<id-1>"
-FunctionCallComplete call_id="<id-2>" name="get_weather" arguments="{\"city\":\"Paris\"}"
+PartStart[0] tool_call call_id="<id-1>" name="get_weather"
+Delta[0] "{\""
+Delta[0] "city"
+Delta[0] "\":\""
+Delta[0] "Paris"
+Delta[0] "\"}"
+PartEnd[0]
 Done finish=ToolCalls input=<n> output=<n>
 
 === final ===
 finish=ToolCalls
-output[0] function_call name="get_weather" arguments="{\"city\":\"Paris\"}"
+output[0].part[0] tool_call name="get_weather" arguments="{\"city\":\"Paris\"}"

@@ -1,13 +1,16 @@
-OutputItemAdded function_call name="get_weather" id="<id-1>"
-FunctionCallComplete call_id="<id-2>" name="get_weather" arguments="{\"city\":\"Paris\"}"
-OutputItemAdded function_call name="get_weather" id="<id-3>"
-FunctionCallComplete call_id="<id-4>" name="get_weather" arguments="{\"city\":\"London\"}"
-OutputItemAdded function_call name="get_weather" id="<id-5>"
-FunctionCallComplete call_id="<id-6>" name="get_weather" arguments="{\"city\":\"Tokyo\"}"
+PartStart[0] tool_call call_id="<id-1>" name="get_weather"
+Delta[0] "{\"city\":\"Paris\"}"
+PartEnd[0]
+PartStart[1] tool_call call_id="<id-2>" name="get_weather"
+Delta[1] "{\"city\":\"London\"}"
+PartEnd[1]
+PartStart[2] tool_call call_id="<id-3>" name="get_weather"
+Delta[2] "{\"city\":\"Tokyo\"}"
+PartEnd[2]
 Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
-output[0] function_call name="get_weather" arguments="{\"city\":\"Paris\"}"
-output[1] function_call name="get_weather" arguments="{\"city\":\"London\"}"
-output[2] function_call name="get_weather" arguments="{\"city\":\"Tokyo\"}"
+output[0].part[0] tool_call name="get_weather" arguments="{\"city\":\"Paris\"}"
+output[0].part[1] tool_call name="get_weather" arguments="{\"city\":\"London\"}"
+output[0].part[2] tool_call name="get_weather" arguments="{\"city\":\"Tokyo\"}"

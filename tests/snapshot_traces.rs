@@ -232,53 +232,46 @@ impl IdMasker {
 }
 
 /// Format the unified event sequence as a deterministic, line-oriented
-/// text snapshot. Stable under cosmetic changes (fields are explicitly
-/// named, ordering is fixed) so unrelated `Debug` derive churn doesn't
-/// break the snapshots.
+/// text snapshot.
 fn format_events(events: &[StreamEvent]) -> String {
-    use platformed_llm::OutputItemInfo;
+    use platformed_llm::{PartKind, PartUpdate};
     let mut masker = IdMasker::new();
     let mut out = String::new();
     for ev in events {
         match ev {
-            StreamEvent::OutputItemAdded { item } => match item {
-                OutputItemInfo::Text => out.push_str("OutputItemAdded text\n"),
-                OutputItemInfo::Reasoning => out.push_str("OutputItemAdded reasoning\n"),
-                OutputItemInfo::FunctionCall { name, id } => {
-                    let id = masker.mask(id);
+            StreamEvent::PartStart { index, kind } => match kind {
+                PartKind::Text => out.push_str(&format!("PartStart[{index}] text\n")),
+                PartKind::Reasoning => out.push_str(&format!("PartStart[{index}] reasoning\n")),
+                PartKind::Refusal => out.push_str(&format!("PartStart[{index}] refusal\n")),
+                PartKind::RedactedReasoning { data } => out.push_str(&format!(
+                    "PartStart[{index}] redacted_reasoning len={}\n",
+                    data.len()
+                )),
+                PartKind::ToolCall { call_id, name } => {
+                    let masked = masker.mask(call_id);
                     out.push_str(&format!(
-                        "OutputItemAdded function_call name={name:?} id={id}\n"
+                        "PartStart[{index}] tool_call call_id={masked} name={name:?}\n"
                     ));
                 }
             },
-            StreamEvent::ContentDelta { delta } => {
-                out.push_str(&format!("ContentDelta {delta:?}\n"));
+            StreamEvent::Delta { index, delta } => {
+                out.push_str(&format!("Delta[{index}] {delta:?}\n"));
             }
-            StreamEvent::ReasoningDelta { delta } => {
-                out.push_str(&format!("ReasoningDelta {delta:?}\n"));
+            StreamEvent::PartUpdate { index, update } => match update {
+                PartUpdate::Signature(s) => out.push_str(&format!(
+                    "PartUpdate[{index}] signature len={}\n",
+                    s.len()
+                )),
+                PartUpdate::Annotation(a) => out.push_str(&format!(
+                    "PartUpdate[{index}] annotation kind={:?} source={:?}\n",
+                    a.kind, a.source
+                )),
+            },
+            StreamEvent::PartEnd { index } => {
+                out.push_str(&format!("PartEnd[{index}]\n"));
             }
-            StreamEvent::ReasoningSignature { signature } => {
-                // Signatures are model-version-volatile opaque blobs; record
-                // only the byte length so the snapshot stays stable across
-                // re-captures while still asserting one was emitted.
-                out.push_str(&format!("ReasoningSignature len={}\n", signature.len()));
-            }
-            StreamEvent::FunctionCallComplete { call } => {
-                let call_id = masker.mask(&call.call_id);
-                out.push_str(&format!(
-                    "FunctionCallComplete call_id={call_id} name={:?} arguments={:?}\n",
-                    call.name, call.arguments
-                ));
-            }
-            StreamEvent::Done {
-                finish_reason,
-                usage: _,
-            } => {
-                // Usage counts are masked to `<n>` — they're model-version
-                // non-deterministic (rerunning capture produces different
-                // numbers even on the same prompt) and would cause snapshot
-                // churn that's not a real regression. Presence of the
-                // fields is enforced separately by `validate_event_sequence`.
+            StreamEvent::Done { finish_reason, .. } => {
+                // Usage masked to keep snapshots stable across re-captures.
                 out.push_str(&format!(
                     "Done finish={finish_reason:?} input=<n> output=<n>\n"
                 ));
@@ -291,33 +284,44 @@ fn format_events(events: &[StreamEvent]) -> String {
     out
 }
 
-/// Format the final `CompleteResponse` produced by feeding the unified
-/// events through `ResponseAccumulator`. Snapshotting this catches
-/// accumulator regressions on real-shape data — without this section,
-/// only the `Vec<StreamEvent>` was diff'd and the actual user-facing
-/// `CompleteResponse` shape was untested against captures.
+/// Format the final `CompleteResponse` produced by feeding the events
+/// through `ResponseAccumulator`.
 fn format_complete(complete: &CompleteResponse) -> String {
+    use platformed_llm::AssistantPart;
     let mut out = String::new();
     out.push_str(&format!("finish={:?}\n", complete.finish_reason));
     for (i, item) in complete.output.iter().enumerate() {
         match item {
-            OutputItem::Text { content } => {
-                out.push_str(&format!("output[{i}] text {content:?}\n"));
-            }
-            OutputItem::Reasoning { content, signature } => {
-                // Mask signature length only — the bytes themselves are
-                // opaque and model-version-volatile.
-                let sig_len = signature.as_ref().map(|s| s.len()).unwrap_or(0);
-                out.push_str(&format!(
-                    "output[{i}] reasoning len={} signature_len={sig_len}\n",
-                    content.len()
-                ));
-            }
-            OutputItem::FunctionCall { call } => {
-                out.push_str(&format!(
-                    "output[{i}] function_call name={:?} arguments={:?}\n",
-                    call.name, call.arguments,
-                ));
+            OutputItem::Assistant { content } => {
+                for (j, part) in content.iter().enumerate() {
+                    match part {
+                        AssistantPart::Text { content, annotations } => out.push_str(&format!(
+                            "output[{i}].part[{j}] text {content:?} annotations={}\n",
+                            annotations.len()
+                        )),
+                        AssistantPart::Reasoning { content, signature } => {
+                            let sig_len = signature.as_ref().map(|s| s.len()).unwrap_or(0);
+                            out.push_str(&format!(
+                                "output[{i}].part[{j}] reasoning len={} signature_len={sig_len}\n",
+                                content.len()
+                            ));
+                        }
+                        AssistantPart::RedactedReasoning { data } => out.push_str(&format!(
+                            "output[{i}].part[{j}] redacted_reasoning len={}\n",
+                            data.len()
+                        )),
+                        AssistantPart::Refusal(s) => out.push_str(&format!(
+                            "output[{i}].part[{j}] refusal {s:?}\n"
+                        )),
+                        AssistantPart::ToolCall(call) => out.push_str(&format!(
+                            "output[{i}].part[{j}] tool_call name={:?} arguments={:?}\n",
+                            call.name, call.arguments
+                        )),
+                        AssistantPart::CacheBreakpoint => out.push_str(&format!(
+                            "output[{i}].part[{j}] cache_breakpoint\n"
+                        )),
+                    }
+                }
             }
         }
     }

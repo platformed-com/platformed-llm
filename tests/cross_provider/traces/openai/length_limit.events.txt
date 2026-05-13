@@ -1,22 +1,23 @@
-OutputItemAdded text
-ContentDelta "**"
-ContentDelta "The"
-ContentDelta " Fasc"
-ContentDelta "inating"
-ContentDelta " History"
-ContentDelta " of"
-ContentDelta " Clouds"
-ContentDelta ":"
-ContentDelta " A"
-ContentDelta " Journey"
-ContentDelta " Through"
-ContentDelta " Time"
-ContentDelta " and"
-ContentDelta " Science"
-ContentDelta "**\n\n"
-ContentDelta "Cloud"
+PartStart[0] text
+Delta[0] "**"
+Delta[0] "The"
+Delta[0] " Fasc"
+Delta[0] "inating"
+Delta[0] " History"
+Delta[0] " of"
+Delta[0] " Clouds"
+Delta[0] ":"
+Delta[0] " A"
+Delta[0] " Journey"
+Delta[0] " Through"
+Delta[0] " Time"
+Delta[0] " and"
+Delta[0] " Science"
+Delta[0] "**\n\n"
+Delta[0] "Cloud"
+PartEnd[0]
 Done finish=Length input=<n> output=<n>
 
 === final ===
 finish=Length
-output[0] text "**The Fascinating History of Clouds: A Journey Through Time and Science**\n\nCloud"
+output[0].part[0] text "**The Fascinating History of Clouds: A Journey Through Time and Science**\n\nCloud" annotations=0

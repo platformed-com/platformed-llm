@@ -1,9 +1,10 @@
 use super::types::{OpenAIReasoning, OpenAIToolChoice, ResponsesRequest, ResponsesStreamEvent};
 use crate::provider::LLMProvider;
 use crate::transport::{Transport, TransportRequest};
-use crate::types::{ReasoningConfig, ReasoningEffort, ReasoningSummary, ToolChoice};
+use crate::types::{PartKind, ReasoningConfig, ReasoningEffort, ReasoningSummary, ToolChoice};
 use crate::{Error, LLMRequest, Response, StreamEvent};
-use futures::TryStreamExt as _;
+use futures_util::StreamExt as _;
+use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 /// OpenAI provider implementation.
@@ -45,14 +46,26 @@ impl OpenAIProvider {
 
     /// Convert internal request to OpenAI Responses API format.
     fn convert_request(&self, request: &LLMRequest) -> ResponsesRequest {
-        // Convert items to OpenAI format
-        let input: Vec<crate::providers::openai::types::OpenAIInputMessage> =
-            request.messages.iter().map(Self::convert_message).collect();
+        let mut input: Vec<crate::providers::openai::types::OpenAIInputMessage> = Vec::new();
+        for item in &request.messages {
+            Self::flatten_input_item(item, &mut input);
+        }
+
+        // ProviderContinuation::OpenAI carries previous_response_id when
+        // the caller wants to chain via server-side state. Other variants
+        // (none exist yet) are silently ignored — that's the
+        // model-switching contract.
+        let previous_response_id = match &request.continuation {
+            Some(crate::types::ProviderContinuation::OpenAI { response_id }) => {
+                Some(response_id.clone())
+            }
+            _ => None,
+        };
 
         ResponsesRequest {
             model: request.model.clone(),
             input,
-            instructions: None, // System messages will be in input array
+            instructions: None,
             temperature: request.temperature,
             max_output_tokens: request.max_tokens,
             top_p: request.top_p,
@@ -62,46 +75,126 @@ impl OpenAIProvider {
                 .map(|tools| Self::convert_tools(tools)),
             tool_choice: request.tool_choice.as_ref().map(convert_tool_choice),
             parallel_tool_calls: request.parallel_tool_calls,
-            previous_response_id: None, // Will be set when we add conversation support
-            stream: None,               // Will be set by the generate methods
-            // Default to opt-out so callers don't accidentally have prompts
-            // retained server-side. Override via LLMRequest::store(true) when
-            // intentionally chaining via `previous_response_id`.
+            previous_response_id,
+            stream: None,
             store: Some(request.store.unwrap_or(false)),
             reasoning: request.reasoning.as_ref().map(convert_reasoning),
         }
     }
 
-    /// Convert our internal InputItem to OpenAI format.
-    fn convert_message(
+    /// Flatten one canonical `InputItem` into one or more OpenAI input
+    /// items. OpenAI's wire model puts function_call / function_call_output
+    /// as siblings of message items, so an Assistant turn with mixed
+    /// text + tool calls splits into a message + N function_call items
+    /// here (preserving emit order).
+    fn flatten_input_item(
         item: &crate::types::InputItem,
-    ) -> crate::providers::openai::types::OpenAIInputMessage {
+        out: &mut Vec<crate::providers::openai::types::OpenAIInputMessage>,
+    ) {
         use crate::providers::openai::types::OpenAIInputMessage;
+        use crate::types::{AssistantPart, InputItem, UserPart};
 
         match item {
-            crate::types::InputItem::Message(msg) => {
-                let role = match msg.role {
-                    crate::types::Role::System => "system",
-                    crate::types::Role::User => "user",
-                    crate::types::Role::Assistant => "assistant",
-                };
-
-                let text = msg.text_content();
-
-                OpenAIInputMessage::Regular {
-                    role: role.to_string(),
-                    content: text,
+            InputItem::System(content) => {
+                out.push(OpenAIInputMessage::Regular {
+                    role: "system".to_string(),
+                    content: content.clone(),
+                });
+            }
+            InputItem::User { content } => {
+                let mut buffered_text = String::new();
+                for part in content {
+                    match part {
+                        UserPart::Text(s) => {
+                            if !buffered_text.is_empty() {
+                                buffered_text.push('\n');
+                            }
+                            buffered_text.push_str(s);
+                        }
+                        UserPart::ToolResult { call_id, content } => {
+                            if !buffered_text.is_empty() {
+                                out.push(OpenAIInputMessage::Regular {
+                                    role: "user".to_string(),
+                                    content: std::mem::take(&mut buffered_text),
+                                });
+                            }
+                            out.push(OpenAIInputMessage::FunctionCallOutput {
+                                call_id: call_id.clone(),
+                                output: flatten_user_parts_to_text(content),
+                            });
+                        }
+                        // Multi-modal / cache breakpoints not yet wired to
+                        // the OpenAI content-array shape — drop with a
+                        // tracing note. Phase 5 follow-up extends
+                        // OpenAIInputMessage::Regular to support array
+                        // content for images / audio / files.
+                        UserPart::Image(_)
+                        | UserPart::Audio(_)
+                        | UserPart::Document(_)
+                        | UserPart::CacheBreakpoint => {
+                            tracing::debug!(
+                                "OpenAI provider dropping unsupported user part during request build"
+                            );
+                        }
+                    }
+                }
+                if !buffered_text.is_empty() {
+                    out.push(OpenAIInputMessage::Regular {
+                        role: "user".to_string(),
+                        content: buffered_text,
+                    });
                 }
             }
-            crate::types::InputItem::FunctionCall(call) => OpenAIInputMessage::FunctionCall {
-                call_id: call.call_id.clone(),
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
-            },
-            crate::types::InputItem::FunctionCallOutput { call_id, output } => {
-                OpenAIInputMessage::FunctionCallOutput {
-                    call_id: call_id.clone(),
-                    output: output.clone(),
+            InputItem::Assistant { content } => {
+                let mut buffered_text = String::new();
+                for part in content {
+                    match part {
+                        AssistantPart::Text { content, .. } => {
+                            if !buffered_text.is_empty() {
+                                buffered_text.push('\n');
+                            }
+                            buffered_text.push_str(content);
+                        }
+                        AssistantPart::Refusal(s) => {
+                            // Translate refusal back to plain assistant text on
+                            // egress (we don't currently emit OpenAI's typed
+                            // refusal content-part shape on the way back in).
+                            if !buffered_text.is_empty() {
+                                buffered_text.push('\n');
+                            }
+                            buffered_text.push_str(s);
+                        }
+                        AssistantPart::ToolCall(call) => {
+                            if !buffered_text.is_empty() {
+                                out.push(OpenAIInputMessage::Regular {
+                                    role: "assistant".to_string(),
+                                    content: std::mem::take(&mut buffered_text),
+                                });
+                            }
+                            out.push(OpenAIInputMessage::FunctionCall {
+                                call_id: call.call_id.clone(),
+                                name: call.name.clone(),
+                                arguments: call.arguments.clone(),
+                            });
+                        }
+                        // Reasoning round-trip on OpenAI requires the
+                        // server-side response id chain (previous_response_id)
+                        // OR re-emitting reasoning items with their original
+                        // id — both unwired right now. Drop with a note.
+                        AssistantPart::Reasoning { .. }
+                        | AssistantPart::RedactedReasoning { .. }
+                        | AssistantPart::CacheBreakpoint => {
+                            tracing::debug!(
+                                "OpenAI provider dropping unsupported assistant part during request build"
+                            );
+                        }
+                    }
+                }
+                if !buffered_text.is_empty() {
+                    out.push(OpenAIInputMessage::Regular {
+                        role: "assistant".to_string(),
+                        content: buffered_text,
+                    });
                 }
             }
         }
@@ -180,6 +273,29 @@ pub(crate) fn parse_openai_error(
     }
 }
 
+/// Best-effort flatten of a tool-result content array into a single string.
+/// Multi-modal tool results aren't currently representable on OpenAI's
+/// function_call_output (which takes a plain string `output`), so non-text
+/// parts are dropped with a tracing note.
+fn flatten_user_parts_to_text(parts: &[crate::types::UserPart]) -> String {
+    use crate::types::UserPart;
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            UserPart::Text(s) => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(s);
+            }
+            _ => {
+                tracing::debug!("dropping non-text tool result part for OpenAI flatten");
+            }
+        }
+    }
+    out
+}
+
 fn convert_reasoning(cfg: &ReasoningConfig) -> OpenAIReasoning {
     OpenAIReasoning {
         effort: cfg.effort.map(|e| match e {
@@ -207,122 +323,201 @@ fn convert_tool_choice(choice: &ToolChoice) -> OpenAIToolChoice {
     }
 }
 
-impl OpenAIProvider {
-    /// Convert an OpenAI streaming event to our `StreamEvent`s.
-    ///
-    /// `pub(crate)` so unit tests can drive this with synthetic events.
-    pub(crate) fn convert_stream_event(
+/// Streaming state for an in-flight OpenAI response.
+///
+/// OpenAI's wire model has two-level nesting: top-level items
+/// (`message`, `function_call`, `reasoning`) plus per-message content
+/// parts (`output_text`, `refusal`). We map both to our flat part-index
+/// space via `(output_index, content_index)` keys — `content_index` is
+/// `None` for top-level items that don't have nested content parts.
+pub(crate) struct OpenAIStreamState {
+    tracker: crate::providers::part_tracker::PartTracker<(u32, Option<u32>)>,
+    /// Recorded continuation hint from the most recent response payload.
+    continuation: Option<crate::types::ProviderContinuation>,
+}
+
+impl OpenAIStreamState {
+    pub(crate) fn new() -> Self {
+        Self {
+            tracker: crate::providers::part_tracker::PartTracker::new(),
+            continuation: None,
+        }
+    }
+
+    pub(crate) fn continuation(&self) -> Option<crate::types::ProviderContinuation> {
+        self.continuation.clone()
+    }
+
+    /// Process one OpenAI wire event into 0 or more `StreamEvent`s.
+    pub(crate) fn process(
+        &mut self,
         event: ResponsesStreamEvent,
-    ) -> Result<Option<StreamEvent>, Error> {
+    ) -> Result<Vec<StreamEvent>, Error> {
         match event.r#type.as_str() {
             "error" => {
-                let (type_, message) = if let Some(error) = &event.error {
-                    (error.r#type.as_str(), error.message.as_str())
-                } else {
-                    ("unknown", "Unknown error occurred")
+                let (kind, message) = match &event.error {
+                    Some(e) => (e.r#type.as_str(), e.message.as_str()),
+                    None => ("unknown", "Unknown error occurred"),
                 };
-                return Err(Error::provider("OpenAI", format!("{type_}: {message}")));
+                return Err(Error::provider("OpenAI", format!("{kind}: {message}")));
             }
-            "response.output_text.delta" => {
-                if let Some(delta) = event.delta {
-                    if !delta.is_empty() {
-                        return Ok(Some(StreamEvent::ContentDelta { delta }));
-                    }
+            "response.created" | "response.in_progress" => {
+                if let Some(response) = &event.response {
+                    self.continuation = Some(crate::types::ProviderContinuation::OpenAI {
+                        response_id: response.id.clone(),
+                    });
                 }
             }
             "response.output_item.added" => {
-                // Handle new output item being added
-                if let Some(item) = event.item {
-                    // Emit OutputItemAdded event with type-specific info
-                    let item_info = match item.r#type.as_str() {
-                        "function_call" => {
-                            // For function calls, include the name and ID if available
-                            let name = item.name.unwrap_or_else(|| "unknown".to_string());
-                            crate::types::OutputItemInfo::FunctionCall { name, id: item.id }
-                        }
-                        "reasoning" => crate::types::OutputItemInfo::Reasoning,
-                        "message" => crate::types::OutputItemInfo::Text,
-                        _ => crate::types::OutputItemInfo::Text,
-                    };
-
-                    return Ok(Some(StreamEvent::OutputItemAdded { item: item_info }));
+                let Some(item) = event.item else { return Ok(vec![]); };
+                let Some(output_index) = event.output_index else { return Ok(vec![]); };
+                match item.r#type.as_str() {
+                    "function_call" => {
+                        let call_id = item.call_id.ok_or_else(|| {
+                            Error::provider(
+                                "OpenAI",
+                                format!(
+                                    "function_call item is missing call_id (item id: {})",
+                                    item.id
+                                ),
+                            )
+                        })?;
+                        let name = item.name.unwrap_or_else(|| "unknown".to_string());
+                        let (_idx, ev) = self.tracker.open(
+                            (output_index, None),
+                            PartKind::ToolCall { call_id, name },
+                        );
+                        return Ok(vec![ev]);
+                    }
+                    "reasoning" => {
+                        let (_idx, ev) = self
+                            .tracker
+                            .open((output_index, None), PartKind::Reasoning);
+                        return Ok(vec![ev]);
+                    }
+                    "message" => {
+                        // Wait for response.content_part.added — message
+                        // items contain an array of content parts, each of
+                        // which maps to its own AssistantPart.
+                    }
+                    _ => {}
                 }
+            }
+            "response.content_part.added" => {
+                let Some(output_index) = event.output_index else { return Ok(vec![]); };
+                let Some(content_index) = event.content_index else { return Ok(vec![]); };
+                let kind = match event.part.as_ref().map(|p| p.r#type.as_str()) {
+                    Some("output_text") => PartKind::Text,
+                    Some("refusal") => PartKind::Refusal,
+                    _ => PartKind::Text,
+                };
+                let (_idx, ev) = self
+                    .tracker
+                    .open((output_index, Some(content_index)), kind);
+                return Ok(vec![ev]);
+            }
+            "response.output_text.delta" => {
+                let Some(output_index) = event.output_index else { return Ok(vec![]); };
+                let Some(content_index) = event.content_index else { return Ok(vec![]); };
+                let Some(delta) = event.delta else { return Ok(vec![]); };
+                if delta.is_empty() {
+                    return Ok(vec![]);
+                }
+                let key = (output_index, Some(content_index));
+                let index = self
+                    .tracker
+                    .index_of(&key)
+                    .ok_or_else(|| Error::streaming(format!(
+                        "output_text.delta for unknown content part {key:?}"
+                    )))?;
+                return Ok(vec![StreamEvent::Delta { index, delta }]);
+            }
+            "response.refusal.delta" => {
+                let Some(output_index) = event.output_index else { return Ok(vec![]); };
+                let Some(content_index) = event.content_index else { return Ok(vec![]); };
+                let Some(delta) = event.delta else { return Ok(vec![]); };
+                if delta.is_empty() {
+                    return Ok(vec![]);
+                }
+                let key = (output_index, Some(content_index));
+                let index = self
+                    .tracker
+                    .index_of(&key)
+                    .ok_or_else(|| Error::streaming(format!(
+                        "refusal.delta for unknown content part {key:?}"
+                    )))?;
+                return Ok(vec![StreamEvent::Delta { index, delta }]);
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                if let Some(delta) = event.delta {
-                    if !delta.is_empty() {
-                        return Ok(Some(StreamEvent::ReasoningDelta { delta }));
-                    }
+                let Some(output_index) = event.output_index else { return Ok(vec![]); };
+                let Some(delta) = event.delta else { return Ok(vec![]); };
+                if delta.is_empty() {
+                    return Ok(vec![]);
                 }
-            }
-            "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
-                // Final canonical text — we already accumulated via deltas.
+                let key = (output_index, None);
+                let index = self
+                    .tracker
+                    .index_of(&key)
+                    .ok_or_else(|| Error::streaming(format!(
+                        "reasoning delta for unknown reasoning part {key:?}"
+                    )))?;
+                return Ok(vec![StreamEvent::Delta { index, delta }]);
             }
             "response.function_call_arguments.delta" => {
-                // We no longer emit FunctionCallArguments events
-                // Arguments are accumulated internally and only complete calls are emitted
-                // This event is ignored for now
+                let Some(output_index) = event.output_index else { return Ok(vec![]); };
+                let Some(delta) = event.delta else { return Ok(vec![]); };
+                if delta.is_empty() {
+                    return Ok(vec![]);
+                }
+                let key = (output_index, None);
+                let index = self
+                    .tracker
+                    .index_of(&key)
+                    .ok_or_else(|| Error::streaming(format!(
+                        "function_call_arguments.delta for unknown tool part {key:?}"
+                    )))?;
+                return Ok(vec![StreamEvent::Delta { index, delta }]);
             }
-            "response.function_call_arguments.done" => {
-                // Function call arguments are complete but no complete data here
-            }
-            "response.output_item.done" => {
-                // Output item is done - emit FunctionCallComplete for function calls.
-                if let Some(item) = event.item {
-                    if item.r#type == "function_call" {
-                        if let (Some(name), Some(arguments)) = (item.name, item.arguments) {
-                            // The Responses API always populates `call_id`
-                            // (`call_…`) on function-call items. The `id`
-                            // field (`fc_…`) is the output-item id and is
-                            // NOT interchangeable — subsequent
-                            // `function_call_output` items must reference
-                            // the `call_…` id or the model can't correlate
-                            // them. Refuse to silently substitute.
-                            let call_id = item.call_id.ok_or_else(|| {
-                                Error::provider(
-                                    "OpenAI",
-                                    format!(
-                                        "function_call output item is missing required \
-                                         `call_id` field (item id: {})",
-                                        item.id,
-                                    ),
-                                )
-                            })?;
-                            let call = crate::types::FunctionCall {
-                                call_id,
-                                name,
-                                arguments,
-                            };
-                            return Ok(Some(StreamEvent::FunctionCallComplete { call }));
-                        }
-                    }
+            "response.content_part.done" => {
+                let Some(output_index) = event.output_index else { return Ok(vec![]); };
+                let Some(content_index) = event.content_index else { return Ok(vec![]); };
+                if let Some(ev) = self.tracker.close(&(output_index, Some(content_index))) {
+                    return Ok(vec![ev]);
                 }
             }
+            "response.output_item.done" => {
+                let Some(output_index) = event.output_index else { return Ok(vec![]); };
+                if let Some(ev) = self.tracker.close(&(output_index, None)) {
+                    return Ok(vec![ev]);
+                }
+            }
+            "response.output_text.done" | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.done" | "response.refusal.done"
+            | "response.function_call_arguments.done" => {
+                // Final canonical value — we already received it via deltas.
+            }
             "response.completed" => {
-                // The response is complete - emit any completed function calls
                 if let Some(response) = event.response {
-                    // Determine finish reason
+                    self.continuation = Some(crate::types::ProviderContinuation::OpenAI {
+                        response_id: response.id.clone(),
+                    });
                     let finish_reason =
                         if response.output.iter().any(|o| o.r#type == "function_call") {
                             crate::types::FinishReason::ToolCalls
                         } else {
                             crate::types::FinishReason::Stop
                         };
-
-                    return Ok(Some(StreamEvent::Done {
+                    return Ok(vec![StreamEvent::Done {
                         finish_reason,
                         usage: response.usage.unwrap_or_default(),
-                    }));
+                    }]);
                 }
             }
             "response.incomplete" => {
-                // Terminal event when the model didn't run to completion
-                // (typically a max_output_tokens hit, sometimes a content
-                // filter). Map `incomplete_details.reason` onto our
-                // FinishReason so callers can branch on Length /
-                // ContentFilter without poking at provider-specific
-                // payloads.
                 if let Some(response) = event.response {
+                    self.continuation = Some(crate::types::ProviderContinuation::OpenAI {
+                        response_id: response.id.clone(),
+                    });
                     let finish_reason = match response
                         .incomplete_details
                         .as_ref()
@@ -330,20 +525,15 @@ impl OpenAIProvider {
                     {
                         Some("max_output_tokens") => crate::types::FinishReason::Length,
                         Some("content_filter") => crate::types::FinishReason::ContentFilter,
-                        // Forward-compat: unknown reasons still produce a
-                        // Done so the stream terminates cleanly.
                         _ => crate::types::FinishReason::Stop,
                     };
-                    return Ok(Some(StreamEvent::Done {
+                    return Ok(vec![StreamEvent::Done {
                         finish_reason,
                         usage: response.usage.unwrap_or_default(),
-                    }));
+                    }]);
                 }
             }
             "response.failed" => {
-                // Terminal failure — surface it as a streaming-level error
-                // so the caller's `?` short-circuits. We don't emit a Done
-                // because the model did not produce a usable response.
                 if let Some(response) = event.response {
                     let message = response
                         .error
@@ -358,17 +548,11 @@ impl OpenAIProvider {
                         format!("response.failed — {}: {}", error.r#type, error.message),
                     ));
                 }
-                return Err(Error::provider(
-                    "OpenAI",
-                    "response.failed without details",
-                ));
+                return Err(Error::provider("OpenAI", "response.failed without details"));
             }
-            _ => {
-                // Ignore other event types for now
-            }
+            _ => {}
         }
-
-        Ok(None)
+        Ok(vec![])
     }
 }
 
@@ -408,17 +592,35 @@ impl LLMProvider for OpenAIProvider {
             return Err(parse_openai_error(status, retry_after, &body_str));
         }
 
-        // Use the clean SSE stream adapter
         use crate::sse_stream::SseStreamExt;
+        let state = Arc::new(Mutex::new(OpenAIStreamState::new()));
+        let state_for_stream = state.clone();
         let event_stream = response
             .body
             .sse_events()
-            .try_filter_map(|sse_event| async move {
+            .map(move |sse_result| -> Result<Vec<StreamEvent>, Error> {
+                let sse_event = sse_result?;
                 debug!(event = ?sse_event, "received OpenAI SSE event");
-                let stream_event = serde_json::from_str::<ResponsesStreamEvent>(&sse_event.data)?;
-                OpenAIProvider::convert_stream_event(stream_event)
+                let stream_event =
+                    serde_json::from_str::<ResponsesStreamEvent>(&sse_event.data)?;
+                state_for_stream.lock().unwrap().process(stream_event)
+            })
+            .flat_map(|result| match result {
+                Ok(events) => futures_util::stream::iter(
+                    events.into_iter().map(Ok).collect::<Vec<_>>(),
+                ),
+                Err(e) => futures_util::stream::iter(vec![Err(e)]),
             });
 
+        // We can't read the continuation off the state until the stream
+        // is fully consumed (response.completed sets it). That's fine for
+        // most callers (they want the stream itself); buffer() picks up
+        // the continuation when finalizing — see Response::with_continuation
+        // for the wiring. We attach an empty continuation here; the
+        // accumulator's finalize() can be extended in a follow-up to
+        // poll the state at end-of-stream if we want this populated on
+        // the streaming-only path too.
+        let _ = state; // keep state alive (the closure also clones it)
         Ok(Response::from_stream(event_stream))
     }
 }
@@ -534,31 +736,32 @@ mod tests {
         );
     }
 
-    /// OpenAI's reasoning streaming events should be routed onto the
-    /// unified `ReasoningDelta` channel; the corresponding
-    /// `response.output_item.added` for type `reasoning` should produce a
-    /// `Reasoning` `OutputItemInfo` so the accumulator opens a reasoning
-    /// item before deltas arrive.
+    /// OpenAI's reasoning streaming events should open a Reasoning part
+    /// and stream deltas into it.
     #[test]
-    fn reasoning_summary_text_delta_emits_reasoning_delta() {
+    fn reasoning_summary_text_delta_routes_to_reasoning_part() {
+        let mut state = OpenAIStreamState::new();
         let added: ResponsesStreamEvent = serde_json::from_str(
-            r#"{"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#,
         )
         .unwrap();
-        match OpenAIProvider::convert_stream_event(added).unwrap().unwrap() {
-            StreamEvent::OutputItemAdded {
-                item: crate::types::OutputItemInfo::Reasoning,
-            } => {}
-            other => panic!("expected OutputItemAdded(Reasoning), got {other:?}"),
-        }
+        let events = state.process(added).unwrap();
+        assert!(
+            matches!(&events[0], StreamEvent::PartStart { index: 0, kind: PartKind::Reasoning }),
+            "expected PartStart(Reasoning), got {:?}", events,
+        );
 
         let delta: ResponsesStreamEvent = serde_json::from_str(
-            r#"{"type":"response.reasoning_summary_text.delta","delta":"hmm,"}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"hmm,"}"#,
         )
         .unwrap();
-        match OpenAIProvider::convert_stream_event(delta).unwrap().unwrap() {
-            StreamEvent::ReasoningDelta { delta } => assert_eq!(delta, "hmm,"),
-            other => panic!("expected ReasoningDelta, got {other:?}"),
+        let events = state.process(delta).unwrap();
+        match &events[0] {
+            StreamEvent::Delta { index, delta } => {
+                assert_eq!(*index, 0);
+                assert_eq!(delta, "hmm,");
+            }
+            other => panic!("expected Delta, got {other:?}"),
         }
     }
 
@@ -577,59 +780,55 @@ mod tests {
         assert_eq!(json["store"], true);
     }
 
-    /// On a `response.output_item.done` for a `function_call`, the unified
-    /// `FunctionCallComplete.call_id` MUST come from the API's `call_id`
-    /// (`call_…`) — not the output item id (`fc_…`). The two are not
-    /// interchangeable; subsequent `function_call_output` items have to
-    /// reference the `call_…` id or the model can't correlate them.
+    /// A `response.output_item.added` for a `function_call` opens a
+    /// `ToolCall` part carrying the API's `call_id` — not the `fc_…`
+    /// output item id. The two are not interchangeable.
     #[test]
-    fn function_call_done_uses_api_call_id() {
+    fn function_call_opens_with_api_call_id() {
+        let mut state = OpenAIStreamState::new();
         let json = r#"{
-            "type":"response.output_item.done",
+            "type":"response.output_item.added",
+            "output_index":0,
             "item":{
                 "type":"function_call",
                 "id":"fc_123",
                 "name":"get_weather",
-                "arguments":"{\"city\":\"Paris\"}",
+                "arguments":"",
                 "call_id":"call_abc"
             }
         }"#;
         let event: ResponsesStreamEvent = serde_json::from_str(json).unwrap();
-        let stream_event = OpenAIProvider::convert_stream_event(event)
-            .expect("conversion should succeed")
-            .expect("should produce a StreamEvent");
-
-        match stream_event {
-            StreamEvent::FunctionCallComplete { call } => {
-                assert_eq!(
-                    call.call_id, "call_abc",
-                    "call_id must come from API's call_id field, not item.id",
-                );
-                assert_ne!(
-                    call.call_id, "fc_123",
-                    "call_id must NOT alias to the fc_* output item id",
-                );
+        let events = state.process(event).unwrap();
+        match &events[0] {
+            StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::ToolCall { call_id, name },
+            } => {
+                assert_eq!(call_id, "call_abc");
+                assert_eq!(name, "get_weather");
             }
-            other => panic!("expected FunctionCallComplete, got {other:?}"),
+            other => panic!("expected PartStart(ToolCall), got {other:?}"),
         }
     }
 
-    /// A `function_call` item with no `call_id` is malformed per the
-    /// Responses API — silently substituting the `fc_*` id breaks multi-turn
-    /// tool calls invisibly. Surface it as an error instead.
+    /// A function_call item with no `call_id` is malformed per the
+    /// Responses API — silently substituting the `fc_*` id breaks
+    /// multi-turn tool calls invisibly. Surface it as an error.
     #[test]
-    fn function_call_done_without_call_id_errors() {
+    fn function_call_added_without_call_id_errors() {
+        let mut state = OpenAIStreamState::new();
         let json = r#"{
-            "type":"response.output_item.done",
+            "type":"response.output_item.added",
+            "output_index":0,
             "item":{
                 "type":"function_call",
                 "id":"fc_123",
                 "name":"get_weather",
-                "arguments":"{}"
+                "arguments":""
             }
         }"#;
         let event: ResponsesStreamEvent = serde_json::from_str(json).unwrap();
-        let result = OpenAIProvider::convert_stream_event(event);
+        let result = state.process(event);
         assert!(
             result.is_err(),
             "function_call without call_id must error, got: {result:?}",
@@ -640,21 +839,9 @@ mod tests {
     fn test_request_conversion() {
         let provider = OpenAIProvider::new("test-key".to_string()).unwrap();
         let prompt = Prompt::user("Hello");
-        let request = LLMRequest {
-            model: "gpt-4".to_string(),
-            messages: prompt.items().to_vec(),
-            temperature: Some(0.7),
-            max_tokens: Some(100),
-            top_p: None,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            store: None,
-            reasoning: None,
-        };
+        let request = LLMRequest::from_prompt("gpt-4", &prompt)
+            .temperature(0.7)
+            .max_tokens(100);
 
         let openai_request = provider.convert_request(&request);
         assert_eq!(openai_request.model, "gpt-4");

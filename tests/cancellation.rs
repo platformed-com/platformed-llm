@@ -52,10 +52,17 @@ async fn dropping_response_closes_underlying_connection() {
                      \r\n";
         socket.write_all(head).await.unwrap();
 
-        // One real OpenAI-shaped SSE event the parser will accept.
-        let frame = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
-        let chunked = format!("{:X}\r\n{}\r\n", frame.len(), frame);
-        socket.write_all(chunked.as_bytes()).await.unwrap();
+        // Real OpenAI-shaped SSE: open a content part, then deliver text.
+        // The new stream model is part-indexed, so a bare output_text.delta
+        // without a preceding content_part.added produces no events.
+        for frame in [
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n",
+        ] {
+            let chunked = format!("{:X}\r\n{}\r\n", frame.len(), frame);
+            socket.write_all(chunked.as_bytes()).await.unwrap();
+        }
         socket.flush().await.unwrap();
 
         // Now wait for the client to close. A clean FIN from the peer
@@ -72,13 +79,16 @@ async fn dropping_response_closes_underlying_connection() {
     let response = provider.generate(&req).await.expect("generate should succeed");
     let mut stream = response.stream();
 
+    // First event should be PartStart (text). Pull two events to also
+    // see the content-part-added PartStart; we just need *any* event to
+    // prove the stream is live before the drop.
     let first = stream
         .next()
         .await
-        .expect("server sent one event")
+        .expect("server sent at least one event")
         .expect("event parses cleanly");
     match first {
-        StreamEvent::ContentDelta { delta } => assert_eq!(delta, "hi"),
+        StreamEvent::PartStart { .. } => {}
         other => panic!("unexpected first event: {other:?}"),
     }
 

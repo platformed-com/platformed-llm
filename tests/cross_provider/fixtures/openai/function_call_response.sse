@@ -1,6 +1,18 @@
-data: {"type":"response.output_item.added","item":{"id":"msg_123","type":"message","role":"assistant","content":[]}}
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_123","type":"message","role":"assistant","content":[]}}
 
-data: {"type":"response.output_text.delta","delta":"I'll help you get the weather for Paris."}
+data: {"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text"}}
 
-data: {"type":"response.output_item.done","item":{"id":"call_abc123def456","type":"function_call","status":"completed","name":"get_weather","arguments":"{\"location\": \"Paris\"}","call_id":"call_abc123def456"}}
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"I'll help you get the weather for Paris."}
+
+data: {"type":"response.content_part.done","output_index":0,"content_index":0}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_123","type":"message"}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_xyz","type":"function_call","name":"get_weather","call_id":"call_abc123def456","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"location\": \"Paris\"}"}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_xyz","type":"function_call","status":"completed","name":"get_weather","arguments":"{\"location\": \"Paris\"}","call_id":"call_abc123def456"}}
+
+data: {"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"gpt-4o-mini","output":[{"id":"fc_xyz","type":"function_call","name":"get_weather","call_id":"call_abc123def456","arguments":"{\"location\": \"Paris\"}"}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}
 

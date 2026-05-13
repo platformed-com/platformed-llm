@@ -70,7 +70,7 @@ async fn run_function_calling_test<T: ProviderTestSetup>() -> Result<(), Box<dyn
     // the tool result, and send the follow-up.
     let complete_response = accumulator.finalize()?;
     conversation = conversation.with_response(&complete_response);
-    conversation = conversation.with_item(InputItem::function_call_output(
+    conversation = conversation.with_item(InputItem::tool_result(
         weather_call.call_id.clone(),
         "The weather in Paris is sunny with a temperature of 22°C (72°F). \
          Perfect weather for sightseeing!"

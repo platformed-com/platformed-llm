@@ -1,209 +1,197 @@
+//! Canonical message model.
+//!
+//! `InputItem` is variant-by-role: `System`, `User`, `Assistant`. The
+//! content of `User` and `Assistant` items is a `Vec` of typed parts so
+//! the model can represent interleaved text + reasoning + tool calls + …
+//! within a single turn — the way Anthropic emits its content blocks.
+//!
+//! Provider-specific parts (`UserPart::CacheBreakpoint`,
+//! `AssistantPart::Reasoning::signature`, etc.) are carried losslessly
+//! when the conversation round-trips through the same provider and
+//! silently dropped or best-effort translated when the lib sends to a
+//! different provider. That's the explicit contract that makes
+//! switching models mid-conversation always work — see FOLLOWUPS Phase 5
+//! for the full drop / translate matrix.
+
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-/// An input item in a conversation (mirrors OutputItem).
+/// A single item in a conversation history.
+///
+/// Each item is one logical turn. The variant encodes the role; the
+/// content is a sequence of typed parts (for `User` and `Assistant`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputItem {
-    /// A message with role and content
-    Message(Message),
-    /// A function call
-    FunctionCall(FunctionCall),
-    /// Output from a function call
-    FunctionCallOutput { call_id: String, output: String },
-}
-
-/// A message with role and content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub role: Role,
-    pub content: String,
+    /// System / developer instruction.
+    System(String),
+    /// User turn. Contains text, multimedia, tool results, and optional
+    /// cache breakpoints in emit order.
+    User { content: Vec<UserPart> },
+    /// Assistant turn. Contains the model's emissions in the order they
+    /// were produced — text, reasoning, refusals, tool calls all
+    /// interleaved as parts.
+    Assistant { content: Vec<AssistantPart> },
 }
 
 impl InputItem {
-    /// Create a system message.
+    /// Build a system instruction.
     pub fn system(content: impl Into<String>) -> Self {
-        InputItem::Message(Message {
-            role: Role::System,
-            content: content.into(),
-        })
+        InputItem::System(content.into())
     }
 
-    /// Create a user message.
+    /// Build a user turn from a single text string.
     pub fn user(content: impl Into<String>) -> Self {
-        InputItem::Message(Message {
-            role: Role::User,
-            content: content.into(),
-        })
+        InputItem::User {
+            content: vec![UserPart::Text(content.into())],
+        }
     }
 
-    /// Create an assistant message.
+    /// Build an assistant turn from a single text string.
     pub fn assistant(content: impl Into<String>) -> Self {
-        InputItem::Message(Message {
-            role: Role::Assistant,
-            content: content.into(),
-        })
-    }
-
-    /// Create a function call item.
-    pub fn function_call(call: FunctionCall) -> Self {
-        InputItem::FunctionCall(call)
-    }
-
-    /// Create a function call output item.
-    pub fn function_call_output(call_id: String, output: String) -> Self {
-        InputItem::FunctionCallOutput { call_id, output }
-    }
-
-    /// Get the role of this item (if it's a message).
-    pub fn role(&self) -> Option<Role> {
-        match self {
-            InputItem::Message(msg) => Some(msg.role),
-            _ => None,
+        InputItem::Assistant {
+            content: vec![AssistantPart::Text {
+                content: content.into(),
+                annotations: Vec::new(),
+            }],
         }
     }
 
-    /// Get the text content of this item (if any).
-    pub fn content(&self) -> Option<String> {
-        match self {
-            InputItem::Message(msg) => {
-                if msg.content.is_empty() {
-                    None
-                } else {
-                    Some(msg.content.clone())
-                }
-            }
-            InputItem::FunctionCallOutput { output, .. } => Some(output.clone()),
-            InputItem::FunctionCall(_) => None,
+    /// Build a tool-result message (a user turn with a single
+    /// `UserPart::ToolResult`).
+    pub fn tool_result(call_id: impl Into<String>, output: impl Into<String>) -> Self {
+        InputItem::User {
+            content: vec![UserPart::ToolResult {
+                call_id: call_id.into(),
+                content: vec![UserPart::Text(output.into())],
+            }],
         }
     }
 
-    /// Get the function call from this item (if any).
-    pub fn get_function_call(&self) -> Option<&FunctionCall> {
-        match self {
-            InputItem::FunctionCall(call) => Some(call),
-            _ => None,
-        }
-    }
-
-    /// Get the function call ID from this item (if any).
-    pub fn function_call_id(&self) -> Option<&str> {
-        match self {
-            InputItem::FunctionCallOutput { call_id, .. } => Some(call_id),
-            _ => None,
+    /// Build an assistant turn that emitted a single tool call.
+    pub fn assistant_tool_call(call: FunctionCall) -> Self {
+        InputItem::Assistant {
+            content: vec![AssistantPart::ToolCall(call)],
         }
     }
 }
 
-impl Message {
-    /// Create a new message with role and text content.
-    pub fn new(role: Role, content: impl Into<String>) -> Self {
-        Message {
-            role,
-            content: content.into(),
-        }
-    }
-
-    /// Add text content to this message.
-    pub fn with_text(mut self, text: impl Into<String>) -> Self {
-        if !self.content.is_empty() {
-            self.content.push(' ');
-        }
-        self.content.push_str(&text.into());
-        self
-    }
-
-    /// Get all text content.
-    pub fn text_content(&self) -> String {
-        self.content.clone()
-    }
-
-    /// Create a system message.
-    pub fn system(content: impl Into<String>) -> Self {
-        Message {
-            role: Role::System,
-            content: content.into(),
-        }
-    }
-
-    /// Create a user message.
-    pub fn user(content: impl Into<String>) -> Self {
-        Message {
-            role: Role::User,
-            content: content.into(),
-        }
-    }
-
-    /// Create an assistant message.
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Message {
-            role: Role::Assistant,
-            content: content.into(),
-        }
-    }
-
-    /// Get the role of this message.
-    pub fn role(&self) -> Role {
-        self.role
-    }
-
-    /// Get the text content of this message (if any).
-    pub fn content(&self) -> Option<String> {
-        if self.content.is_empty() {
-            None
-        } else {
-            Some(self.content.clone())
-        }
-    }
+/// A part of a user turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UserPart {
+    Text(String),
+    Image(ImageSource),
+    Audio(AudioSource),
+    Document(DocumentSource),
+    /// Result of a tool the assistant previously called. `call_id`
+    /// correlates with a prior `AssistantPart::ToolCall`.
+    ToolResult {
+        call_id: String,
+        content: Vec<UserPart>,
+    },
+    /// Anthropic-only: marks the end of a cacheable prefix in the
+    /// surrounding message. Best-effort on OpenAI (derives a stable
+    /// `prompt_cache_key`); dropped on Gemini.
+    CacheBreakpoint,
 }
 
-/// Role of a message participant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    System,
-    User,
-    Assistant,
+/// A part of an assistant turn. Parts appear in the order the model
+/// emitted them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AssistantPart {
+    /// Visible text. Annotations attach citations to specific spans.
+    Text {
+        content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        annotations: Vec<Annotation>,
+    },
+    /// Chain-of-thought reasoning. The optional `signature` is
+    /// Anthropic's thinking signature; dropped on cross-provider
+    /// conversion.
+    Reasoning {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// Anthropic redacted thinking — opaque blob passed back unchanged.
+    RedactedReasoning { data: String },
+    /// Typed refusal (OpenAI). Translated to plain text on providers
+    /// that don't model refusals separately.
+    Refusal(String),
+    /// A tool call the model emitted.
+    ToolCall(FunctionCall),
+    /// Anthropic cache breakpoint marker, same semantics as
+    /// [`UserPart::CacheBreakpoint`].
+    CacheBreakpoint,
 }
 
-/// Tool definition for function calling.
+/// Citation or annotation attached to a span within an
+/// [`AssistantPart::Text`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Annotation {
+    pub kind: AnnotationKind,
+    pub start: usize,
+    pub end: usize,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnotationKind {
+    UrlCitation,
+    FileCitation,
+    WebSearch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ImageSource {
+    Url(String),
+    Base64 { data: String, media_type: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AudioSource {
+    Url(String),
+    Base64 { data: String, media_type: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DocumentSource {
+    Url(String),
+    Base64 { data: String, media_type: String },
+}
+
+/// Tool definition the model can call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub r#type: ToolType,
     pub function: Function,
 }
 
-/// Type of tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolType {
     Function,
 }
 
-/// Function definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
     pub name: String,
-    /// Function description. Optional per the OpenAI / Anthropic / Gemini
-    /// schemas, though strongly recommended for tool selection accuracy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parameters: Cow<'static, RawValue>,
 }
 
-/// Function call information.
-///
-/// The `call_id` is used when providing function call outputs back to the model.
-/// Different providers handle IDs differently internally, but this is abstracted away.
+/// A tool call emitted by the assistant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionCall {
-    pub call_id: String, // The call_id used for function results
+    pub call_id: String,
     pub name: String,
-    pub arguments: String, // JSON string
+    /// JSON-encoded argument object.
+    pub arguments: String,
 }
 
-/// Reason why generation finished.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {

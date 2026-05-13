@@ -1,20 +1,21 @@
-OutputItemAdded text
-ContentDelta "The"
-ContentDelta " weather"
-ContentDelta " in"
-ContentDelta " Paris"
-ContentDelta " is"
-ContentDelta " sunny"
-ContentDelta " with"
-ContentDelta " a"
-ContentDelta " temperature"
-ContentDelta " of"
-ContentDelta " "
-ContentDelta "22"
-ContentDelta "°C"
-ContentDelta "."
+PartStart[0] text
+Delta[0] "The"
+Delta[0] " weather"
+Delta[0] " in"
+Delta[0] " Paris"
+Delta[0] " is"
+Delta[0] " sunny"
+Delta[0] " with"
+Delta[0] " a"
+Delta[0] " temperature"
+Delta[0] " of"
+Delta[0] " "
+Delta[0] "22"
+Delta[0] "°C"
+Delta[0] "."
+PartEnd[0]
 Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
-output[0] text "The weather in Paris is sunny with a temperature of 22°C."
+output[0].part[0] text "The weather in Paris is sunny with a temperature of 22°C." annotations=0

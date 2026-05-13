@@ -248,19 +248,25 @@ fn scenario_to_llm_request(
                     .clone()
                     .ok_or_else(|| "tool message missing tool_call_id".to_string())?;
                 let output = m.content.clone().unwrap_or_default();
-                prompt = prompt.with_item(InputItem::function_call_output(id, output));
+                prompt = prompt.with_tool_result(id, output);
             }
             "assistant" if !m.tool_calls.is_empty() => {
+                use platformed_llm::AssistantPart;
+                let mut content: Vec<AssistantPart> = Vec::new();
                 if let Some(text) = m.content.as_ref().filter(|s| !s.is_empty()) {
-                    prompt = prompt.with_assistant(text.clone());
+                    content.push(AssistantPart::Text {
+                        content: text.clone(),
+                        annotations: Vec::new(),
+                    });
                 }
                 for tc in &m.tool_calls {
-                    prompt = prompt.with_item(InputItem::function_call(FunctionCall {
+                    content.push(AssistantPart::ToolCall(FunctionCall {
                         call_id: tc.id.clone(),
                         name: tc.name.clone(),
                         arguments: tc.arguments.clone(),
                     }));
                 }
+                prompt = prompt.with_item(InputItem::Assistant { content });
             }
             "assistant" => {
                 prompt = prompt.with_assistant(m.content.clone().unwrap_or_default());
