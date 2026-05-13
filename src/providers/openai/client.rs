@@ -282,8 +282,12 @@ impl OpenAIProvider {
                     ProviderBuiltin::WebSearch => {
                         out.push(super::types::OpenAITool::WebSearchPreview);
                     }
-                    ProviderBuiltin::ComputerUse => {
-                        out.push(super::types::OpenAITool::ComputerUsePreview);
+                    ProviderBuiltin::ComputerUse(cfg) => {
+                        out.push(super::types::OpenAITool::ComputerUsePreview {
+                            display_width: cfg.display_width,
+                            display_height: cfg.display_height,
+                            environment: cfg.environment.clone(),
+                        });
                     }
                     ProviderBuiltin::GoogleSearch | ProviderBuiltin::CodeExecution => {
                         tracing::debug!(
@@ -1050,6 +1054,25 @@ mod tests {
             result.is_err(),
             "function_call without call_id must error, got: {result:?}",
         );
+    }
+
+    #[test]
+    fn computer_use_builtin_carries_config_on_openai() {
+        use crate::types::{ComputerUseConfig, ProviderBuiltin, Tool};
+        let req = LLMRequest::from_prompt("gpt-5", &Prompt::user("hi"))
+            .tools(vec![Tool::builtin(ProviderBuiltin::ComputerUse(
+                ComputerUseConfig {
+                    display_width: 1280,
+                    display_height: 800,
+                    environment: "browser".to_string(),
+                },
+            ))]);
+        let body = provider().convert_request(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["tools"][0]["type"], "computer_use_preview");
+        assert_eq!(json["tools"][0]["display_width"], 1280);
+        assert_eq!(json["tools"][0]["display_height"], 800);
+        assert_eq!(json["tools"][0]["environment"], "browser");
     }
 
     #[test]

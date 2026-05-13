@@ -1,18 +1,18 @@
 {
-  "captured_at_unix": 1778687578,
+  "captured_at_unix": 1778688764,
   "endpoint": "https://api.openai.com/v1/responses",
   "expect_failure": false,
   "headers": {
     "content-type": "text/event-stream; charset=utf-8",
     "openai-organization": "platformed-02snf0",
-    "openai-processing-ms": "119",
+    "openai-processing-ms": "161",
     "openai-version": "2020-10-01",
-    "x-request-id": "req_ba917c541081444896e30ab2145ed3fa"
+    "x-request-id": "req_d835d01c60684628a3e87480fb29e6d0"
   },
-  "latency_ms": 855,
+  "latency_ms": 1908,
   "model": "gpt-4o-mini",
   "provider": "openai",
-  "response_bytes": 4660,
+  "response_bytes": 4923,
   "scenario": "text_only",
   "status": 200
 }

@@ -13,8 +13,9 @@ pub use config::{
     ResponseFormat, ToolChoice, Usage,
 };
 pub use message::{
-    Annotation, AnnotationKind, AssistantPart, AudioSource, DocumentSource, FinishReason,
-    Function, FunctionCall, ImageSource, InputItem, ProviderBuiltin, Tool, ToolType, UserPart,
+    Annotation, AnnotationKind, AssistantPart, AudioSource, ComputerUseConfig, DocumentSource,
+    FinishReason, Function, FunctionCall, ImageSource, InputItem, ProviderBuiltin, Tool, ToolType,
+    UserPart,
 };
 pub use prompt::Prompt;
 pub use streaming::{PartKind, PartUpdate, StreamEvent};

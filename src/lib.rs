@@ -28,8 +28,8 @@ pub use response::{CompleteResponse, OutputItem, Response};
 pub use sse_stream::SseEvent;
 pub use transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
 pub use types::{
-    Annotation, AnnotationKind, AssistantPart, AudioSource, DocumentSource, FinishReason,
-    Function, FunctionCall, ImageSource, InputItem, LLMRequest, PartKind, PartUpdate, Prompt,
-    ProviderBuiltin, ProviderContinuation, ReasoningConfig, ReasoningEffort, ReasoningSummary,
-    ResponseFormat, StreamEvent, Tool, ToolChoice, ToolType, Usage, UserPart,
+    Annotation, AnnotationKind, AssistantPart, AudioSource, ComputerUseConfig, DocumentSource,
+    FinishReason, Function, FunctionCall, ImageSource, InputItem, LLMRequest, PartKind,
+    PartUpdate, Prompt, ProviderBuiltin, ProviderContinuation, ReasoningConfig, ReasoningEffort,
+    ReasoningSummary, ResponseFormat, StreamEvent, Tool, ToolChoice, ToolType, Usage, UserPart,
 };

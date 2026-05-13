@@ -162,10 +162,19 @@ pub enum AnthropicTool {
         description: String,
         input_schema: Cow<'static, RawValue>,
     },
+    /// Parameterless builtin (`web_search_20250305`).
     Builtin {
         #[serde(rename = "type")]
         r#type: &'static str,
         name: &'static str,
+    },
+    /// Anthropic `computer_20250124` — display dimensions + environment.
+    Computer {
+        #[serde(rename = "type")]
+        r#type: &'static str,
+        name: &'static str,
+        display_width_px: u32,
+        display_height_px: u32,
     },
 }
 

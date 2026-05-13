@@ -88,7 +88,11 @@ pub enum OpenAITool {
         parameters: Cow<'static, RawValue>,
     },
     WebSearchPreview,
-    ComputerUsePreview,
+    ComputerUsePreview {
+        display_width: u32,
+        display_height: u32,
+        environment: String,
+    },
 }
 
 /// OpenAI Responses API request.

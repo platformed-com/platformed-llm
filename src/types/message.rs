@@ -233,8 +233,23 @@ pub enum ProviderBuiltin {
     GoogleSearch,
     /// Code execution (Gemini).
     CodeExecution,
-    /// Computer use (OpenAI / Anthropic) — config TBD.
-    ComputerUse,
+    /// Computer use (OpenAI / Anthropic). Carries the virtual display
+    /// dimensions and the environment the model is acting against.
+    ComputerUse(ComputerUseConfig),
+}
+
+/// Configuration for the `computer_use` builtin tool. Required by
+/// both OpenAI's `computer_use_preview` and Anthropic's
+/// `computer_20250124` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ComputerUseConfig {
+    pub display_width: u32,
+    pub display_height: u32,
+    /// Environment the model controls — `"browser"`, `"mac"`,
+    /// `"windows"`, `"ubuntu"` on OpenAI; Anthropic accepts the same
+    /// labels.
+    pub environment: String,
 }
 
 /// A tool call emitted by the assistant.

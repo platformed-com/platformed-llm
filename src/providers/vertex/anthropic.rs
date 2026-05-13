@@ -138,10 +138,14 @@ impl AnthropicViaVertexProvider {
                         r#type: "web_search_20250305",
                         name: "web_search",
                     }),
-                    Tool::Builtin(ProviderBuiltin::ComputerUse) => Some(AnthropicTool::Builtin {
-                        r#type: "computer_20250124",
-                        name: "computer",
-                    }),
+                    Tool::Builtin(ProviderBuiltin::ComputerUse(cfg)) => {
+                        Some(AnthropicTool::Computer {
+                            r#type: "computer_20250124",
+                            name: "computer",
+                            display_width_px: cfg.display_width,
+                            display_height_px: cfg.display_height,
+                        })
+                    }
                     Tool::Builtin(b) => {
                         tracing::debug!(?b, "Anthropic provider dropping unsupported builtin");
                         None

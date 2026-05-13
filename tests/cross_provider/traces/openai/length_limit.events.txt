@@ -12,12 +12,12 @@ Delta[0] " Understanding"
 Delta[0] "\n\n"
 Delta[0] "Cloud"
 Delta[0] "s"
-Delta[0] ","
-Delta[0] " those"
-Delta[0] " ephemeral"
+Delta[0] " have"
+Delta[0] " fascinated"
+Delta[0] " humanity"
 PartEnd[0]
 Done finish=Length input=<n> output=<n>
 
 === final ===
 finish=Length
-output[0].part[0] text "### The History of Clouds: An Evolving Understanding\n\nClouds, those ephemeral" annotations=0
+output[0].part[0] text "### The History of Clouds: An Evolving Understanding\n\nClouds have fascinated humanity" annotations=0
