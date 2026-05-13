@@ -260,6 +260,34 @@ deltas have to filter `Delta` by checking `parts[index].kind`. Mitigated
 by convenience iterators on `Response` (`text_deltas()`,
 `reasoning_deltas()`) that do the filter once.
 
+**Implementation notes per provider**:
+
+| Provider | Effort | Mapping shape |
+|---|---|---|
+| Anthropic | **Easiest** | Wire is already part-indexed (`content_block_start.index`); conversion is essentially a rename. ~30 LOC. |
+| Gemini | **Same as today** | Existing `GoogleStreamState` (when to open / continue / close text vs. tool parts) doesn't change — only the emitted-event names. ~50 LOC. |
+| OpenAI | **Modestly harder** | OpenAI wire has two-level nesting (top-level items + content_part within messages), so the conversion needs an `(output_index, content_index) → our_index` map. ~80-100 LOC. Compensated by getting progressive tool-call argument streaming and annotation forwarding "for free" — both currently dropped. |
+
+A shared `PartTracker<K>` helper absorbs the per-provider bookkeeping:
+
+```rust
+pub(crate) struct PartTracker<K: Eq + Hash> {
+    next_index: u32,
+    by_key: HashMap<K, u32>,
+}
+
+impl<K: Eq + Hash + Clone> PartTracker<K> {
+    fn open(&mut self, key: K, kind: PartKind) -> (u32, StreamEvent) { … }
+    fn index_of(&self, key: &K) -> Option<u32> { … }
+    fn close(&mut self, key: K) -> Option<StreamEvent> { … }
+}
+```
+
+`K` is the provider's identifier shape: `u32` for Anthropic, `(u32,
+Option<u32>)` for OpenAI, synthetic counter for Gemini. Each provider's
+stream-conversion file then reads as "wire event → PartTracker call →
+emit". No per-part bookkeeping in any single provider.
+
 ### Provider continuation tokens
 
 OpenAI's `previous_response_id` (and any future analogue from other
