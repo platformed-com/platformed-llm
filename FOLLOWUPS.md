@@ -1,7 +1,6 @@
 # Follow-ups
 
-Tracked work deferred from the testability + bug-fix sweep, the trace-
-capture work, and the Transport refactor. Items here are intentionally
+Open work deferred from prior sweeps. Items here are intentionally
 skipped, not forgotten. Delete sections as they land.
 
 ## Phase 5 — breaking API redesign
@@ -153,61 +152,14 @@ Easy fix once decided whether to wire them or remove them from
 
 ## Testing gaps
 
-Done during the sweep:
-
-- **HTTP error mapping (OpenAI, synthetic)**: `tests/http_errors_e2e.rs`
-  — 429 with/without `Retry-After`, 401, 500, non-JSON 5xx, all through
-  `generate()` via an in-process `StaticTransport`.
-- **HTTP error mapping (real captures)**: `tests/error_traces_e2e.rs`
-  walks captures with `meta.status != 200`, replays each through the
-  matching provider via `StaticTransport`, and asserts the typed
-  `Error` variant matches expectations.
-- **Cancellation**: `tests/cancellation.rs` stands up a raw
-  `tokio::net::TcpListener`, sends one chunked SSE event, then verifies
-  that dropping the `Response` mid-stream produces a peer FIN observed
-  via `read() == Ok(0)`.
-- **SSE parser chunk-boundary invariant**: `sse_stream.rs::tests`
-  exhaustively splits a synthetic corpus byte-by-byte and across
-  randomized chunk patterns, plus a real captured trace, and asserts
-  the event sequence is identical to the single-chunk baseline.
-- **Unified-event + final-response snapshots**: `tests/snapshot_traces.rs`
-  replays each captured trace through the full provider pipeline and
-  diffs the produced `Vec<StreamEvent>` *and* the accumulator's
-  `CompleteResponse` against a checked-in `.events.txt`. Volatile IDs
-  and usage token counts are masked so wire-shape regressions show up
-  cleanly without re-capture churn. A sanity check fails if
-  `Done.usage.input_tokens == 0` so masking can't hide a parser bug.
-  `UPDATE_SNAPSHOTS=1` regenerates.
-- **`Response::buffer` error path**: `src/response.rs::tests` covers
-  both mid-stream `Result::Err` and `StreamEvent::Error` short-
-  circuiting buffer with the underlying message preserved.
-- **`ProviderConfig::from_env`**: 9 unit tests covering each explicit
-  `PROVIDER_TYPE` path, missing-credential errors, region defaulting,
-  ADC fallback, credential-sniffing inference, and unrecognized values.
-  Uses a process-wide mutex + RAII env guard (env mutation is `unsafe`
-  since Rust 1.81).
-- **Real-API scenario coverage**: scenario schema supports per-provider
-  overrides (`model`, `auth_override`, `extra_body`, `skip`),
-  `expect_failure`, and richer message shapes (assistant `tool_calls`,
-  `tool` role). Captures cover `text_only`, `system_and_user`,
-  `function_call`, `multi_turn_tool`, `length_limit`, `parallel_tools`,
-  `reasoning_request` (OpenAI gpt-5-mini), `auth_error`, and
-  `model_not_found`.
-- **Transport-driven captures**: `cargo run --example capture_traces`
-  drives `provider.generate()` with a `RecordingTransport` that tees
-  the bytes — capturing IS the lib's full request-path test against
-  real providers. The saved `request.json` IS the lib's output.
-
-Still open:
-
 - **Anthropic real captures**: project needs Claude enabled in Vertex
   Model Garden. Replay/snapshot tests no-op for Anthropic until then.
   Anthropic integration coverage today is `function_calling_e2e` against
   hand-authored fixtures + provider unit tests only.
-- **Vertex typed-error mapping**: error_traces_e2e accepts any
+- **Vertex typed-error mapping**: `error_traces_e2e` accepts any
   `Error::Provider` for Vertex 4xx because the provider doesn't map
   the structured `google.rpc.Status` envelope. Tightens to assert
-  `Error::Auth` / `Error::ModelNotAvailable` once the Phase 5 error
+  `Error::Auth` / `Error::ModelNotAvailable` once the Phase 5 Error
   redesign lands.
 - **OpenAI refusal coverage**: still untested; needs a prompt that
   reliably elicits a refusal without poking policy boundaries.
