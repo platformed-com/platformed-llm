@@ -8,8 +8,8 @@
         "@type": "type.googleapis.com/google.rpc.ErrorInfo",
         "reason": "ACCESS_TOKEN_TYPE_UNSUPPORTED",
         "metadata": {
-          "service": "aiplatform.googleapis.com",
-          "method": "google.cloud.aiplatform.v1.PredictionService.StreamGenerateContent"
+          "method": "google.cloud.aiplatform.v1.PredictionService.StreamGenerateContent",
+          "service": "aiplatform.googleapis.com"
         }
       }
     ]
