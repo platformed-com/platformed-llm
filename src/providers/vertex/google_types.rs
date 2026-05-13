@@ -129,6 +129,14 @@ pub struct GoogleGenerationConfig {
     /// rough mapping (Low → 2048, Medium → 8192, High → 16384).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<GoogleThinkingConfig>,
+    /// MIME type the model should constrain its response to. The
+    /// canonical value for JSON output is `"application/json"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_mime_type: Option<String>,
+    /// Optional JSON Schema describing the response shape. Only
+    /// meaningful when `response_mime_type` is `"application/json"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<Cow<'static, RawValue>>,
 }
 
 /// Gemini thinking config.

@@ -135,6 +135,28 @@ pub struct ResponsesRequest {
     /// same prefix produce the same key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    /// `text.format` block — JSON mode / JSON schema constraint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<OpenAITextConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAITextConfig {
+    pub format: OpenAITextFormat,
+}
+
+/// `text.format` wire shape on OpenAI Responses API.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpenAITextFormat {
+    /// Bare JSON mode — model returns valid JSON without schema enforcement.
+    JsonObject,
+    /// Strict JSON Schema. Carries the schema inline.
+    JsonSchema {
+        name: String,
+        schema: Cow<'static, RawValue>,
+        strict: bool,
+    },
 }
 
 /// OpenAI's `reasoning` request field for chain-of-thought models.

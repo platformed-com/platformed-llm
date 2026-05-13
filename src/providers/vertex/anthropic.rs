@@ -210,6 +210,15 @@ impl AnthropicViaVertexProvider {
                 "Anthropic provider does not support presence/frequency penalty; dropping"
             );
         }
+        if matches!(
+            request.response_format,
+            Some(crate::types::ResponseFormat::JsonObject | crate::types::ResponseFormat::JsonSchema { .. })
+        ) {
+            tracing::debug!(
+                "Anthropic has no native JSON mode; response_format dropped — use a function \
+                 tool with the schema for tool-use coercion instead"
+            );
+        }
 
         Ok(anthropic_request)
     }

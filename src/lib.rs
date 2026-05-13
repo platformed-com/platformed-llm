@@ -31,5 +31,5 @@ pub use types::{
     Annotation, AnnotationKind, AssistantPart, AudioSource, DocumentSource, FinishReason,
     Function, FunctionCall, ImageSource, InputItem, LLMRequest, PartKind, PartUpdate, Prompt,
     ProviderBuiltin, ProviderContinuation, ReasoningConfig, ReasoningEffort, ReasoningSummary,
-    StreamEvent, Tool, ToolChoice, ToolType, Usage, UserPart,
+    ResponseFormat, StreamEvent, Tool, ToolChoice, ToolType, Usage, UserPart,
 };

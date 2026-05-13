@@ -77,6 +77,33 @@ pub enum ProviderContinuation {
     Gemini { cached_content: String },
 }
 
+/// Structured output mode for the response.
+///
+/// Mapping per provider:
+/// - **OpenAI**: maps to `text.format` on the Responses API. `Text` is
+///   the default (no constraint); `JsonObject` sets `{"type":
+///   "json_object"}`; `JsonSchema` sets `{"type": "json_schema",
+///   "json_schema": {...}}`.
+/// - **Gemini**: maps to `generationConfig.responseMimeType:
+///   "application/json"` plus `responseSchema` for `JsonSchema`.
+/// - **Anthropic**: silently dropped — Anthropic has no native JSON
+///   mode. Callers wanting structured output on Anthropic should use
+///   tool-use coercion (a function tool with the schema).
+#[derive(Debug, Clone)]
+pub enum ResponseFormat {
+    /// Default — unconstrained text output.
+    Text,
+    /// Bare JSON mode — model returns valid JSON but no schema is enforced.
+    JsonObject,
+    /// JSON Schema constraint. `strict` requests strict-mode validation
+    /// on providers that support it.
+    JsonSchema {
+        name: String,
+        schema: std::borrow::Cow<'static, serde_json::value::RawValue>,
+        strict: bool,
+    },
+}
+
 /// Strategy for how the model should use available tools.
 ///
 /// Each provider has its own wire shape for this; the conversion happens
@@ -125,6 +152,10 @@ pub struct LLMRequest {
     /// Silently ignored on cross-provider switches.
     #[serde(default, skip_serializing_if = "Option::is_none", skip)]
     pub continuation: Option<ProviderContinuation>,
+    /// Structured-output constraint (JSON mode / JSON schema). `None`
+    /// means unconstrained text output.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip)]
+    pub response_format: Option<ResponseFormat>,
 }
 
 impl LLMRequest {
@@ -145,6 +176,7 @@ impl LLMRequest {
             store: None,
             reasoning: None,
             continuation: None,
+            response_format: None,
         }
     }
 
@@ -222,6 +254,12 @@ impl LLMRequest {
     /// Attach a provider continuation hint from a prior response.
     pub fn continuation(mut self, continuation: ProviderContinuation) -> Self {
         self.continuation = Some(continuation);
+        self
+    }
+
+    /// Constrain the response to a structured shape (JSON mode / schema).
+    pub fn response_format(mut self, response_format: ResponseFormat) -> Self {
+        self.response_format = Some(response_format);
         self
     }
 }

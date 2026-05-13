@@ -10,7 +10,7 @@ pub mod streaming;
 
 pub use config::{
     LLMRequest, ProviderContinuation, ReasoningConfig, ReasoningEffort, ReasoningSummary,
-    ToolChoice, Usage,
+    ResponseFormat, ToolChoice, Usage,
 };
 pub use message::{
     Annotation, AnnotationKind, AssistantPart, AudioSource, DocumentSource, FinishReason,

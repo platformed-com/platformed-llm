@@ -268,6 +268,18 @@ impl GoogleProvider {
             GoogleThinkingConfig { thinking_budget }
         });
 
+        let (response_mime_type, response_schema) = match &request.response_format {
+            Some(crate::types::ResponseFormat::JsonObject) => {
+                (Some("application/json".to_string()), None)
+            }
+            Some(crate::types::ResponseFormat::JsonSchema { schema, .. }) => (
+                Some("application/json".to_string()),
+                Some(schema.clone()),
+            ),
+            // ResponseFormat::Text or None — leave unset.
+            Some(crate::types::ResponseFormat::Text) | None => (None, None),
+        };
+
         let generation_config = Some(GoogleGenerationConfig {
             temperature: request.temperature,
             max_output_tokens: request.max_tokens,
@@ -276,6 +288,8 @@ impl GoogleProvider {
             presence_penalty: request.presence_penalty,
             frequency_penalty: request.frequency_penalty,
             thinking_config,
+            response_mime_type,
+            response_schema,
         });
 
         let tools = request.tools.as_ref().and_then(|tools| {
@@ -827,6 +841,46 @@ mod tests {
             json["cachedContent"],
             "projects/p/locations/l/cachedContents/abc",
         );
+    }
+
+    #[test]
+    fn response_format_json_object_sets_mime_type() {
+        use crate::types::ResponseFormat;
+        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
+            .response_format(ResponseFormat::JsonObject);
+        let body = provider().convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["generationConfig"]["responseMimeType"],
+            "application/json",
+        );
+        assert!(json["generationConfig"]
+            .get("responseSchema")
+            .map(|v| v.is_null())
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn response_format_json_schema_emits_schema() {
+        use crate::types::ResponseFormat;
+        use std::borrow::Cow;
+        let schema_raw = serde_json::value::RawValue::from_string(
+            r#"{"type":"object","properties":{"x":{"type":"number"}}}"#.to_string(),
+        )
+        .unwrap();
+        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
+            .response_format(ResponseFormat::JsonSchema {
+                name: "Point".to_string(),
+                schema: Cow::Owned(schema_raw),
+                strict: true,
+            });
+        let body = provider().convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["generationConfig"]["responseMimeType"],
+            "application/json",
+        );
+        assert_eq!(json["generationConfig"]["responseSchema"]["type"], "object");
     }
 
     /// An OpenAI continuation is ignored by Gemini — the model-

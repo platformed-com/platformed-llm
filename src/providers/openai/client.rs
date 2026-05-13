@@ -106,6 +106,7 @@ impl OpenAIProvider {
             presence_penalty: request.presence_penalty,
             frequency_penalty: request.frequency_penalty,
             prompt_cache_key: derive_prompt_cache_key(&request.messages),
+            text: request.response_format.as_ref().and_then(convert_response_format),
         }
     }
 
@@ -482,6 +483,27 @@ fn flatten_user_parts_to_text(parts: &[crate::types::UserPart]) -> String {
         }
     }
     out
+}
+
+fn convert_response_format(
+    rf: &crate::types::ResponseFormat,
+) -> Option<crate::providers::openai::types::OpenAITextConfig> {
+    use crate::providers::openai::types::{OpenAITextConfig, OpenAITextFormat};
+    use crate::types::ResponseFormat;
+    let format = match rf {
+        ResponseFormat::Text => return None,
+        ResponseFormat::JsonObject => OpenAITextFormat::JsonObject,
+        ResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        } => OpenAITextFormat::JsonSchema {
+            name: name.clone(),
+            schema: schema.clone(),
+            strict: *strict,
+        },
+    };
+    Some(OpenAITextConfig { format })
 }
 
 fn convert_reasoning(cfg: &ReasoningConfig) -> OpenAIReasoning {
@@ -1028,6 +1050,37 @@ mod tests {
             result.is_err(),
             "function_call without call_id must error, got: {result:?}",
         );
+    }
+
+    #[test]
+    fn response_format_json_object_emits_text_format() {
+        use crate::types::ResponseFormat;
+        let req = LLMRequest::from_prompt("gpt-5", &Prompt::user("hi"))
+            .response_format(ResponseFormat::JsonObject);
+        let body = provider().convert_request(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["text"]["format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn response_format_json_schema_emits_schema_block() {
+        use crate::types::ResponseFormat;
+        use std::borrow::Cow;
+        let schema_raw = serde_json::value::RawValue::from_string(
+            r#"{"type":"object"}"#.to_string(),
+        )
+        .unwrap();
+        let req = LLMRequest::from_prompt("gpt-5", &Prompt::user("hi"))
+            .response_format(ResponseFormat::JsonSchema {
+                name: "Point".to_string(),
+                schema: Cow::Owned(schema_raw),
+                strict: true,
+            });
+        let body = provider().convert_request(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["text"]["format"]["type"], "json_schema");
+        assert_eq!(json["text"]["format"]["name"], "Point");
+        assert_eq!(json["text"]["format"]["strict"], true);
     }
 
     /// `UserPart::CacheBreakpoint` should produce a stable
