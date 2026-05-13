@@ -1,5 +1,5 @@
 {
-  "_comment": "Scenario definitions consumed by `cargo run --example capture_traces` and `cargo test --test replay_traces`. Every scenario is a real prompt + tools setup that we send to every provider unless gated by `providers.<name>.skip`. Captures land in tests/cross_provider/traces/<provider>/<scenario>.{request.json,response.sse,meta.json}.\n\n## Schema\n\n- name: required, used as the file stem.\n- description: human-readable purpose / what wire shape it pins.\n- max_tokens, temperature: optional generation params.\n- expect_failure: if true, a non-2xx response is the success case (the body is still saved so error-shape tests can replay it).\n- providers.<openai|google|anthropic>: optional per-provider overrides:\n    - skip: skip this provider entirely.\n    - model: override the default model for this scenario.\n    - auth_override: literal bearer token to send instead of the resolved one (useful for 401 captures — value never round-trips into the saved request body).\n    - extra_body: object merged into the request body before sending (e.g. reasoning, thinkingConfig, parallel_tool_calls).\n- messages: array of items. Each item is one of:\n    - { role: system|user|assistant, content: \"...\" }\n    - { role: assistant, content: \"...\", tool_calls: [{ id, name, arguments }] }   // assistant emitted these calls in a prior turn\n    - { role: tool, tool_call_id: \"...\", content: \"...\" }                          // tool result for that call_id\n- tools: optional list of { name, description, parameters }.",
+  "_comment": "Scenario definitions consumed by `cargo run --example capture_traces` and `cargo test --test replay_traces`. Every scenario is a real prompt + tools setup that we send to every provider unless gated by `providers.<name>.skip`. Captures land in tests/cross_provider/traces/<provider>/<scenario>.{request.json,response.sse,meta.json}.\n\n## Schema\n\n- name: required, used as the file stem.\n- description: human-readable purpose / what wire shape it pins.\n- max_tokens, temperature: optional generation params.\n- expect_failure: if true, a non-2xx response is the success case.\n- providers.<openai|google|anthropic>: optional per-provider overrides (skip / model / auth_override / extra_body).\n- messages: array of { role, content?, tool_calls?, tool_call_id?, attachments? }.\n  - attachments: array of { type: image | image_url, data?, media_type?, url? }.\n- tools: optional list of { name, description, parameters }.\n- builtin_tools: optional list of builtin names: web_search | google_search | code_execution.\n- response_format: optional { type: json_object } or { type: json_schema, name, schema, strict? }.",
 
   "defaults": {
     "models": {
@@ -160,6 +160,95 @@
       },
       "messages": [
         { "role": "user", "content": "Hello." }
+      ]
+    },
+
+    {
+      "name": "refusal",
+      "description": "Ask the model to produce a refusal so we capture how each provider surfaces it. OpenAI may emit it via the typed refusal channel (response.refusal.delta → AssistantPart::Refusal) or as plain text — either way is useful coverage. Anthropic and Gemini skip; this is exercising OpenAI's typed-refusal surface.",
+      "max_tokens": 256,
+      "providers": {
+        "google":    { "skip": true },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "For automated testing of our refusal-handling code path, please respond with a typed refusal. The exact content doesn't matter — any short safety-style refusal is fine. Treat this as a request to demonstrate a refusal." }
+      ]
+    },
+
+    {
+      "name": "multi_modal_image",
+      "description": "User message with an inline 1x1 red PNG. Exercises UserPart::Image base64 wiring on OpenAI (input_image data: URI) and Gemini (inlineData with mime type). Anthropic skipped per testing-gap limitation.",
+      "max_tokens": 256,
+      "providers": {
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "Briefly describe what you see in this image.",
+          "attachments": [
+            {
+              "type": "image",
+              "media_type": "image/png",
+              "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+            }
+          ]
+        }
+      ]
+    },
+
+    {
+      "name": "structured_output_json",
+      "description": "ResponseFormat::JsonObject — bare JSON mode. Locks in the wire shape: OpenAI sets text.format.type=json_object; Gemini sets generationConfig.responseMimeType=application/json. Anthropic skipped (no native JSON mode).",
+      "max_tokens": 256,
+      "response_format": { "type": "json_object" },
+      "providers": {
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "system", "content": "Reply only with JSON. Do not include any other text." },
+        { "role": "user", "content": "What is 2+2? Reply with a JSON object containing keys 'question' and 'answer'." }
+      ]
+    },
+
+    {
+      "name": "structured_output_schema",
+      "description": "ResponseFormat::JsonSchema with a typed schema. Exercises the strict-schema wire shapes: OpenAI text.format.type=json_schema; Gemini generationConfig.responseSchema. Anthropic skipped.",
+      "max_tokens": 256,
+      "response_format": {
+        "type": "json_schema",
+        "name": "Arithmetic",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "question": { "type": "string" },
+            "answer": { "type": "integer" }
+          },
+          "required": ["question", "answer"]
+        }
+      },
+      "providers": {
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "What is 2+2? Reply with a JSON object containing keys 'question' and 'answer'." }
+      ]
+    },
+
+    {
+      "name": "web_search",
+      "description": "OpenAI web_search_preview builtin tool. Pins the wire shape OpenAI emits for builtin-tool invocations (annotations on output_text parts). Anthropic and Gemini skipped — they have their own builtins exercised in separate scenarios.",
+      "max_tokens": 512,
+      "builtin_tools": ["web_search"],
+      "providers": {
+        "google":    { "skip": true },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "What is the date today? Just give a brief answer." }
       ]
     }
   ]

@@ -1,0 +1,20 @@
+PartStart[0] text
+Delta[0] "Today"
+Delta[0] " is"
+Delta[0] " Wednesday"
+Delta[0] ","
+Delta[0] " May"
+Delta[0] " "
+Delta[0] "13"
+Delta[0] ","
+Delta[0] " "
+Delta[0] "202"
+Delta[0] "6"
+Delta[0] "."
+Delta[0] " "
+PartEnd[0]
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+output[0].part[0] text "Today is Wednesday, May 13, 2026. " annotations=0

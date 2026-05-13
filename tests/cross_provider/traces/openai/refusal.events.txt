@@ -1,0 +1,17 @@
+PartStart[0] text
+Delta[0] "I'm"
+Delta[0] " sorry"
+Delta[0] ","
+Delta[0] " but"
+Delta[0] " I"
+Delta[0] " cannot"
+Delta[0] " assist"
+Delta[0] " with"
+Delta[0] " that"
+Delta[0] "."
+PartEnd[0]
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+output[0].part[0] text "I'm sorry, but I cannot assist with that." annotations=0

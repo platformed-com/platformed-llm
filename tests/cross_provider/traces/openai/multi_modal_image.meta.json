@@ -1,0 +1,18 @@
+{
+  "captured_at_unix": 1778689951,
+  "endpoint": "https://api.openai.com/v1/responses",
+  "expect_failure": false,
+  "headers": {
+    "content-type": "text/event-stream; charset=utf-8",
+    "openai-organization": "platformed-02snf0",
+    "openai-processing-ms": "135",
+    "openai-version": "2020-10-01",
+    "x-request-id": "req_e5bda46bf5154db59be31779e77389cd"
+  },
+  "latency_ms": 2202,
+  "model": "gpt-4o-mini",
+  "provider": "openai",
+  "response_bytes": 8336,
+  "scenario": "multi_modal_image",
+  "status": 200
+}

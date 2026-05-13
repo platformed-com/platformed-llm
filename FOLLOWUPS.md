@@ -14,27 +14,27 @@ exist in code but haven't been exercised end-to-end.
   Model Garden. Replay/snapshot tests no-op for Anthropic until then.
   Anthropic integration coverage today is `function_calling_e2e`
   against hand-authored fixtures + provider unit tests only.
-- **OpenAI refusal coverage**: `AssistantPart::Refusal` is the typed
-  surface, but no captured trace exercises a real refusal — needs a
-  prompt that reliably elicits one without poking policy boundaries.
+- **OpenAI typed-refusal channel**: the `refusal` scenario captures
+  a real refusal from `gpt-4o-mini`, but the model emits it via the
+  ordinary `output_text` channel (graceful plain-text refusal),
+  *not* via the typed `response.refusal.delta` channel. The lib's
+  `AssistantPart::Refusal` surface still has no captured wire-shape
+  pinning — that fires only when OpenAI's safety system intercepts
+  a request, which doesn't happen for the polite "please refuse"
+  prompt we're using. Real coverage would require an actually-
+  policy-violating prompt; deferred.
 - **Anthropic multi-region captures**: the `us` / `eu` Vertex
   multi-region URL handling has unit-test coverage but no captured
   trace pins it against the real provider. Blocked on the same Model
   Garden access as the regional Anthropic captures.
-- **Real multi-modal captures**: `UserPart::Image/Audio/Document` are
-  wired through all three providers but no captured scenario
-  exercises them against real APIs yet. The capture binary
-  (`examples/capture_traces.rs`) and `tests/scenarios.json` schema
-  would need a way to express inline base64 bytes for a scenario
-  message.
-- **Provider-builtin captures**: `Tool::Builtin(WebSearch /
-  GoogleSearch / CodeExecution / ComputerUse)` produce the right
-  wire shape per provider but no captured scenario exercises a real
-  web-search / code-execution round-trip.
-- **Structured-output captures**: `ResponseFormat::JsonObject` /
-  `JsonSchema` wired on OpenAI and Gemini but no captured scenario
-  exercises them. JSON mode is a high-value feature to pin against
-  real APIs.
+- **Audio + Document captures**: `UserPart::Image` is now exercised
+  by the `multi_modal_image` scenario against real OpenAI + Google.
+  Audio and Document scenarios still missing — would need a small
+  base64 mp3 / PDF asset (or reference files via path) in the
+  scenarios schema.
+- **Provider-builtin captures (partial)**: `WebSearch` is exercised
+  by the `web_search` scenario against OpenAI. `GoogleSearch` /
+  `CodeExecution` / `ComputerUse` still missing.
 - **ProviderContinuation captures**: `OpenAI { response_id }` and
   `Gemini { cached_content }` wire through but no captured scenario
   exercises a real chained turn (would also need OpenAI's `store:

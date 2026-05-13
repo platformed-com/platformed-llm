@@ -1,0 +1,23 @@
+{
+  "input": [
+    {
+      "content": "Reply only with JSON. Do not include any other text.",
+      "role": "system",
+      "type": "message"
+    },
+    {
+      "content": "What is 2+2? Reply with a JSON object containing keys 'question' and 'answer'.",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 256,
+  "model": "gpt-4o-mini",
+  "store": false,
+  "stream": true,
+  "text": {
+    "format": {
+      "type": "json_object"
+    }
+  }
+}

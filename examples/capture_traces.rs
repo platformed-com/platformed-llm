@@ -84,6 +84,28 @@ struct Scenario {
     messages: Vec<ScenarioMessage>,
     #[serde(default)]
     tools: Vec<ScenarioTool>,
+    /// Provider-builtin tools to add alongside `tools`. Each entry is
+    /// one of: `"web_search"`, `"google_search"`, `"code_execution"`,
+    /// `"computer_use"`. Providers that don't offer the named builtin
+    /// silently drop it (model-switching contract).
+    #[serde(default)]
+    builtin_tools: Vec<String>,
+    /// Optional structured-output constraint. `{"type":"json_object"}`
+    /// or `{"type":"json_schema","name":...,"schema":...,"strict":...}`.
+    #[serde(default)]
+    response_format: Option<ScenarioResponseFormat>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ScenarioResponseFormat {
+    JsonObject,
+    JsonSchema {
+        name: String,
+        schema: Value,
+        #[serde(default)]
+        strict: bool,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -112,6 +134,17 @@ struct ScenarioMessage {
     tool_calls: Vec<ScenarioToolCall>,
     #[serde(default)]
     tool_call_id: Option<String>,
+    /// Multi-modal attachments. Appended to the user message after the
+    /// text `content`.
+    #[serde(default)]
+    attachments: Vec<ScenarioAttachment>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ScenarioAttachment {
+    Image { data: String, media_type: String },
+    ImageUrl { url: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -275,7 +308,31 @@ fn scenario_to_llm_request(
                 prompt = prompt.with_system(m.content.clone().unwrap_or_default());
             }
             "user" | _ => {
-                prompt = prompt.with_user(m.content.clone().unwrap_or_default());
+                use platformed_llm::UserPart;
+                let mut content: Vec<UserPart> = Vec::new();
+                if let Some(text) = m.content.as_ref().filter(|s| !s.is_empty()) {
+                    content.push(UserPart::Text(text.clone()));
+                }
+                for att in &m.attachments {
+                    match att {
+                        ScenarioAttachment::Image { data, media_type } => {
+                            content.push(UserPart::Image(platformed_llm::ImageSource::Base64 {
+                                data: data.clone(),
+                                media_type: media_type.clone(),
+                            }));
+                        }
+                        ScenarioAttachment::ImageUrl { url } => {
+                            content.push(UserPart::Image(platformed_llm::ImageSource::Url(
+                                url.clone(),
+                            )));
+                        }
+                    }
+                }
+                if content.is_empty() {
+                    // Empty user message: skip rather than emit a no-content turn.
+                    continue;
+                }
+                prompt = prompt.with_item(InputItem::User { content });
             }
         }
     }
@@ -287,24 +344,53 @@ fn scenario_to_llm_request(
     if let Some(m) = scenario.max_tokens {
         req = req.max_tokens(m);
     }
-    if !scenario.tools.is_empty() {
-        let mut tools: Vec<Tool> = Vec::with_capacity(scenario.tools.len());
-        for t in &scenario.tools {
-            // Function::parameters is Cow<'static, RawValue>; route through
-            // a JSON re-serialize since we built `parameters` from a Value.
-            let raw = serde_json::value::RawValue::from_string(t.parameters.to_string())
-                .map_err(|e| format!("tool {} parameters: {e}", t.name))?;
-            tools.push(Tool::Function(platformed_llm::Function {
-                name: t.name.clone(),
-                description: if t.description.is_empty() {
-                    None
-                } else {
-                    Some(t.description.clone())
-                },
-                parameters: std::borrow::Cow::Owned(raw),
-            }));
-        }
+    let mut tools: Vec<Tool> = Vec::new();
+    for t in &scenario.tools {
+        let raw = serde_json::value::RawValue::from_string(t.parameters.to_string())
+            .map_err(|e| format!("tool {} parameters: {e}", t.name))?;
+        tools.push(Tool::Function(platformed_llm::Function {
+            name: t.name.clone(),
+            description: if t.description.is_empty() {
+                None
+            } else {
+                Some(t.description.clone())
+            },
+            parameters: std::borrow::Cow::Owned(raw),
+        }));
+    }
+    for b in &scenario.builtin_tools {
+        let builtin = match b.as_str() {
+            "web_search" => platformed_llm::ProviderBuiltin::WebSearch,
+            "google_search" => platformed_llm::ProviderBuiltin::GoogleSearch,
+            "code_execution" => platformed_llm::ProviderBuiltin::CodeExecution,
+            other => {
+                return Err(format!("unknown builtin_tool: {other}"));
+            }
+        };
+        tools.push(Tool::Builtin(builtin));
+    }
+    if !tools.is_empty() {
         req = req.tools(tools);
+    }
+
+    if let Some(rf) = &scenario.response_format {
+        let translated = match rf {
+            ScenarioResponseFormat::JsonObject => platformed_llm::ResponseFormat::JsonObject,
+            ScenarioResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => {
+                let raw = serde_json::value::RawValue::from_string(schema.to_string())
+                    .map_err(|e| format!("response_format schema: {e}"))?;
+                platformed_llm::ResponseFormat::JsonSchema {
+                    name: name.clone(),
+                    schema: std::borrow::Cow::Owned(raw),
+                    strict: *strict,
+                }
+            }
+        };
+        req = req.response_format(translated);
     }
 
     // Translate the supported subset of `extra_body`. Anything else is

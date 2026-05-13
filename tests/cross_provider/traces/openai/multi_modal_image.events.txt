@@ -1,0 +1,21 @@
+PartStart[0] text
+Delta[0] "The"
+Delta[0] " image"
+Delta[0] " is"
+Delta[0] " a"
+Delta[0] " solid"
+Delta[0] " yellow"
+Delta[0] " color"
+Delta[0] " without"
+Delta[0] " any"
+Delta[0] " patterns"
+Delta[0] " or"
+Delta[0] " additional"
+Delta[0] " elements"
+Delta[0] "."
+PartEnd[0]
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+output[0].part[0] text "The image is a solid yellow color without any patterns or additional elements." annotations=0

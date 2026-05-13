@@ -1,0 +1,2 @@
+data: {"candidates": [{"content": {"role": "model","parts": [{"text": "{\"question\": \"What is 2+2?\", \"answer\": 4}"}]},"finishReason": "STOP"}],"usageMetadata": {"promptTokenCount": 29,"candidatesTokenCount": 17,"totalTokenCount": 109,"trafficType": "ON_DEMAND","promptTokensDetails": [{"modality": "TEXT","tokenCount": 29}],"candidatesTokensDetails": [{"modality": "TEXT","tokenCount": 17}],"thoughtsTokenCount": 63},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T16:32:50.235319Z","responseId": "sqcEareuDrqp9fgPkZer4QQ"}
+

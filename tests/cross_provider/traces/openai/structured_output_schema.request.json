@@ -1,0 +1,36 @@
+{
+  "input": [
+    {
+      "content": "What is 2+2? Reply with a JSON object containing keys 'question' and 'answer'.",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 256,
+  "model": "gpt-4o-mini",
+  "store": false,
+  "stream": true,
+  "text": {
+    "format": {
+      "name": "Arithmetic",
+      "schema": {
+        "additionalProperties": false,
+        "properties": {
+          "answer": {
+            "type": "integer"
+          },
+          "question": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "question",
+          "answer"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "json_schema"
+    }
+  }
+}

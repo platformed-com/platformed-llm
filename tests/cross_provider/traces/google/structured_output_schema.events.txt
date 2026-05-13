@@ -1,0 +1,8 @@
+PartStart[0] text
+Delta[0] "{\"question\": \"What is 2+2?\", \"answer\": 4}"
+PartEnd[0]
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+output[0].part[0] text "{\"question\": \"What is 2+2?\", \"answer\": 4}" annotations=0
