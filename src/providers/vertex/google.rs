@@ -163,12 +163,48 @@ impl GoogleProvider {
                                 };
                                 push_part(&mut contents, "user", part);
                             }
-                            UserPart::Audio(_)
-                            | UserPart::Document(_)
-                            | UserPart::CacheBreakpoint => {
-                                tracing::debug!(
-                                    "Google provider dropping unsupported user part"
-                                );
+                            UserPart::Audio(src) => {
+                                let part = match src {
+                                    crate::types::AudioSource::Base64 { data, media_type } => {
+                                        GooglePart::InlineData {
+                                            inline_data: GoogleInlineData {
+                                                mime_type: media_type.clone(),
+                                                data: data.clone(),
+                                            },
+                                        }
+                                    }
+                                    crate::types::AudioSource::Url(u) => GooglePart::FileData {
+                                        file_data: GoogleFileData {
+                                            mime_type: "audio/*".to_string(),
+                                            file_uri: u.clone(),
+                                        },
+                                    },
+                                };
+                                push_part(&mut contents, "user", part);
+                            }
+                            UserPart::Document(src) => {
+                                let part = match src {
+                                    crate::types::DocumentSource::Base64 {
+                                        data,
+                                        media_type,
+                                    } => GooglePart::InlineData {
+                                        inline_data: GoogleInlineData {
+                                            mime_type: media_type.clone(),
+                                            data: data.clone(),
+                                        },
+                                    },
+                                    crate::types::DocumentSource::Url(u) => GooglePart::FileData {
+                                        file_data: GoogleFileData {
+                                            mime_type: "application/pdf".to_string(),
+                                            file_uri: u.clone(),
+                                        },
+                                    },
+                                };
+                                push_part(&mut contents, "user", part);
+                            }
+                            UserPart::CacheBreakpoint => {
+                                // Gemini uses a separate cachedContent
+                                // API surface; not wired yet.
                             }
                         }
                     }

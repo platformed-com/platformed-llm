@@ -137,11 +137,46 @@ impl OpenAIProvider {
                                 output: flatten_user_parts_to_text(content),
                             });
                         }
-                        UserPart::Audio(_) | UserPart::Document(_) => {
-                            tracing::debug!(
-                                "OpenAI provider dropping audio/document user part during request build"
-                            );
-                        }
+                        UserPart::Audio(src) => match src {
+                            crate::types::AudioSource::Base64 { data, media_type } => {
+                                // OpenAI accepts mp3 / wav. media_type is
+                                // expected to be something like "audio/mp3".
+                                let format = media_type
+                                    .strip_prefix("audio/")
+                                    .unwrap_or(media_type.as_str())
+                                    .to_string();
+                                parts.push(OpenAIContentPart::InputAudio {
+                                    input_audio:
+                                        crate::providers::openai::types::OpenAIInputAudio {
+                                            data: data.clone(),
+                                            format,
+                                        },
+                                });
+                            }
+                            crate::types::AudioSource::Url(_) => {
+                                tracing::debug!(
+                                    "OpenAI input_audio requires inline base64; dropping URL audio"
+                                );
+                            }
+                        },
+                        UserPart::Document(src) => match src {
+                            crate::types::DocumentSource::Url(u) => {
+                                parts.push(OpenAIContentPart::InputFile {
+                                    file_url: Some(u.clone()),
+                                    file_data: None,
+                                    filename: None,
+                                });
+                            }
+                            crate::types::DocumentSource::Base64 { data, media_type } => {
+                                parts.push(OpenAIContentPart::InputFile {
+                                    file_url: None,
+                                    file_data: Some(format!(
+                                        "data:{media_type};base64,{data}"
+                                    )),
+                                    filename: None,
+                                });
+                            }
+                        },
                         UserPart::CacheBreakpoint => {
                             // OpenAI maps cache breakpoints onto a per-
                             // request `prompt_cache_key` rather than

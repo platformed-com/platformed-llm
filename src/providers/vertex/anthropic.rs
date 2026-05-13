@@ -233,10 +233,25 @@ fn build_user_blocks(parts: &[UserPart]) -> Result<Vec<AnthropicContentBlock>, E
                     is_error: None,
                 });
             }
-            UserPart::Audio(_) | UserPart::Document(_) => {
-                tracing::debug!(
-                    "Anthropic provider dropping audio/document user part during request build"
-                );
+            UserPart::Audio(_) => {
+                tracing::debug!("Anthropic provider does not support audio input; dropping");
+            }
+            UserPart::Document(src) => {
+                let source = match src {
+                    crate::types::DocumentSource::Url(u) => ijson::ijson!({
+                        "type": "url",
+                        "url": u.clone(),
+                    }),
+                    crate::types::DocumentSource::Base64 { data, media_type } => ijson::ijson!({
+                        "type": "base64",
+                        "media_type": media_type.clone(),
+                        "data": data.clone(),
+                    }),
+                };
+                blocks.push(AnthropicContentBlock::Document {
+                    source,
+                    cache_control: None,
+                });
             }
             UserPart::CacheBreakpoint => attach_cache_control(blocks.last_mut()),
         }
@@ -262,6 +277,9 @@ fn attach_cache_control(last: Option<&mut AnthropicContentBlock>) {
                 *cache_control = Some(hint);
             }
             AnthropicContentBlock::Image { cache_control, .. } => {
+                *cache_control = Some(hint);
+            }
+            AnthropicContentBlock::Document { cache_control, .. } => {
                 *cache_control = Some(hint);
             }
             _ => {
@@ -549,10 +567,9 @@ pub(crate) fn convert_stream_event_stateful(
                     .open(index, PartKind::RedactedReasoning { data });
                 events.push(ev);
             }
-            AnthropicContentBlock::ToolResult { .. } => {
-                // Request-side blocks; not expected on the response stream.
-            }
-            AnthropicContentBlock::Image { .. } => {
+            AnthropicContentBlock::ToolResult { .. }
+            | AnthropicContentBlock::Image { .. }
+            | AnthropicContentBlock::Document { .. } => {
                 // Request-side blocks; not expected on the response stream.
             }
         },

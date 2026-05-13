@@ -114,6 +114,13 @@ pub enum AnthropicContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<AnthropicCacheControl>,
     },
+    /// Document (PDF) content block (request side).
+    #[serde(rename = "document")]
+    Document {
+        source: IValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
+    },
 }
 
 /// Anthropic cache-control hint on a content block.
