@@ -1,3 +1,7 @@
 OutputItemAdded text
 ContentDelta "hello"
-Done finish=Stop input=11 output=1 reasoning=22
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+output[0] text "hello"

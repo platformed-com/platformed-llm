@@ -60,3 +60,23 @@ impl Error {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_constructor_preserves_provider_and_message() {
+        let err = Error::provider("OpenAI", "Test error");
+        let msg = err.to_string();
+        assert!(msg.contains("OpenAI"));
+        assert!(msg.contains("Test error"));
+    }
+
+    #[test]
+    fn config_constructor_renders_invalid_configuration_prefix() {
+        let err = Error::config("Invalid model name");
+        assert!(err.to_string().contains("Invalid configuration"));
+        assert!(err.to_string().contains("Invalid model name"));
+    }
+}

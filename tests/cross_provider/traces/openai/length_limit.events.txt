@@ -15,4 +15,8 @@ ContentDelta " and"
 ContentDelta " Science"
 ContentDelta "**\n\n"
 ContentDelta "Cloud"
-Done finish=Length input=20 output=16
+Done finish=Length input=<n> output=<n>
+
+=== final ===
+finish=Length
+output[0] text "**The Fascinating History of Clouds: A Journey Through Time and Science**\n\nCloud"

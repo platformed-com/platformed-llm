@@ -258,4 +258,9 @@ ContentDelta "."
 ContentDelta "33"
 ContentDelta " km"
 ContentDelta "."
-Done finish=Stop input=62 output=581
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+output[0] reasoning len=460 signature_len=0
+output[1] text "Let t = hours after 3:00 pm when they meet (t ≥ 1).  \nDistance by train from Paris = 80t.  \nDistance by train from Lyon = 100(t − 1).  \nThey meet when 80t + 100(t − 1) = 470.\n\nSolve: 180t − 100 = 470 → 180t = 570 → t = 570/180 = 3 1/6 h = 3 h 10 min.\n\nSo they meet at 3:00 pm + 3 h 10 min = 6:10 pm.  \nDistance from Paris = 80 × 3.1666... = 253 1/3 km ≈ 253.33 km."

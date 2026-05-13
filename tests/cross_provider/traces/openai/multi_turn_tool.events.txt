@@ -13,4 +13,8 @@ ContentDelta " "
 ContentDelta "22"
 ContentDelta "°C"
 ContentDelta "."
-Done finish=Stop input=100 output=16
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+output[0] text "The weather in Paris is sunny with a temperature of 22°C."

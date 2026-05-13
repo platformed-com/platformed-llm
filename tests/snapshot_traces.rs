@@ -20,10 +20,11 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
+use platformed_llm::accumulator::ResponseAccumulator;
 use platformed_llm::{
-    AnthropicViaVertexProvider, Error, GoogleProvider, LLMProvider, LLMRequest, OpenAIProvider,
-    Prompt, StreamEvent, Transport, TransportImpl, TransportRequest, TransportResponse,
-    VertexEndpoint,
+    AnthropicViaVertexProvider, CompleteResponse, Error, GoogleProvider, LLMProvider, LLMRequest,
+    OpenAIProvider, OutputItem, Prompt, StreamEvent, Transport, TransportImpl, TransportRequest,
+    TransportResponse, VertexEndpoint,
 };
 use serde_json::Value;
 
@@ -271,22 +272,16 @@ fn format_events(events: &[StreamEvent]) -> String {
             }
             StreamEvent::Done {
                 finish_reason,
-                usage,
+                usage: _,
             } => {
+                // Usage counts are masked to `<n>` — they're model-version
+                // non-deterministic (rerunning capture produces different
+                // numbers even on the same prompt) and would cause snapshot
+                // churn that's not a real regression. Presence of the
+                // fields is enforced separately by `validate_event_sequence`.
                 out.push_str(&format!(
-                    "Done finish={finish_reason:?} input={} output={}",
-                    usage.input_tokens, usage.output_tokens
+                    "Done finish={finish_reason:?} input=<n> output=<n>\n"
                 ));
-                if let Some(v) = usage.cache_read_input_tokens {
-                    out.push_str(&format!(" cache_read={v}"));
-                }
-                if let Some(v) = usage.cache_creation_input_tokens {
-                    out.push_str(&format!(" cache_creation={v}"));
-                }
-                if let Some(v) = usage.reasoning_tokens {
-                    out.push_str(&format!(" reasoning={v}"));
-                }
-                out.push('\n');
             }
             StreamEvent::Error { error } => {
                 out.push_str(&format!("Error {error:?}\n"));
@@ -296,20 +291,68 @@ fn format_events(events: &[StreamEvent]) -> String {
     out
 }
 
+/// Format the final `CompleteResponse` produced by feeding the unified
+/// events through `ResponseAccumulator`. Snapshotting this catches
+/// accumulator regressions on real-shape data — without this section,
+/// only the `Vec<StreamEvent>` was diff'd and the actual user-facing
+/// `CompleteResponse` shape was untested against captures.
+fn format_complete(complete: &CompleteResponse) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("finish={:?}\n", complete.finish_reason));
+    for (i, item) in complete.output.iter().enumerate() {
+        match item {
+            OutputItem::Text { content } => {
+                out.push_str(&format!("output[{i}] text {content:?}\n"));
+            }
+            OutputItem::Reasoning { content, signature } => {
+                // Mask signature length only — the bytes themselves are
+                // opaque and model-version-volatile.
+                let sig_len = signature.as_ref().map(|s| s.len()).unwrap_or(0);
+                out.push_str(&format!(
+                    "output[{i}] reasoning len={} signature_len={sig_len}\n",
+                    content.len()
+                ));
+            }
+            OutputItem::FunctionCall { call } => {
+                out.push_str(&format!(
+                    "output[{i}] function_call name={:?} arguments={:?}\n",
+                    call.name, call.arguments,
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Shape sanity that must hold for any captured success-path replay,
 /// independent of the snapshot. Run *before* write/compare so a buggy
 /// bootstrap can't silently bake bad behaviour into the golden file.
+///
+/// Also catches "usage parsing silently broke" — the snapshot masks
+/// usage numeric values to keep re-captures stable, so without this
+/// check a parser regression that zeroed out token counts would slip
+/// through.
 fn validate_event_sequence(events: &[StreamEvent]) -> Result<(), String> {
-    let dones = events
+    let dones: Vec<&StreamEvent> = events
         .iter()
         .filter(|e| matches!(e, StreamEvent::Done { .. }))
-        .count();
-    if dones != 1 {
-        return Err(format!("expected exactly one Done event, got {dones}"));
+        .collect();
+    if dones.len() != 1 {
+        return Err(format!(
+            "expected exactly one Done event, got {}",
+            dones.len()
+        ));
     }
     let last_is_done = matches!(events.last(), Some(StreamEvent::Done { .. }));
     if !last_is_done {
         return Err("Done event is not the last event in the stream".to_string());
+    }
+    if let StreamEvent::Done { usage, .. } = dones[0] {
+        if usage.input_tokens == 0 {
+            return Err(
+                "Done.usage.input_tokens is 0 — usage block was probably not parsed".to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -333,7 +376,35 @@ async fn unified_event_snapshots_match() {
             continue;
         }
 
-        let actual = format_events(&events);
+        // Run the same events through the accumulator to produce a
+        // `CompleteResponse` — the surface most callers actually see
+        // (`response.buffer()` / `response.text()`). Snapshotting it
+        // closes the trace → unified events → CompleteResponse chain.
+        let mut accumulator = ResponseAccumulator::new();
+        let mut accumulator_failed = false;
+        for ev in &events {
+            if let Err(e) = accumulator.process_event(ev.clone()) {
+                failures.push(format!("{label}: accumulator: {e}"));
+                accumulator_failed = true;
+                break;
+            }
+        }
+        if accumulator_failed {
+            continue;
+        }
+        let complete = match accumulator.finalize() {
+            Ok(c) => c,
+            Err(e) => {
+                failures.push(format!("{label}: accumulator.finalize: {e}"));
+                continue;
+            }
+        };
+
+        let actual = format!(
+            "{}\n=== final ===\n{}",
+            format_events(&events),
+            format_complete(&complete),
+        );
 
         let snapshot_exists = trace.snapshot_path.exists();
         if update || !snapshot_exists {

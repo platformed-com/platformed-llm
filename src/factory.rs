@@ -335,4 +335,206 @@ mod tests {
         assert!(ProviderType::Anthropic.is_supported_via_vertex());
         assert!(!ProviderType::OpenAI.is_supported_via_vertex());
     }
+
+    // ---------------------------------------------------------------------
+    // from_env tests
+    //
+    // Env vars are process-global, so these tests serialize on a single
+    // mutex (`ENV_LOCK`). Each test wraps its mutations in `EnvGuard` which
+    // snapshots and restores the relevant vars on drop, so an unrelated
+    // run-after test isn't poisoned by left-over state.
+    //
+    // `env::set_var` / `env::remove_var` are `unsafe` since Rust 1.81
+    // because the underlying syscall is not thread-safe with concurrent
+    // readers. The mutex above gives us that exclusion: while we hold the
+    // lock, no other test in this binary is reading env vars via
+    // `from_env`. Outside threads (e.g. spawned by tokio runtimes inside
+    // tests) reading the same vars *could* race, but `from_env` is sync
+    // and runs only on the test thread under the lock, so the
+    // SAFETY-requirements are met.
+    // ---------------------------------------------------------------------
+
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Vars `from_env` reads. Cleared on construction so each test sees a
+    /// known empty environment; original values restored on drop.
+    const TRACKED: &[&str] = &[
+        "PROVIDER_TYPE",
+        "OPENAI_API_KEY",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_REGION",
+        "VERTEX_ACCESS_TOKEN",
+        "ANTHROPIC_VERTEX_ACCESS_TOKEN",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "ANTHROPIC_MODEL",
+    ];
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn fresh() -> Self {
+            let saved: Vec<_> = TRACKED.iter().map(|v| (*v, env::var_os(v))).collect();
+            for v in TRACKED {
+                // SAFETY: serialized by ENV_LOCK; see module-level note.
+                unsafe { env::remove_var(v) };
+            }
+            Self { saved }
+        }
+
+        fn set(&self, key: &str, value: &str) {
+            // SAFETY: serialized by ENV_LOCK; see module-level note.
+            unsafe { env::set_var(key, value) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                // SAFETY: serialized by ENV_LOCK; see module-level note.
+                unsafe {
+                    match v {
+                        Some(val) => env::set_var(k, val),
+                        None => env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lock the mutex, recovering from a poisoned lock left by a previously
+    /// panicking test so one failure doesn't cascade through the suite.
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn from_env_openai_explicit() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        g.set("PROVIDER_TYPE", "openai");
+        g.set("OPENAI_API_KEY", "sk-test-key");
+
+        let config = ProviderConfig::from_env().expect("openai config");
+        assert!(matches!(config.provider_type, ProviderType::OpenAI));
+        assert_eq!(config.api_key, Some("sk-test-key".to_string()));
+        assert_eq!(config.project_id, None);
+    }
+
+    #[test]
+    fn from_env_openai_missing_api_key_errors() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        g.set("PROVIDER_TYPE", "openai");
+
+        let err = ProviderConfig::from_env().expect_err("missing key");
+        assert!(err.to_string().contains("OPENAI_API_KEY"), "got: {err}");
+    }
+
+    #[test]
+    fn from_env_google_with_access_token() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        g.set("PROVIDER_TYPE", "google");
+        g.set("GOOGLE_CLOUD_PROJECT", "proj-1");
+        g.set("GOOGLE_CLOUD_REGION", "us-east1");
+        g.set("VERTEX_ACCESS_TOKEN", "ya29.tok");
+
+        let config = ProviderConfig::from_env().expect("google config");
+        assert!(matches!(config.provider_type, ProviderType::Google));
+        assert_eq!(config.project_id, Some("proj-1".to_string()));
+        assert_eq!(config.location, Some("us-east1".to_string()));
+        assert_eq!(config.access_token, Some("ya29.tok".to_string()));
+    }
+
+    #[test]
+    fn from_env_google_defaults_region_when_absent() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        g.set("PROVIDER_TYPE", "google");
+        g.set("GOOGLE_CLOUD_PROJECT", "proj-1");
+        g.set("VERTEX_ACCESS_TOKEN", "ya29.tok");
+
+        let config = ProviderConfig::from_env().expect("google config");
+        assert_eq!(config.location, Some("europe-west1".to_string()));
+    }
+
+    #[test]
+    fn from_env_google_falls_back_to_adc_when_no_access_token() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        g.set("PROVIDER_TYPE", "google");
+        g.set("GOOGLE_CLOUD_PROJECT", "proj-1");
+
+        let config = ProviderConfig::from_env().expect("google adc config");
+        assert!(matches!(config.provider_type, ProviderType::Google));
+        assert_eq!(config.access_token, None);
+        assert_eq!(config.project_id, Some("proj-1".to_string()));
+    }
+
+    #[test]
+    fn from_env_anthropic_explicit() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        g.set("PROVIDER_TYPE", "anthropic");
+        g.set("GOOGLE_CLOUD_PROJECT", "proj-1");
+        g.set("VERTEX_ACCESS_TOKEN", "ya29.tok");
+
+        let config = ProviderConfig::from_env().expect("anthropic config");
+        assert!(matches!(config.provider_type, ProviderType::Anthropic));
+        assert_eq!(config.access_token, Some("ya29.tok".to_string()));
+    }
+
+    #[test]
+    fn from_env_invalid_provider_type_errors() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        g.set("PROVIDER_TYPE", "bogus");
+
+        let err = ProviderConfig::from_env().expect_err("invalid provider");
+        assert!(
+            err.to_string().contains("Invalid PROVIDER_TYPE"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_env_fallback_openai_from_api_key_alone() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        // PROVIDER_TYPE unset → infer from credentials.
+        g.set("OPENAI_API_KEY", "sk-fallback");
+
+        let config = ProviderConfig::from_env().expect("openai fallback");
+        assert!(matches!(config.provider_type, ProviderType::OpenAI));
+        assert_eq!(config.api_key, Some("sk-fallback".to_string()));
+    }
+
+    #[test]
+    fn from_env_fallback_anthropic_via_dedicated_token() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        g.set("ANTHROPIC_VERTEX_ACCESS_TOKEN", "ya29.anthropic");
+        g.set("GOOGLE_CLOUD_PROJECT", "proj-1");
+
+        let config = ProviderConfig::from_env().expect("anthropic fallback");
+        assert!(matches!(config.provider_type, ProviderType::Anthropic));
+        assert_eq!(config.access_token, Some("ya29.anthropic".to_string()));
+    }
+
+    #[test]
+    fn from_env_no_credentials_errors() {
+        let _l = lock();
+        let _g = EnvGuard::fresh();
+        // Nothing set at all.
+        let err = ProviderConfig::from_env().expect_err("no creds");
+        assert!(
+            err.to_string().contains("No valid API credentials"),
+            "got: {err}"
+        );
+    }
 }

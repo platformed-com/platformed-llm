@@ -4,4 +4,10 @@ OutputItemAdded function_call name="get_weather" id="<id-3>"
 FunctionCallComplete call_id="<id-4>" name="get_weather" arguments="{\"city\":\"London\"}"
 OutputItemAdded function_call name="get_weather" id="<id-5>"
 FunctionCallComplete call_id="<id-6>" name="get_weather" arguments="{\"city\":\"Tokyo\"}"
-Done finish=ToolCalls input=60 output=59
+Done finish=ToolCalls input=<n> output=<n>
+
+=== final ===
+finish=ToolCalls
+output[0] function_call name="get_weather" arguments="{\"city\":\"Paris\"}"
+output[1] function_call name="get_weather" arguments="{\"city\":\"London\"}"
+output[2] function_call name="get_weather" arguments="{\"city\":\"Tokyo\"}"

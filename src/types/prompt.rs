@@ -100,3 +100,79 @@ impl From<Vec<InputItem>> for Prompt {
         Prompt { items }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::response::{CompleteResponse, OutputItem};
+    use crate::types::{FinishReason, FunctionCall, Message, Role, Usage};
+
+    #[test]
+    fn builder_stacks_items_in_order() {
+        let prompt = Prompt::system("you are a helpful assistant")
+            .with_user("what is the capital of france?");
+        assert_eq!(prompt.items().len(), 2);
+
+        let from_str: Prompt = "hello".into();
+        assert_eq!(from_str.items().len(), 1);
+
+        let from_string: Prompt = "hello".to_string().into();
+        assert_eq!(from_string.items().len(), 1);
+    }
+
+    #[test]
+    fn with_response_appends_assistant_message() {
+        let prompt =
+            Prompt::system("you are a helpful assistant").with_user("what is the capital?");
+        let response = CompleteResponse {
+            output: vec![OutputItem::Text {
+                content: "AI response".to_string(),
+            }],
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        };
+        let extended = prompt.with_response(&response);
+        assert_eq!(extended.items().len(), 3);
+        match &extended.items()[2] {
+            InputItem::Message(msg) => {
+                assert_eq!(msg.role(), Role::Assistant);
+                assert_eq!(msg.content(), Some("AI response".to_string()));
+            }
+            _ => panic!("expected message"),
+        }
+    }
+
+    #[test]
+    fn with_items_appends_each_in_order() {
+        let prompt = Prompt::system("you are a helpful assistant").with_user("hello world");
+        let extended = prompt.with_items(vec![
+            InputItem::Message(Message::assistant("first assistant message")),
+            InputItem::FunctionCall(FunctionCall {
+                call_id: "call_123".to_string(),
+                name: "test_function".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            InputItem::Message(Message::assistant("second assistant message")),
+        ]);
+        assert_eq!(extended.items().len(), 5);
+
+        let added = &extended.items()[2..];
+        match &added[0] {
+            InputItem::Message(msg) => {
+                assert_eq!(msg.role(), Role::Assistant);
+                assert_eq!(msg.content(), Some("first assistant message".to_string()));
+            }
+            _ => panic!("expected message"),
+        }
+        match &added[1] {
+            InputItem::FunctionCall(call) => assert_eq!(call.name, "test_function"),
+            _ => panic!("expected function call"),
+        }
+        match &added[2] {
+            InputItem::Message(msg) => {
+                assert_eq!(msg.content(), Some("second assistant message".to_string()))
+            }
+            _ => panic!("expected message"),
+        }
+    }
+}

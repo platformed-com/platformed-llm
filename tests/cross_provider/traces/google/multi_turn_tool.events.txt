@@ -1,4 +1,8 @@
 OutputItemAdded text
 ContentDelta "\n"
 ContentDelta "The weather in Paris is sunny with a temperature of 22 degrees Celsius."
-Done finish=Stop input=52 output=17
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+output[0] text "\nThe weather in Paris is sunny with a temperature of 22 degrees Celsius."

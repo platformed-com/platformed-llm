@@ -195,6 +195,72 @@ mod tests {
         assert_eq!(text, "Test response");
     }
 
+    /// A stream error mid-`buffer()` must short-circuit and surface the
+    /// underlying error rather than silently returning a partial
+    /// `CompleteResponse`. Previously this was untested, so an accumulator
+    /// regression could leave callers with quietly-truncated results.
+    #[tokio::test]
+    async fn buffer_propagates_mid_stream_error() {
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            Ok(StreamEvent::OutputItemAdded {
+                item: crate::types::OutputItemInfo::Text,
+            }),
+            Ok(StreamEvent::ContentDelta {
+                delta: "partial".to_string(),
+            }),
+            Err(Error::streaming("connection reset mid-stream")),
+            // The Done that should never be reached.
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ];
+        let stream = futures_util::stream::iter(events);
+        let err = Response::from_stream(stream)
+            .buffer()
+            .await
+            .expect_err("buffer() must surface mid-stream errors");
+        assert!(
+            matches!(err, Error::Streaming(_)),
+            "expected Streaming variant, got {err:?}",
+        );
+        assert!(
+            err.to_string().contains("connection reset"),
+            "underlying message must be preserved, got: {err}",
+        );
+    }
+
+    /// `StreamEvent::Error` (a typed mid-stream error event, distinct from
+    /// a `Result::Err`) must terminate `buffer()` with `Error::Streaming`
+    /// and not produce a `CompleteResponse`.
+    #[tokio::test]
+    async fn buffer_propagates_stream_error_event() {
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            Ok(StreamEvent::OutputItemAdded {
+                item: crate::types::OutputItemInfo::Text,
+            }),
+            Ok(StreamEvent::ContentDelta {
+                delta: "partial".to_string(),
+            }),
+            Ok(StreamEvent::Error {
+                error: "model produced an internal error".to_string(),
+            }),
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ];
+        let stream = futures_util::stream::iter(events);
+        let err = Response::from_stream(stream)
+            .buffer()
+            .await
+            .expect_err("buffer() must surface StreamEvent::Error");
+        assert!(
+            err.to_string().contains("model produced an internal error"),
+            "underlying message must be preserved, got: {err}",
+        );
+    }
+
     #[test]
     fn test_mixed_output_ordering() {
         use crate::types::FunctionCall;

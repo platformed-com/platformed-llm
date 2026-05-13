@@ -1,4 +1,8 @@
 OutputItemAdded text
 ContentDelta "Hello"
 ContentDelta "."
-Done finish=Stop input=18 output=3
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+output[0] text "Hello."
