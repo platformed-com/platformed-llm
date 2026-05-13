@@ -3,87 +3,45 @@
 Open work deferred from prior sweeps. Items here are intentionally
 skipped, not forgotten. Delete sections as they land.
 
-## Phase 5 — remaining items
-
-The Phase 5 redesign (canonical message model, part-indexed
-StreamEvent, ProviderContinuation, Tool::Builtin, Error redesign with
-typed status + retryable, Response::collect(), explicit re-exports,
-from_env simplification, image multi-modal across all three providers,
-Anthropic cache_control) has landed. The remaining Phase-5-adjacent
-items are smaller and orthogonal:
-
-### Multi-modal beyond images
-
-`UserPart::Audio` and `UserPart::Document` are typed on the surface
-but each provider silently drops them today. Provider wiring:
-
-- **OpenAI**: `input_audio` (mp3/wav) and `input_file` (PDFs) content
-  parts. Same `OpenAIMessageContent::Parts` machinery; just add the
-  variants.
-- **Anthropic**: `document` content blocks for PDFs; no audio support.
-- **Gemini**: `inlineData` with the right mime types covers audio /
-  documents already (binary just rides under a different content-type).
-
-### OpenAI prompt_cache_key
-
-`UserPart::CacheBreakpoint` currently no-ops on OpenAI. To map it
-onto the per-request `prompt_cache_key`, derive a stable hash of the
-prefix bytes up to the breakpoint and set it on the
-`ResponsesRequest` once. Single-breakpoint only on OpenAI's side.
+## Remaining provider features
 
 ### Gemini cachedContent
 
-Gemini exposes prompt caching via a separate `cachedContent` API
-that must be created server-side ahead of time. Wiring would mean
-adding a `cached_content` field on `LLMRequest` (or a Gemini-specific
-config) referencing a pre-created CachedContent name. Different
-surface from `CacheBreakpoint`; both could coexist.
+Gemini exposes prompt caching via a separate `cachedContent` API that
+must be created server-side ahead of time. The lib's `CacheBreakpoint`
+is currently a no-op on Gemini. Wiring would mean adding a
+`cached_content` field on `LLMRequest` (or a Gemini-specific config)
+that references a pre-created CachedContent resource name. Different
+surface from `CacheBreakpoint`; both could coexist if we want
+per-block hints AND server-side caches.
 
-### Provider-builtin wire shapes
+### Gemini structured output
 
-`Tool::Builtin(ProviderBuiltin)` is enumerated and silently dropped
-from the tools array on providers that don't offer that builtin, but
-the providers that *do* offer them aren't emitting the right wire
-shape yet. Each provider has its own:
+`responseMimeType` / `responseSchema` (JSON-mode equivalent) — no
+surface today. Adding `LLMRequest::response_format: Option<…>` and
+threading it through each provider would cover OpenAI's
+`response_format` and Gemini's `responseSchema` at once.
 
-- OpenAI: `{"type": "web_search_preview"}` / `{"type":
-  "computer_use_preview", "display_width": ...}` entries in the tools
-  array.
-- Anthropic: `{"type": "web_search_20250305"}` / `{"type":
-  "computer_20250124", ...}` entries.
-- Gemini: `googleSearch` and `codeExecution` are *separate keys* on
-  the request rather than entries in `tools`; needs a different
-  conversion path.
+### OpenAI multi-org / project headers
 
-### Gemini request-side thinkingConfig
+`OpenAI-Organization` and `OpenAI-Project` headers are optional but
+required for multi-org keys / project-scoped keys. Add an optional
+field on `OpenAIProvider` (or a new constructor) that injects these.
 
-Phase 3.5 added response-side `thoughtsTokenCount` parsing. The
-request-side `generationConfig.thinkingConfig: { thinking_budget: N }`
-that lets callers ask Gemini 2.5 to think is still unwired. Maps from
-`ReasoningConfig.effort` like the Anthropic budget does.
+### Anthropic beta headers
 
-## Unwired request fields
+Several Anthropic features (computer use beta, fine-grained tool
+streaming) require an `anthropic-beta` header. Similar treatment to
+OpenAI org headers — an optional list of beta IDs on
+`AnthropicViaVertexProvider`.
 
-These reach `LLMRequest` but no provider serializes them:
+### Computer-use parameters
 
-- `LLMRequest::stop` — Gemini's `stopSequences`, OpenAI's `stop`,
-  Anthropic's `stop_sequences`. None of the three providers thread it
-  through.
-- `LLMRequest::presence_penalty` / `frequency_penalty` — supported by
-  OpenAI (non-reasoning models) and Gemini, ignored today.
-
-## Other provider feature gaps
-
-- **OpenAI `OpenAI-Organization` / `OpenAI-Project` headers**:
-  optional, but multi-org / project-scoped keys won't work without
-  them.
-- **Anthropic `anthropic-beta` headers**: required for several beta
-  features (computer use, fine-grained tool streaming).
-- **Gemini `toolConfig`**: forced tool mode (`AUTO` / `ANY` / `NONE`)
-  isn't exposed. The `ToolChoice` enum on `LLMRequest` is wired only
-  on OpenAI; Anthropic and Gemini still ignore it.
-- **Gemini structured output**: `responseMimeType` / `responseSchema`
-  (JSON-mode equivalent) — no surface.
+`ProviderBuiltin::ComputerUse` currently emits the bare type marker.
+The real wire shape on OpenAI takes `display_width`, `display_height`,
+`environment`; Anthropic takes similar fields. Either expand the
+variant to carry a config struct or add a separate
+`ComputerUseConfig` parameter.
 
 ## Testing gaps
 
@@ -98,6 +56,11 @@ These reach `LLMRequest` but no provider serializes them:
   multi-region URL handling has unit-test coverage but no captured
   trace pins it against the real provider. Blocked on the same Model
   Garden access as the regional Anthropic captures.
-- **Real multi-modal captures**: nothing exercises image / audio /
-  document input against real APIs yet — only synthetic round-trip
-  via `Tool::Function` paths.
+- **Real multi-modal captures**: `UserPart::Image/Audio/Document` are
+  wired through all three providers but no captured scenario
+  exercises them against real APIs yet. The capture binary
+  (`examples/capture_traces.rs`) and scenarios.json schema would need
+  a way to express inline base64 bytes for a scenario message.
+- **Provider-builtin captures**: `Tool::Builtin(WebSearch)` etc.
+  produce the right wire shape per provider but no captured scenario
+  exercises a real web-search round-trip.

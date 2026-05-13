@@ -1,23 +1,23 @@
 PartStart[0] text
 Delta[0] "###"
 Delta[0] " The"
-Delta[0] " Fasc"
-Delta[0] "inating"
 Delta[0] " History"
 Delta[0] " of"
 Delta[0] " Clouds"
+Delta[0] ":"
+Delta[0] " An"
+Delta[0] " E"
+Delta[0] "volving"
+Delta[0] " Understanding"
 Delta[0] "\n\n"
 Delta[0] "Cloud"
 Delta[0] "s"
-Delta[0] " have"
-Delta[0] " captivated"
-Delta[0] " human"
-Delta[0] " imagination"
-Delta[0] " and"
-Delta[0] " influenced"
+Delta[0] ","
+Delta[0] " those"
+Delta[0] " ephemeral"
 PartEnd[0]
 Done finish=Length input=<n> output=<n>
 
 === final ===
 finish=Length
-output[0].part[0] text "### The Fascinating History of Clouds\n\nClouds have captivated human imagination and influenced" annotations=0
+output[0].part[0] text "### The History of Clouds: An Evolving Understanding\n\nClouds, those ephemeral" annotations=0

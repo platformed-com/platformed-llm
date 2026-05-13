@@ -1,12 +1,12 @@
 {
-  "captured_at_unix": 1778686035,
+  "captured_at_unix": 1778687601,
   "endpoint": "https://api.openai.com/v1/responses",
   "expect_failure": true,
   "headers": {
     "content-type": "text/plain",
-    "x-request-id": "req_639195e0e2db451ebe5f3b79d9b18ec5"
+    "x-request-id": "req_eb2de5f186834feba2c3c05f75966f6a"
   },
-  "latency_ms": 224,
+  "latency_ms": 261,
   "model": "gpt-4o-mini",
   "provider": "openai",
   "response_bytes": 271,

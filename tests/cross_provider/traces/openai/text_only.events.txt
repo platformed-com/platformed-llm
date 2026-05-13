@@ -1,9 +1,8 @@
 PartStart[0] text
 Delta[0] "Hello"
-Delta[0] "."
 PartEnd[0]
 Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
-output[0].part[0] text "Hello." annotations=0
+output[0].part[0] text "Hello" annotations=0
