@@ -1,24 +1,35 @@
 # Follow-ups
 
-Tracked work deferred from the testability + bug-fix sweep that finished in
-the cae938b…HEAD range. Items here are intentionally skipped, not forgotten.
-Delete sections as they land.
+Tracked work deferred from the testability + bug-fix sweep, the trace-
+capture work, and the Transport refactor. Items here are intentionally
+skipped, not forgotten. Delete sections as they land.
 
-## Phase 1.6 — Vertex multi-region host patterns
+## Phase 1.6 — Vertex multi-region host URLs
 
-`src/providers/vertex/transport.rs::default_host` already special-cases
-`location == "global"` (uses the unprefixed `aiplatform.googleapis.com`).
-Multi-region aliases (`us`, `eu`) currently fall through to the regional
-pattern and produce hosts like `us-aiplatform.googleapis.com`, which
-likely don't resolve. Vertex docs suggest the correct pattern is
-`aiplatform.{us,eu}.rep.googleapis.com`.
+`src/providers/vertex/endpoint.rs::default_host` knows two URL shapes:
+
+- `location == "global"` → `aiplatform.googleapis.com` (unprefixed).
+- any other value → `{location}-aiplatform.googleapis.com` (regional
+  pattern).
+
+Vertex also accepts two **multi-region** location codes — `us` and `eu` —
+that route across data centers in those continents. These need a third
+URL pattern: `aiplatform.{us,eu}.rep.googleapis.com`. Today they fall
+through to the regional branch and produce `us-aiplatform.googleapis.com`
+/ `eu-aiplatform.googleapis.com`, neither of which resolves.
 
 **Plan**:
 1. Verify the exact host pattern against current Vertex AI docs (or hit
    it from a project that has multi-region routing enabled).
-2. Extend `default_host` with `match location { "us" | "eu" => …, "global"
-   => …, regional => … }`.
-3. Add parametric tests in `transport::tests` covering each branch.
+2. Extend `default_host`:
+   ```rust
+   match location {
+       "global"     => "https://aiplatform.googleapis.com",
+       "us" | "eu"  => format!("https://aiplatform.{location}.rep.googleapis.com"),
+       region       => format!("https://{region}-aiplatform.googleapis.com"),
+   }
+   ```
+3. Add parametric tests in `endpoint::tests` covering each branch.
 
 ## Phase 5 — breaking API redesign
 
@@ -69,7 +80,11 @@ Currently `Error::Provider { provider, message }` swallows the HTTP
 status and the structured provider error body, and `Error::Auth(String)`
 / `Error::Streaming(String)` are stringly typed. After the OpenAI
 typed-error work in Phase 2.6, the variant shapes are inconsistent
-across providers.
+across providers — and the Vertex providers (Google, Anthropic) still
+collapse every non-2xx into `Error::Provider("Google", "API error: …")`
+even though the captured 401 body contains `"status": "UNAUTHENTICATED"`
+and the 404 contains `"status": "NOT_FOUND"` — easy mappings to
+`Error::Auth` / `Error::ModelNotAvailable` once the shape allows it.
 
 **Plan**:
 ```rust
@@ -86,7 +101,9 @@ pub enum Error {
 ```
 
 All three provider error mappers route into these variants; consumers
-get `retry_after` / `retryable` for free.
+get `retry_after` / `retryable` for free. Once landed, `error_traces_e2e`
+should tighten to assert `Error::Auth` on Vertex 401 instead of accepting
+any `Error::Provider`.
 
 ### Response::collect()
 
@@ -109,9 +126,10 @@ breaking change. Replace with explicit re-exports of named items.
 
 `src/factory.rs::ProviderConfig::from_env` has ~60 lines of
 credential-sniffing fallbacks that try to guess the provider type from
-which env var happens to be set. Drop the fallback; require
-`PROVIDER_TYPE` to be set explicitly. Document the four envs each
-provider reads.
+which env var happens to be set. The behaviour is now pinned by 9 unit
+tests but it's still ambiguous from the user side. Drop the fallback;
+require `PROVIDER_TYPE` to be set explicitly. Document the four envs
+each provider reads. Tests update with the simplification.
 
 ## Reasoning / thinking gaps
 
@@ -146,7 +164,8 @@ Easy fix once decided whether to wire them or remove them from
 
 - **OpenAI refusal handling**: `response.refusal.delta` / `.done` events
   are silently dropped. Should surface as a typed `StreamEvent::Refusal`
-  (or fold into `Error::ContentFilter`).
+  (or fold into `Error::ContentFilter`). No captured trace currently
+  exercises a refusal — needs a prompt that elicits one reliably.
 - **OpenAI `OpenAI-Organization` / `OpenAI-Project` headers**: optional,
   but multi-org / project-scoped keys won't work without them.
 - **Anthropic `cache_control: Ephemeral`** on tools / system / message
@@ -161,52 +180,64 @@ Easy fix once decided whether to wire them or remove them from
 
 ## Testing gaps
 
-Done in the testing-gap sweep:
+Done during the sweep:
 
-- OpenAI HTTP error mapping is e2e-tested (`tests/http_errors_e2e.rs`)
-  — 429 → `Error::RateLimit` (with and without `Retry-After`), 401 →
-  `Error::Auth`, 500 + non-JSON bodies → `Error::Provider`, all
-  through real wiremock + `generate()`.
-- Cancellation: `tests/cancellation.rs` stands up a raw
+- **HTTP error mapping (OpenAI, synthetic)**: `tests/http_errors_e2e.rs`
+  — 429 with/without `Retry-After`, 401, 500, non-JSON 5xx, all through
+  `generate()` via an in-process `StaticTransport`.
+- **HTTP error mapping (real captures)**: `tests/error_traces_e2e.rs`
+  walks captures with `meta.status != 200`, replays each through the
+  matching provider via `StaticTransport`, and asserts the typed
+  `Error` variant matches expectations.
+- **Cancellation**: `tests/cancellation.rs` stands up a raw
   `tokio::net::TcpListener`, sends one chunked SSE event, then verifies
   that dropping the `Response` mid-stream produces a peer FIN observed
-  via `read() == Ok(0)` on the server side.
-- SSE parser chunk-boundary invariant: `sse_stream.rs::tests`
+  via `read() == Ok(0)`.
+- **SSE parser chunk-boundary invariant**: `sse_stream.rs::tests`
   exhaustively splits a synthetic corpus byte-by-byte and across
   randomized chunk patterns, plus a real captured trace, and asserts
   the event sequence is identical to the single-chunk baseline.
-- Unified-event snapshots: `tests/snapshot_traces.rs` replays each
-  captured trace through the provider pipeline and diffs the produced
-  `Vec<StreamEvent>` against a checked-in `.events.txt`. Volatile IDs
-  are masked to `<id-N>` so wire-shape regressions show up cleanly in
-  the PR diff. `UPDATE_SNAPSHOTS=1` regenerates.
-- Real-API scenario coverage broadened: scenario schema now supports
-  per-provider overrides (`model`, `auth_override`, `extra_body`,
-  `skip`), `expect_failure`, and richer message shapes (assistant
-  `tool_calls`, `tool` role). New captures cover `multi_turn_tool`,
-  `length_limit`, `parallel_tools`, `reasoning_request` (OpenAI
-  gpt-5-mini), `auth_error` (real 401 envelopes), and
-  `model_not_found` (real 4xx envelopes).
-- Real error-path captures with typed-error verification:
-  `tests/error_traces_e2e.rs` walks captures with `meta.status != 200`,
-  replays each through the matching provider's `generate()` via
-  wiremock with the captured status + body, and asserts the typed
-  `Error` variant matches expectations. `http_errors_e2e.rs` covers
-  the same parser against synthetic bodies.
+- **Unified-event + final-response snapshots**: `tests/snapshot_traces.rs`
+  replays each captured trace through the full provider pipeline and
+  diffs the produced `Vec<StreamEvent>` *and* the accumulator's
+  `CompleteResponse` against a checked-in `.events.txt`. Volatile IDs
+  and usage token counts are masked so wire-shape regressions show up
+  cleanly without re-capture churn. A sanity check fails if
+  `Done.usage.input_tokens == 0` so masking can't hide a parser bug.
+  `UPDATE_SNAPSHOTS=1` regenerates.
+- **`Response::buffer` error path**: `src/response.rs::tests` covers
+  both mid-stream `Result::Err` and `StreamEvent::Error` short-
+  circuiting buffer with the underlying message preserved.
+- **`ProviderConfig::from_env`**: 9 unit tests covering each explicit
+  `PROVIDER_TYPE` path, missing-credential errors, region defaulting,
+  ADC fallback, credential-sniffing inference, and unrecognized values.
+  Uses a process-wide mutex + RAII env guard (env mutation is `unsafe`
+  since Rust 1.81).
+- **Real-API scenario coverage**: scenario schema supports per-provider
+  overrides (`model`, `auth_override`, `extra_body`, `skip`),
+  `expect_failure`, and richer message shapes (assistant `tool_calls`,
+  `tool` role). Captures cover `text_only`, `system_and_user`,
+  `function_call`, `multi_turn_tool`, `length_limit`, `parallel_tools`,
+  `reasoning_request` (OpenAI gpt-5-mini), `auth_error`, and
+  `model_not_found`.
+- **Transport-driven captures**: `cargo run --example capture_traces`
+  drives `provider.generate()` with a `RecordingTransport` that tees
+  the bytes — capturing IS the lib's full request-path test against
+  real providers. The saved `request.json` IS the lib's output.
 
 Still open:
 
-- **Anthropic captures aren't checked in** (Phase 1.6 / Vertex
-  multi-region work needed first, plus a project that has Claude
-  enabled in Vertex Model Garden). Replay/snapshot tests no-op for
-  Anthropic until then.
-- **Google / Anthropic typed-error mapping**: the Vertex providers
-  collapse every non-2xx into `Error::Provider("Google", "API
-  error: ...")` / `Error::Provider("Anthropic", ...)`. The captured
-  Vertex 401 body has `"status": "UNAUTHENTICATED"` and a 404 has
-  `"status": "NOT_FOUND"` — easy mappings to `Error::Auth` /
-  `Error::ModelNotAvailable` once the Phase 5 error redesign lands.
-- **OpenAI `response.refusal.delta` / `.done`**: still dropped; the
-  captured suite doesn't currently hit a real refusal scenario. Worth
-  adding once we have a prompt that reliably elicits one without
-  poking the policy boundaries.
+- **Anthropic real captures**: project needs Claude enabled in Vertex
+  Model Garden. Replay/snapshot tests no-op for Anthropic until then.
+  Anthropic integration coverage today is `function_calling_e2e` against
+  hand-authored fixtures + provider unit tests only.
+- **Vertex typed-error mapping**: error_traces_e2e accepts any
+  `Error::Provider` for Vertex 4xx because the provider doesn't map
+  the structured `google.rpc.Status` envelope. Tightens to assert
+  `Error::Auth` / `Error::ModelNotAvailable` once the Phase 5 error
+  redesign lands.
+- **OpenAI refusal coverage**: still untested; needs a prompt that
+  reliably elicits a refusal without poking policy boundaries.
+- **Multi-region Vertex host URLs**: see Phase 1.6 above. Test coverage
+  exists for `global` and regional patterns; the multi-region
+  (`us`, `eu`) pattern would land alongside the implementation fix.
