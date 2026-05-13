@@ -18,6 +18,11 @@ pub struct GoogleRequest {
     pub system_instruction: Option<GoogleContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_config: Option<GoogleToolConfig>,
+    /// Reference to a pre-created `CachedContent` resource on Vertex.
+    /// When set, Vertex looks up the cached prefix and elides the
+    /// message history that produced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_content: Option<String>,
 }
 
 /// Gemini `toolConfig`. Forces or disables tool calling per request.

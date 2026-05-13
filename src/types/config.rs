@@ -70,6 +70,11 @@ pub enum ReasoningSummary {
 pub enum ProviderContinuation {
     /// OpenAI Responses API `previous_response_id`.
     OpenAI { response_id: String },
+    /// Gemini `cachedContent` resource name (pre-created via the
+    /// Vertex AI CachedContent API). When the next request targets the
+    /// same Gemini deployment, Vertex looks up the cached prefix and
+    /// elides the message history that produced it.
+    Gemini { cached_content: String },
 }
 
 /// Strategy for how the model should use available tools.

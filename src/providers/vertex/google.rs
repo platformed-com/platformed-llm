@@ -350,12 +350,20 @@ impl GoogleProvider {
                     },
                 });
 
+        let cached_content = match &request.continuation {
+            Some(crate::types::ProviderContinuation::Gemini { cached_content }) => {
+                Some(cached_content.clone())
+            }
+            _ => None,
+        };
+
         let google_request = GoogleRequest {
             contents,
             generation_config,
             tools,
             system_instruction,
             tool_config,
+            cached_content,
         };
 
         Ok(google_request)
@@ -804,5 +812,35 @@ mod tests {
         let body = provider().convert_request(&req).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["tools"], serde_json::json!([{ "codeExecution": {} }]));
+    }
+
+    #[test]
+    fn cached_content_continuation_threaded_through_request() {
+        use crate::types::ProviderContinuation;
+        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
+            .continuation(ProviderContinuation::Gemini {
+                cached_content: "projects/p/locations/l/cachedContents/abc".to_string(),
+            });
+        let body = provider().convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["cachedContent"],
+            "projects/p/locations/l/cachedContents/abc",
+        );
+    }
+
+    /// An OpenAI continuation is ignored by Gemini — the model-
+    /// switching contract: hints from the wrong provider degrade
+    /// silently to a full-history request.
+    #[test]
+    fn openai_continuation_ignored_by_gemini() {
+        use crate::types::ProviderContinuation;
+        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
+            .continuation(ProviderContinuation::OpenAI {
+                response_id: "resp_abc".to_string(),
+            });
+        let body = provider().convert_request(&req).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(json.get("cachedContent").is_none());
     }
 }

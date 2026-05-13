@@ -16,6 +16,9 @@ use crate::{Error, LLMRequest, Response, StreamEvent};
 pub struct AnthropicViaVertexProvider {
     endpoint: VertexEndpoint,
     transport: Transport,
+    /// Comma-separated `anthropic-beta` header values. Used to opt into
+    /// beta features (computer use, fine-grained tool streaming, etc.).
+    beta: Vec<String>,
 }
 
 impl AnthropicViaVertexProvider {
@@ -24,6 +27,7 @@ impl AnthropicViaVertexProvider {
         Ok(Self {
             endpoint: VertexEndpoint::with_access_token(project_id, location, access_token),
             transport: Transport::reqwest()?,
+            beta: Vec::new(),
         })
     }
 
@@ -38,6 +42,7 @@ impl AnthropicViaVertexProvider {
             endpoint: VertexEndpoint::with_access_token(project_id, location, access_token)
                 .with_base_url(base_url),
             transport: Transport::reqwest()?,
+            beta: Vec::new(),
         })
     }
 
@@ -46,13 +51,26 @@ impl AnthropicViaVertexProvider {
         Ok(Self {
             endpoint: VertexEndpoint::with_adc(project_id, location).await?,
             transport: Transport::reqwest()?,
+            beta: Vec::new(),
         })
     }
 
     /// Create a new Anthropic provider with a caller-supplied [`Transport`]
     /// and pre-built [`VertexEndpoint`].
     pub fn with_transport(endpoint: VertexEndpoint, transport: Transport) -> Self {
-        Self { endpoint, transport }
+        Self {
+            endpoint,
+            transport,
+            beta: Vec::new(),
+        }
+    }
+
+    /// Opt into Anthropic beta features. Each `beta_id` (e.g.
+    /// `"computer-use-2025-01-24"`) appears as a comma-separated value
+    /// in the `anthropic-beta` header.
+    pub fn with_beta(mut self, beta_ids: impl IntoIterator<Item = String>) -> Self {
+        self.beta.extend(beta_ids);
+        self
     }
 
     /// Convert internal request to Anthropic format.
@@ -365,12 +383,16 @@ impl LLMProvider for AnthropicViaVertexProvider {
         );
 
         let body = serde_json::to_vec(&anthropic_request)?;
+        let mut headers = vec![
+            self.endpoint.auth_header().await?,
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        if !self.beta.is_empty() {
+            headers.push(("anthropic-beta".to_string(), self.beta.join(",")));
+        }
         let req = TransportRequest {
             url,
-            headers: vec![
-                self.endpoint.auth_header().await?,
-                ("Content-Type".to_string(), "application/json".to_string()),
-            ],
+            headers,
             body,
         };
         let response = self.transport.send(req).await?;

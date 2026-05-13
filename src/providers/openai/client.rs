@@ -12,6 +12,10 @@ pub struct OpenAIProvider {
     transport: Transport,
     api_key: String,
     base_url: String,
+    /// Optional `OpenAI-Organization` header value for multi-org keys.
+    organization: Option<String>,
+    /// Optional `OpenAI-Project` header value for project-scoped keys.
+    project: Option<String>,
 }
 
 impl OpenAIProvider {
@@ -21,6 +25,8 @@ impl OpenAIProvider {
             transport: Transport::reqwest()?,
             api_key,
             base_url: "https://api.openai.com/v1".to_string(),
+            organization: None,
+            project: None,
         })
     }
 
@@ -30,6 +36,8 @@ impl OpenAIProvider {
             transport: Transport::reqwest()?,
             api_key,
             base_url,
+            organization: None,
+            project: None,
         })
     }
 
@@ -41,7 +49,22 @@ impl OpenAIProvider {
             transport,
             api_key,
             base_url,
+            organization: None,
+            project: None,
         }
+    }
+
+    /// Attach an `OpenAI-Organization` header. Required for keys that
+    /// have access to multiple organizations.
+    pub fn with_organization(mut self, organization: impl Into<String>) -> Self {
+        self.organization = Some(organization.into());
+        self
+    }
+
+    /// Attach an `OpenAI-Project` header. Required for project-scoped keys.
+    pub fn with_project(mut self, project: impl Into<String>) -> Self {
+        self.project = Some(project.into());
+        self
     }
 
     /// Convert internal request to OpenAI Responses API format.
@@ -734,15 +757,22 @@ impl LLMProvider for OpenAIProvider {
         );
 
         let body = serde_json::to_vec(&openai_request)?;
+        let mut headers = vec![
+            (
+                "Authorization".to_string(),
+                format!("Bearer {}", self.api_key),
+            ),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        if let Some(org) = &self.organization {
+            headers.push(("OpenAI-Organization".to_string(), org.clone()));
+        }
+        if let Some(project) = &self.project {
+            headers.push(("OpenAI-Project".to_string(), project.clone()));
+        }
         let req = TransportRequest {
             url: format!("{}/responses", self.base_url),
-            headers: vec![
-                (
-                    "Authorization".to_string(),
-                    format!("Bearer {}", self.api_key),
-                ),
-                ("Content-Type".to_string(), "application/json".to_string()),
-            ],
+            headers,
             body,
         };
         let response = self.transport.send(req).await?;
