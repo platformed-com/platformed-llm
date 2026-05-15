@@ -62,14 +62,13 @@ const TOOL_CALL_CLOSE: &str = "</tool_call>";
 /// </tools>
 /// ```
 #[derive(Debug, Clone, Default)]
-pub struct ChatMlTemplate {
-    _priv: (),
-}
+#[non_exhaustive]
+pub struct ChatMlTemplate;
 
 impl ChatMlTemplate {
     /// Construct a default ChatML template.
     pub fn new() -> Self {
-        Self { _priv: () }
+        Self
     }
 }
 
@@ -157,15 +156,27 @@ fn render_assistant_turn(out: &mut String, parts: &[AssistantPart]) {
             AssistantPart::ToolCall(call) => {
                 out.push_str(TOOL_CALL_OPEN);
                 out.push('\n');
-                // Re-encode as the {"name", "arguments"} shape the
-                // template advertises. `arguments` is already JSON
-                // text — splice it in raw rather than re-quoting.
-                let args = if call.arguments.trim().is_empty() {
-                    "{}".to_string()
+                // Serialise the {"name","arguments"} block via serde
+                // so `name` is correctly escaped and `arguments` is
+                // spliced as a real JSON value (not string-formatted,
+                // which broke on names containing `"`/`\` and on
+                // non-JSON arguments).
+                #[derive(Serialize)]
+                struct ToolCallLine<'a> {
+                    name: &'a str,
+                    arguments: &'a RawValue,
+                }
+                let empty = RawValue::from_string("{}".to_string()).unwrap();
+                let args: &RawValue = if call.arguments.trim().is_empty() {
+                    &empty
                 } else {
-                    call.arguments.clone()
+                    serde_json::from_str::<&RawValue>(&call.arguments).unwrap_or(&empty)
                 };
-                let line = format!(r#"{{"name": "{}", "arguments": {}}}"#, call.name, args);
+                let line = serde_json::to_string(&ToolCallLine {
+                    name: &call.name,
+                    arguments: args,
+                })
+                .unwrap_or_else(|_| r#"{"name":"","arguments":{}}"#.to_string());
                 out.push_str(&line);
                 out.push('\n');
                 out.push_str(TOOL_CALL_CLOSE);
@@ -324,8 +335,12 @@ fn parse_tool_call(json: &str) -> Option<ParsedDelta> {
     #[derive(serde::Deserialize)]
     struct Wire {
         name: String,
+        // Capture as RawValue so the model's exact argument bytes
+        // (key order, number formatting) pass through verbatim to
+        // the tool — re-serialising via serde_json::Value would
+        // reorder/normalise them.
         #[serde(default)]
-        arguments: serde_json::Value,
+        arguments: Option<Box<RawValue>>,
     }
     let body = json.trim();
     let parsed: Wire = match serde_json::from_str(body) {
@@ -335,10 +350,10 @@ fn parse_tool_call(json: &str) -> Option<ParsedDelta> {
             return None;
         }
     };
-    let arguments = if parsed.arguments.is_null() {
-        "{}".to_string()
-    } else {
-        parsed.arguments.to_string()
+    let arguments = match parsed.arguments {
+        None => "{}".to_string(),
+        Some(rv) if rv.get().trim() == "null" => "{}".to_string(),
+        Some(rv) => rv.get().to_string(),
     };
     Some(ParsedDelta::ToolCall {
         name: parsed.name,
@@ -433,7 +448,7 @@ mod tests {
             .with_tool_result("call_0", "sunny");
         let out = ChatMlTemplate::new().render(&p, &[], None);
         assert!(out.contains(r#"<tool_call>"#));
-        assert!(out.contains(r#"{"name": "get_weather", "arguments": {"city":"Paris"}}"#));
+        assert!(out.contains(r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#));
         assert!(out.contains("<tool_response>\nsunny\n</tool_response>"));
     }
 

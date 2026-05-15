@@ -28,9 +28,15 @@ use llama_gguf::engine::Engine;
 pub trait LocalEngine: Send + Sync {
     /// Generate up to `max_tokens` tokens for `prompt`. Each
     /// `Ok(String)` yielded by the iterator is one decoded token or
-    /// multi-token chunk (the engine decides). Dropping the iterator
-    /// before exhaustion is the cancellation contract — implementors
-    /// should stop work as soon as their internals notice the drop.
+    /// multi-token chunk (the engine decides).
+    ///
+    /// Cancellation: the provider stops pulling and drops the
+    /// iterator when the consumer goes away. Because inference is
+    /// synchronous and uninterruptible *within* a token, cancellation
+    /// takes effect at the next token boundary — i.e. at most one
+    /// in-flight token's worth of compute is wasted, not an unbounded
+    /// amount. Implementors should drop cleanly between tokens; no
+    /// finer-grained interruption is required (or expected).
     fn generate_streaming<'a>(
         &'a self,
         prompt: &str,

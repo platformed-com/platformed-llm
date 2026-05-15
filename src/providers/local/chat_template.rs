@@ -149,6 +149,13 @@ pub enum Segment {
 /// of `marker`. Holds back the last `marker.len() - 1` bytes, clamped
 /// down to a char boundary so a multi-byte UTF-8 sequence is never
 /// split. `0` means "withhold everything for now".
+///
+/// Precondition: `marker` is ASCII (true for all delimiters this
+/// crate uses). A multibyte `marker` could under-hold — a partial
+/// multibyte delimiter straddling a chunk boundary might leak as
+/// text and then never re-match. `scan_delimited` only takes
+/// `&'static str` delimiters chosen by template authors, so this is
+/// a documented contract, not a runtime check.
 fn safe_prefix_end(buf: &str, marker: &str) -> usize {
     let hold = marker.len().saturating_sub(1);
     let mut end = buf.len().saturating_sub(hold);

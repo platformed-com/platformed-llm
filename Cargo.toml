@@ -100,7 +100,7 @@ anthropic-vertex = ["vertex"]
 # Local provider — embedded GGUF inference via the `llama-gguf` crate.
 # Enables `tokio/rt` so we can shuttle synchronous inference onto
 # `spawn_blocking`; `async-stream` powers the token-decode pipeline.
-llama-gguf = ["dep:llama-gguf", "dep:async-stream", "tokio/rt"]
+llama-gguf = ["dep:llama-gguf", "dep:async-stream", "tokio/rt", "tokio/sync"]
 
 # Internal: gate for the `fetch-test-models` binary. Pulls in
 # `rustls-tls` + a multi-thread Tokio runtime so the bin can make

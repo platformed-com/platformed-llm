@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::channel::{mpsc, oneshot};
+use futures::channel::oneshot;
 use llama_gguf::engine::EngineConfig;
 
 use crate::provider::Provider;
@@ -101,6 +101,16 @@ impl LlamaGgufProvider {
     /// [`ChatMlTemplate`]; override when the loaded model was trained
     /// against a different chat format (e.g. Llama 3 instruct, raw
     /// completion).
+    ///
+    /// Caveat: the underlying `llama_gguf::Engine` runs its own
+    /// `wrap_prompt` on the rendered string, which is a no-op only
+    /// when the string already contains a recognised marker
+    /// (`<|im_start|>`, `<|user|>`, `[INST]`). `ChatMlTemplate`
+    /// emits `<|im_start|>` so it's safe. A custom template whose
+    /// output contains none of those markers (e.g. a raw-completion
+    /// or Llama-3 `<|start_header_id|>` template) will be *re-wrapped*
+    /// by the engine — include a recognised marker in the rendered
+    /// output, or load the GGUF with a chat template that no-ops.
     pub fn with_chat_template(mut self, template: Arc<dyn ChatTemplate>) -> Self {
         self.template = template;
         self
@@ -136,15 +146,18 @@ impl Provider for LlamaGgufProvider {
         let engine = self.engine.clone();
 
         // The llama-gguf streaming iterator is synchronous (it does
-        // tensor math on the calling thread). Push it onto a
-        // `spawn_blocking` worker and bridge into the async world via
-        // an unbounded mpsc channel — dropping `tx` at the end of the
-        // task is what signals end-of-stream to the receiver. The
+        // tensor math on the calling thread). Run it on a
+        // `spawn_blocking` worker and bridge into async via a
+        // *bounded* tokio mpsc: `blocking_send` parks the worker when
+        // the consumer falls behind (backpressure — no unbounded
+        // buffering) and returns `Err` *immediately* if the receiver
+        // is dropped, even while parked, so cancellation is observed
+        // promptly (worst case: one in-flight token's compute). The
         // `reason` oneshot carries the finish reason out-of-band so
         // the terminal `Done` reports `Length` vs `Stop` truthfully
         // (llama-gguf's iterator ends identically for EOS and the
         // max_tokens cap, so we infer it from the token budget).
-        let (mut tx, rx) = mpsc::unbounded::<Result<String, Error>>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, Error>>(32);
         let (reason_tx, reason_rx) = oneshot::channel::<FinishReason>();
         tokio::task::spawn_blocking(move || {
             let stream = engine.generate_streaming(&prompt_text, max_tokens);
@@ -153,16 +166,15 @@ impl Provider for LlamaGgufProvider {
                 let item =
                     tok.map_err(|e| Error::provider("llama-gguf", format!("generation: {e}")));
                 let is_err = item.is_err();
-                // `unbounded_send` only errors when the receiver was
-                // dropped — the consumer abandoned us; stop generating
-                // (no finish reason: nobody is listening).
-                if tx.start_send(item).is_err() {
+                // Err here ⇒ receiver dropped (consumer abandoned us)
+                // ⇒ stop generating; nobody is listening for a reason.
+                if tx.blocking_send(item).is_err() {
                     return;
                 }
                 if is_err {
-                    // Error already forwarded; `translate_to_events`
+                    // Error already forwarded; translate_to_events
                     // suppresses the trailing Done on error, so the
-                    // finish reason is moot — drop `reason_tx`.
+                    // finish reason is moot — drop reason_tx.
                     return;
                 }
                 emitted += 1;
@@ -178,14 +190,21 @@ impl Provider for LlamaGgufProvider {
                 FinishReason::Stop
             };
             let _ = reason_tx.send(reason);
-            // tx drops here; rx sees end-of-stream on next poll.
+            // tx drops here; rx sees end-of-stream on next recv.
+        });
+
+        // Adapt the tokio Receiver into a futures Stream (no
+        // tokio-stream dep needed). `recv().await` yields None once
+        // the worker's `tx` drops → clean end-of-stream.
+        let token_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
         });
 
         // Chain: tokens → ParsedDelta → StreamEvent (+ trailing Done
         // carrying the engine-reported finish reason). The decode
         // stages are `stream!` generators in `chat_template`; this
         // provider is purely glue.
-        let tokens: TokenStream = Box::pin(rx);
+        let tokens: TokenStream = Box::pin(token_stream);
         let events = translate_to_events(self.template.decode(tokens), Some(reason_rx));
 
         Ok(Response::from_stream(events))
