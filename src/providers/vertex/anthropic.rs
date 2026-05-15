@@ -207,7 +207,7 @@ impl AnthropicViaVertexProvider {
         let anthropic_request = AnthropicRequest {
             messages,
             max_tokens: config.max_tokens.unwrap_or(1024),
-            anthropic_version: "vertex-2023-10-16".to_string(),
+            anthropic_version: "vertex-2023-10-16",
             system: system_message,
             temperature,
             top_p: config.top_p,

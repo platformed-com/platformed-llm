@@ -112,8 +112,12 @@ impl GoogleProvider {
         // First pass: collect the assistant turns' tool_call name + id
         // pairs so we can echo them back on the corresponding user
         // ToolResult (Gemini's `functionResponse` part requires the
-        // function name on the wire).
-        for item in active_messages {
+        // function name on the wire). Scan the *full* history, not
+        // just `active_messages`: a continuation can elide the
+        // assistant turn that made the call while the first
+        // non-elided user item is its ToolResult — the name still
+        // has to resolve.
+        for item in messages {
             if let InputItem::Assistant { content } = item {
                 for part in content {
                     if let AssistantPart::ToolCall(call) = part {
@@ -126,6 +130,13 @@ impl GoogleProvider {
         for item in active_messages {
             match item {
                 InputItem::System(content) => {
+                    // `role: "system"` here is confirmed accepted by
+                    // the live Vertex API — see the captured real
+                    // exchange in
+                    // tests/cross_provider/traces/google/system_and_user.*
+                    // (request sends this shape; response is a valid
+                    // 200). Don't "fix" to drop the role without a
+                    // fresh capture proving it's required.
                     system_instruction = Some(GoogleContent {
                         role: "system".to_string(),
                         parts: vec![GooglePart::Text {
@@ -144,18 +155,24 @@ impl GoogleProvider {
                                 );
                             }
                             UserPart::ToolResult { call_id, content } => {
-                                let function_name = call_id_to_name
-                                    .get(call_id.as_str())
-                                    .ok_or_else(|| {
-                                        Error::provider(
-                                            "Google",
-                                            format!(
-                                                "ToolResult references unknown call_id \
-                                                 {call_id:?} — no prior tool_call matches",
-                                            ),
-                                        )
-                                    })?
-                                    .to_string();
+                                // No matching tool_call anywhere in
+                                // history (e.g. the originating call
+                                // was a provider-builtin dropped on a
+                                // cross-provider switch). Skip the
+                                // orphaned result with a warning rather
+                                // than hard-erroring the whole request
+                                // — matches the model-switching "drop
+                                // what doesn't translate" contract.
+                                let Some(function_name) =
+                                    call_id_to_name.get(call_id.as_str()).map(|s| s.to_string())
+                                else {
+                                    tracing::warn!(
+                                        call_id = %call_id,
+                                        "Gemini: dropping ToolResult with no matching \
+                                         tool_call (orphaned across model switch?)",
+                                    );
+                                    continue;
+                                };
                                 let output_text = flatten_user_parts_to_text(content);
                                 push_part(
                                     &mut contents,
@@ -591,12 +608,19 @@ enum GoogleSlot {
 #[derive(Debug)]
 pub(crate) struct GoogleStreamState {
     tracker: crate::providers::part_tracker::PartTracker<GoogleSlot>,
+    /// Index of the most recently opened text part, retained even
+    /// after it's closed. Gemini batches grounding metadata onto the
+    /// final chunk; if a function call / code execution interleaved
+    /// and closed the text part, the citation target would otherwise
+    /// be lost (`index_of(Text)` is `None` at finish).
+    last_text_index: Option<u32>,
 }
 
 impl Default for GoogleStreamState {
     fn default() -> Self {
         Self {
             tracker: crate::providers::part_tracker::PartTracker::new(),
+            last_text_index: None,
         }
     }
 }
@@ -607,6 +631,7 @@ impl GoogleStreamState {
             return idx;
         }
         let (idx, ev) = self.tracker.open(GoogleSlot::Text, PartKind::Text);
+        self.last_text_index = Some(idx);
         out.push(ev);
         idx
     }
@@ -643,29 +668,31 @@ impl GoogleStreamState {
         out: &mut Vec<StreamEvent>,
         call_id: String,
         name: String,
-        arguments: String,
+        mut arguments: String,
     ) {
         let events = self.tracker.open_one_shot(PartKind::ToolCall {
             call_id,
             name: name.clone(),
         });
-        // open_one_shot emits PartStart + PartEnd; insert the
-        // arguments Delta between them.
-        let mut iter = events.into_iter();
-        let start = iter.next().expect("PartStart");
-        let end = iter.next().expect("PartEnd");
-        let StreamEvent::PartStart { index, .. } = &start else {
-            unreachable!("open_one_shot first event is PartStart");
-        };
-        let index = *index;
-        out.push(start);
-        if !arguments.is_empty() {
-            out.push(StreamEvent::Delta {
-                index,
-                delta: arguments,
-            });
+        // open_one_shot emits PartStart then PartEnd; splice the
+        // arguments Delta in right after the PartStart. Forward each
+        // event and inject once, without depending (via panicking
+        // `expect`/`unreachable!`) on the exact event count — a
+        // future PartTracker change shouldn't crash the stream.
+        for ev in events {
+            if let StreamEvent::PartStart { index, .. } = &ev {
+                let index = *index;
+                out.push(ev);
+                if !arguments.is_empty() {
+                    out.push(StreamEvent::Delta {
+                        index,
+                        delta: std::mem::take(&mut arguments),
+                    });
+                }
+            } else {
+                out.push(ev);
+            }
         }
-        out.push(end);
     }
 }
 
@@ -761,10 +788,14 @@ pub(crate) fn convert_response_stateful(
             // closing it. Gemini batches grounding metadata on the final
             // chunk; we replay each support as a PartUpdate so the
             // accumulator can attach citations to AssistantPart::Text.
-            if let (Some(text_idx), Some(meta)) = (
-                state.tracker.index_of(&GoogleSlot::Text),
-                &candidate.grounding_metadata,
-            ) {
+            // Prefer the still-open text part; fall back to the last
+            // text part we opened (a tool call may have closed it
+            // before the grounding-bearing final chunk arrived).
+            let text_idx = state
+                .tracker
+                .index_of(&GoogleSlot::Text)
+                .or(state.last_text_index);
+            if let (Some(text_idx), Some(meta)) = (text_idx, &candidate.grounding_metadata) {
                 for annotation in flatten_grounding_metadata(meta) {
                     events.push(StreamEvent::PartUpdate {
                         index: text_idx,
@@ -780,8 +811,19 @@ pub(crate) fn convert_response_stateful(
             let finish_reason = match finish_reason_str.as_str() {
                 "STOP" => FinishReason::Stop,
                 "MAX_TOKENS" => FinishReason::Length,
-                "SAFETY" => FinishReason::ContentFilter,
-                _ => FinishReason::Stop, // Default to Stop for unknown reasons
+                // All of these mean "the model declined / output was
+                // suppressed", not a clean stop — surfacing them as
+                // Stop would let callers treat a censored or truncated
+                // answer as complete.
+                "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII"
+                | "IMAGE_SAFETY" => FinishReason::ContentFilter,
+                other => {
+                    tracing::warn!(
+                        finish_reason = other,
+                        "Gemini: unknown candidate finishReason; treating as Incomplete",
+                    );
+                    FinishReason::Incomplete
+                }
             };
 
             let usage = response

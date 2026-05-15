@@ -10,7 +10,7 @@ use serde_json::value::RawValue;
 pub struct AnthropicRequest {
     pub messages: Vec<AnthropicMessage>,
     pub max_tokens: u32,
-    pub anthropic_version: String, // Always "vertex-2023-10-16"
+    pub anthropic_version: &'static str, // Always "vertex-2023-10-16"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,24 +171,20 @@ pub enum AnthropicTool {
 /// (`id`, `model`, `role`, `content`, `stop_reason`) are present on
 /// the wire but stripped by serde since the streaming converter
 /// reconstructs them from the per-block events.
+// Deserialize-only: `skip_serializing_if` would be dead here.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnthropicResponse {
     /// Initial usage snapshot — Anthropic reports `input_tokens` here
     /// and accumulates `output_tokens` via `message_delta` events.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<AnthropicUsage>,
 }
 
 /// Anthropic usage information.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnthropicUsage {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u32>,
 }
 

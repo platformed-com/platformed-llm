@@ -318,6 +318,15 @@ pub struct GoogleUsageMetadata {
 
 impl From<GoogleUsageMetadata> for Usage {
     fn from(metadata: GoogleUsageMetadata) -> Self {
+        // OPEN QUESTION (needs live-API verification, not resolvable
+        // offline): does `candidatesTokenCount` already include
+        // `thoughtsTokenCount` on 2.5 thinking models, or are thoughts
+        // billed as output but reported only separately? If the
+        // latter, `output_tokens` here undercounts by the thinking
+        // budget and should be `candidates + thoughts`. Left as the
+        // verbatim wire value until confirmed against a real thinking
+        // response — `reasoning_tokens` carries the breakout either
+        // way, so no information is lost.
         Usage {
             input_tokens: metadata.prompt_token_count.unwrap_or(0),
             output_tokens: metadata.candidates_token_count.unwrap_or(0),
