@@ -1,4 +1,4 @@
-#![cfg(all(feature = "openai", feature = "google", feature = "anthropic"))]
+#![cfg(all(feature = "openai", feature = "google", feature = "anthropic-vertex"))]
 //! Snapshot the unified `StreamEvent` sequence produced by replaying each
 //! captured wire trace.
 //!

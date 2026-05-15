@@ -5,15 +5,15 @@
 //!
 //! - `openai` — OpenAI Responses API (`OpenAIProvider`).
 //! - `google` — Google Gemini via Vertex AI (`GoogleProvider`).
-//! - `anthropic` — Anthropic Claude via Vertex AI
+//! - `anthropic-vertex` — Anthropic Claude via Vertex AI
 //!   (`AnthropicViaVertexProvider`).
 //! - `llama-gguf` — Local GGUF inference (`LlamaGgufProvider`).
 //!
-//! The default feature set enables `openai`, `google`, and `anthropic`.
+//! No features are enabled by default — opt in per provider.
 
 #[cfg(feature = "openai")]
 mod openai;
-#[cfg(any(feature = "openai", feature = "google", feature = "anthropic"))]
+#[cfg(any(feature = "openai", feature = "google", feature = "anthropic-vertex"))]
 pub(crate) mod part_tracker;
 #[cfg(feature = "vertex")]
 mod vertex;
@@ -23,7 +23,7 @@ pub mod local;
 
 #[cfg(feature = "openai")]
 pub use openai::OpenAIProvider;
-#[cfg(feature = "anthropic")]
+#[cfg(feature = "anthropic-vertex")]
 pub use vertex::AnthropicViaVertexProvider;
 #[cfg(feature = "google")]
 pub use vertex::GoogleProvider;
@@ -39,7 +39,7 @@ pub use local::LlamaGgufProvider;
 /// Anthropic `tool_result` block — non-text parts (images, audio,
 /// documents) have nowhere to land, so they're dropped with a
 /// `tracing::debug!` so the loss is visible in logs.
-#[cfg(any(feature = "openai", feature = "google", feature = "anthropic"))]
+#[cfg(any(feature = "openai", feature = "google", feature = "anthropic-vertex"))]
 pub(crate) fn flatten_user_parts_to_text(parts: &[crate::types::UserPart]) -> String {
     use crate::types::UserPart;
     let mut out = String::new();

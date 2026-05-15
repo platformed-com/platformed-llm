@@ -1,4 +1,4 @@
-#[cfg(feature = "anthropic")]
+#[cfg(feature = "anthropic-vertex")]
 use crate::providers::AnthropicViaVertexProvider;
 #[cfg(feature = "google")]
 use crate::providers::GoogleProvider;
@@ -212,7 +212,7 @@ impl ProviderFactory {
                  (rebuild with `--features google`)",
             )),
 
-            #[cfg(feature = "anthropic")]
+            #[cfg(feature = "anthropic-vertex")]
             ProviderType::Anthropic => {
                 let project_id = config
                     .project_id
@@ -234,10 +234,10 @@ impl ProviderFactory {
                 };
                 Ok(Box::new(provider))
             }
-            #[cfg(not(feature = "anthropic"))]
+            #[cfg(not(feature = "anthropic-vertex"))]
             ProviderType::Anthropic => Err(Error::config(
                 "Anthropic provider is not enabled in this build \
-                 (rebuild with `--features anthropic`)",
+                 (rebuild with `--features anthropic-vertex`)",
             )),
         }
     }
@@ -359,7 +359,7 @@ mod tests {
         drop(provider);
     }
 
-    #[cfg(feature = "anthropic")]
+    #[cfg(feature = "anthropic-vertex")]
     #[tokio::test]
     async fn create_anthropic_with_access_token_succeeds() {
         let config = ProviderConfig::vertex(
@@ -426,7 +426,7 @@ mod tests {
         assert!(err.to_string().contains("Location"), "got: {err}");
     }
 
-    #[cfg(feature = "anthropic")]
+    #[cfg(feature = "anthropic-vertex")]
     #[tokio::test]
     async fn create_anthropic_without_project_id_errors() {
         let config = ProviderConfig {

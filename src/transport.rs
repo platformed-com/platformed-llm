@@ -134,7 +134,7 @@ impl Transport {
     /// timeout and no whole-request timeout. Most callers want this.
     ///
     /// Available when any hosted-provider feature
-    /// (`openai` / `google` / `anthropic`) is enabled.
+    /// (`openai` / `google` / `anthropic-vertex`) is enabled.
     #[cfg(feature = "reqwest")]
     pub fn reqwest() -> Result<Self, Error> {
         Ok(Self::new(ReqwestTransport::with_default_client()?))
@@ -164,7 +164,7 @@ impl std::fmt::Debug for Transport {
 ///
 /// Available when the `reqwest` feature is enabled — implicitly the
 /// case under any hosted-provider feature (`openai`, `google`,
-/// `anthropic`).
+/// `anthropic-vertex`).
 #[cfg(feature = "reqwest")]
 pub struct ReqwestTransport {
     client: reqwest::Client,

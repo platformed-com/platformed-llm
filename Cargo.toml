@@ -20,7 +20,7 @@ thiserror = "2.0"
 
 # Optional — pulled in by specific provider features.
 # `reqwest` is the default HTTP client behind `ReqwestTransport`. Any
-# cloud provider (openai / google / anthropic) depends on it.
+# cloud provider (openai / google / anthropic-vertex) depends on it.
 reqwest = { version = "0.12", features = [
     "json",
     "stream",
@@ -59,7 +59,7 @@ required-features = ["openai"]
 
 [[example]]
 name = "simple_anthropic_test"
-required-features = ["anthropic"]
+required-features = ["anthropic-vertex"]
 
 [[example]]
 name = "vertex_unified_api"
@@ -67,7 +67,7 @@ required-features = ["vertex"]
 
 [[example]]
 name = "capture_traces"
-required-features = ["openai", "google", "anthropic"]
+required-features = ["openai", "google", "anthropic-vertex"]
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["macros", "rt", "rt-multi-thread", "process"] }
@@ -80,8 +80,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [features]
 # Nothing is on by default — downstream consumers opt into the
 # providers they need with `--features openai`, `--features
-# google,anthropic`, etc. A bare `cargo build` compiles the lib core
-# only (types, transport, accumulator).
+# google,anthropic-vertex`, etc. A bare `cargo build` compiles the
+# lib core only (types, transport, accumulator).
 default = []
 
 # Default `ReqwestTransport`. Implied by every hosted-provider feature
@@ -93,7 +93,9 @@ openai = ["reqwest", "dep:ijson"]
 # Shared base for Gemini and Claude-via-Vertex. Pulls in HTTP + Google auth.
 vertex = ["reqwest", "dep:gcp_auth", "dep:ijson", "dep:uuid"]
 google = ["vertex"]
-anthropic = ["vertex"]
+# Anthropic Claude *via Vertex* (the only Anthropic transport this
+# crate implements); named to reflect that.
+anthropic-vertex = ["vertex"]
 
 # Local provider — embedded GGUF inference via the `llama-gguf` crate.
 # Enables `tokio/rt` so we can shuttle synchronous inference onto
