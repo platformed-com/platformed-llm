@@ -959,9 +959,7 @@ impl Provider for OpenAIProvider {
 
         if !(200..300).contains(&response.status) {
             let status = response.status;
-            let retry_after = response
-                .header("retry-after")
-                .and_then(|s| s.parse::<u64>().ok());
+            let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
             let body_bytes = response.collect_body().await.unwrap_or_default();
             let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
             return Err(parse_openai_error(status, retry_after, &body_str));

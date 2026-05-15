@@ -419,6 +419,8 @@ impl Provider for AnthropicViaVertexProvider {
 
         if !(200..300).contains(&response.status) {
             let status = response.status;
+            // Read Retry-After before `collect_body` consumes the response.
+            let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
             let body_bytes = response.collect_body().await.unwrap_or_default();
             let body_text = String::from_utf8_lossy(&body_bytes);
             return Err(match status {
@@ -426,6 +428,10 @@ impl Provider for AnthropicViaVertexProvider {
                     Error::auth_with_status(status, format!("Anthropic {status}: {body_text}"))
                 }
                 404 => Error::ModelNotAvailable(format!("Anthropic 404: {body_text}")),
+                429 => Error::rate_limit(
+                    retry_after,
+                    format!("Anthropic 429 (rate limited): {body_text}"),
+                ),
                 _ => Error::provider_with_status(
                     "Anthropic",
                     status,

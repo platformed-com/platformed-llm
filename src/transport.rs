@@ -78,6 +78,20 @@ pub struct TransportResponse {
     pub body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
 }
 
+/// Parse a `Retry-After` header value into whole seconds.
+///
+/// Handles the delta-seconds form (`"30"`) that OpenAI, Anthropic and
+/// Vertex all send. The HTTP-date form is *not* parsed (returns
+/// `None`) — none of the supported providers use it; callers fall
+/// back to their own backoff when this is `None`.
+///
+/// Only the hosted providers consume this; gated to those features so
+/// a `--no-default-features` (core-only) build doesn't flag it as dead.
+#[cfg(any(feature = "openai", feature = "google", feature = "anthropic-vertex"))]
+pub(crate) fn parse_retry_after(value: Option<&str>) -> Option<u64> {
+    value.and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 impl TransportResponse {
     /// Read the value of the first header whose name (case-insensitively)
     /// equals `name`. Convenience for providers that only care about a
@@ -245,6 +259,20 @@ mod tests {
         assert_eq!(resp.header("retry-after"), Some("30"));
         assert_eq!(resp.header("RETRY-AFTER"), Some("30"));
         assert_eq!(resp.header("missing"), None);
+    }
+
+    #[cfg(any(feature = "openai", feature = "google", feature = "anthropic-vertex"))]
+    #[test]
+    fn parse_retry_after_handles_delta_seconds_and_garbage() {
+        assert_eq!(parse_retry_after(Some("30")), Some(30));
+        assert_eq!(parse_retry_after(Some("  7 ")), Some(7));
+        assert_eq!(parse_retry_after(None), None);
+        // HTTP-date form is intentionally unparsed (returns None).
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after(Some("")), None);
     }
 
     /// `Transport` is a thin newtype around `Arc<dyn TransportImpl>` —

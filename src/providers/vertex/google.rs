@@ -445,16 +445,22 @@ impl Provider for GoogleProvider {
 
         if !(200..300).contains(&response.status) {
             let status = response.status;
+            // Read Retry-After before `collect_body` consumes the response.
+            let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
             let body_bytes = response.collect_body().await.unwrap_or_default();
             let body_text = String::from_utf8_lossy(&body_bytes);
             // Vertex 4xx envelopes carry `"status": "UNAUTHENTICATED"` /
-            // `"NOT_FOUND"` — map them onto our typed variants where the
-            // mapping is clear.
+            // `"NOT_FOUND"` / `"RESOURCE_EXHAUSTED"` — map them onto our
+            // typed variants where the mapping is clear.
             return Err(match status {
                 401 | 403 => {
                     Error::auth_with_status(status, format!("Google {status}: {body_text}"))
                 }
                 404 => Error::ModelNotAvailable(format!("Google 404: {body_text}")),
+                429 => Error::rate_limit(
+                    retry_after,
+                    format!("Google 429 (RESOURCE_EXHAUSTED): {body_text}"),
+                ),
                 _ => {
                     Error::provider_with_status("Google", status, format!("API error: {body_text}"))
                 }
