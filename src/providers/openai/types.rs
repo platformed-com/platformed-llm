@@ -275,6 +275,13 @@ pub struct ResponseItem {
     /// new builtins don't fail the parse.
     #[serde(default)]
     pub action: Option<IValue>,
+    /// Complete function-call arguments JSON on the terminal
+    /// `output_item.done` frame. Used to reconcile when the
+    /// incremental `function_call_arguments.delta` stream was empty
+    /// (short calls / wire variations) — otherwise the args would be
+    /// silently lost.
+    #[serde(default)]
+    pub arguments: Option<String>,
 }
 
 /// Content item in a Responses API output. Currently only the `type`
@@ -477,6 +484,12 @@ pub enum OpenAIAnnotation {
         file_id: String,
         #[serde(default)]
         filename: Option<String>,
+        /// Byte offset in the text the citation anchors to. OpenAI's
+        /// `file_citation` is a point anchor (no span), so this maps
+        /// to a zero-width `start == end` unified annotation rather
+        /// than a misleading `0..0`.
+        #[serde(default)]
+        index: usize,
     },
     /// Unknown / future annotation variants — captured generically so
     /// new shapes don't fail the parse.

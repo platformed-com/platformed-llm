@@ -160,6 +160,21 @@ impl OpenAIProvider {
                             });
                         }
                         UserPart::ToolResult { call_id, content } => {
+                            // A user turn mixing free text with a tool
+                            // result (legitimate on Anthropic/Gemini,
+                            // and how round-tripped history can look)
+                            // is split here into ordered top-level
+                            // items: message / function_call_output /
+                            // message. This is NOT rejected — doing so
+                            // would break a unified prompt only on
+                            // OpenAI. Open question (needs live-API
+                            // verification, can't be confirmed offline):
+                            // whether the Responses API accepts that
+                            // interleaving as-is or wants the
+                            // function_call_output reordered ahead of
+                            // trailing user text. Left as-is until
+                            // verified rather than risk regressing a
+                            // working path on an unverified assumption.
                             push_user_parts(out, &mut parts);
                             out.push(OpenAIInputMessage::FunctionCallOutput {
                                 call_id: call_id.clone(),
@@ -366,12 +381,28 @@ pub(crate) fn parse_openai_error(
 /// no breakpoint is present (callers who don't opt into caching get
 /// the OpenAI default of no key).
 ///
-/// Uses a deterministic blake3-style hash via `std::hash::DefaultHasher`
-/// — stable within a single build of the consuming binary, which is
-/// the unit of deployment that wants consistent cache hits.
+/// Uses `std::hash::DefaultHasher` (SipHash-1-3, fixed seed) — stable
+/// within a single build of the consuming binary, which is the unit
+/// of deployment that wants consistent cache hits. *Not* stable
+/// across Rust/std versions; don't persist these keys.
 fn derive_prompt_cache_key(messages: &[crate::types::InputItem]) -> Option<String> {
     use crate::types::{AssistantPart, InputItem, UserPart};
     use std::hash::{Hash, Hasher};
+
+    // Common case: no breakpoint anywhere → no key, and skip hashing
+    // the entire history (this runs on every request).
+    let has_breakpoint = messages.iter().any(|item| match item {
+        InputItem::User { content } => content
+            .iter()
+            .any(|p| matches!(p, UserPart::CacheBreakpoint)),
+        InputItem::Assistant { content } => content
+            .iter()
+            .any(|p| matches!(p, AssistantPart::CacheBreakpoint)),
+        InputItem::System(_) => false,
+    });
+    if !has_breakpoint {
+        return None;
+    }
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let mut saw_breakpoint = false;
@@ -569,11 +600,15 @@ fn map_openai_annotation(a: OpenAIAnnotation) -> Option<Annotation> {
             title,
         }),
         OpenAIAnnotation::FileCitation {
-            file_id, filename, ..
+            file_id,
+            filename,
+            index,
         } => Some(Annotation {
             kind: AnnotationKind::FileCitation,
-            start: 0,
-            end: 0,
+            // Point anchor: OpenAI file citations carry a single
+            // offset, not a span. Zero-width start == end.
+            start: index,
+            end: index,
             source: file_id,
             title: filename,
         }),
@@ -608,6 +643,12 @@ pub(crate) struct OpenAIStreamState {
     /// we surface it once at end-of-stream so the marker lands *after*
     /// the assistant content in the resulting `AssistantPart` order.
     emitted_continuation: bool,
+    /// Keys of `function_call` parts that received at least one
+    /// `function_call_arguments.delta`. On `output_item.done` a key
+    /// *not* in this set means the args never streamed incrementally
+    /// — we reconcile from the item's complete `arguments` so they
+    /// aren't silently lost.
+    fn_args_streamed: std::collections::HashSet<(u32, Option<u32>)>,
 }
 
 impl OpenAIStreamState {
@@ -615,6 +656,7 @@ impl OpenAIStreamState {
         Self {
             tracker: crate::providers::part_tracker::PartTracker::new(),
             emitted_continuation: false,
+            fn_args_streamed: std::collections::HashSet::new(),
         }
     }
 
@@ -661,7 +703,19 @@ impl OpenAIStreamState {
                                 ),
                             )
                         })?;
-                        let name = item.name.unwrap_or_else(|| "unknown".to_string());
+                        // Mirror the `call_id` handling: a missing
+                        // name is a malformed item — error rather than
+                        // fabricate `"unknown"`, which would only fail
+                        // tool dispatch confusingly downstream.
+                        let name = item.name.ok_or_else(|| {
+                            Error::provider(
+                                "OpenAI",
+                                format!(
+                                    "function_call item is missing name (item id: {})",
+                                    item.id
+                                ),
+                            )
+                        })?;
                         let (_idx, ev) = self
                             .tracker
                             .open((output_index, None), PartKind::ToolCall { call_id, name });
@@ -706,6 +760,21 @@ impl OpenAIStreamState {
                         if let Some(action) = &item.action {
                             if let Ok(delta) = serde_json::to_string(action) {
                                 out.push(StreamEvent::Delta { index: idx, delta });
+                            }
+                        }
+                    }
+                    // Reconcile function-call arguments: if no
+                    // `function_call_arguments.delta` ever streamed for
+                    // this part, the complete `arguments` arrives only
+                    // here. Without this the call's arguments would be
+                    // silently empty (short calls / wire variations).
+                    if item.r#type == "function_call" && !self.fn_args_streamed.contains(&key) {
+                        if let Some(args) = item.arguments.as_deref() {
+                            if !args.is_empty() {
+                                out.push(StreamEvent::Delta {
+                                    index: idx,
+                                    delta: args.to_string(),
+                                });
                             }
                         }
                     }
@@ -796,6 +865,7 @@ impl OpenAIStreamState {
                         "function_call_arguments.delta for unknown tool part {key:?}"
                     ))
                 })?;
+                self.fn_args_streamed.insert(key);
                 Ok(vec![StreamEvent::Delta { index, delta }])
             }
 
@@ -906,7 +976,7 @@ impl OpenAIStreamState {
     }
 
     fn reasoning_delta(
-        &self,
+        &mut self,
         output_index: u32,
         summary_index: Option<u32>,
         delta: String,
@@ -915,12 +985,23 @@ impl OpenAIStreamState {
             return Ok(vec![]);
         }
         let key = (output_index, summary_index);
-        let index = self.tracker.index_of(&key).ok_or_else(|| {
-            Error::streaming(format!(
-                "reasoning delta for unknown reasoning part {key:?}"
-            ))
-        })?;
-        Ok(vec![StreamEvent::Delta { index, delta }])
+        if let Some(index) = self.tracker.index_of(&key) {
+            return Ok(vec![StreamEvent::Delta { index, delta }]);
+        }
+        // The non-summary `response.reasoning_text.delta` channel has
+        // no preceding part-added frame (unlike the summary channel,
+        // whose part is opened by `ReasoningSummaryPartAdded`). Open
+        // the Reasoning part lazily on first delta rather than
+        // hard-aborting the whole stream. It's closed later by the
+        // enclosing `reasoning` item's `OutputItemDone` (same
+        // `(output_index, None)` key).
+        if summary_index.is_none() {
+            let (idx, start) = self.tracker.open(key, PartKind::Reasoning);
+            return Ok(vec![start, StreamEvent::Delta { index: idx, delta }]);
+        }
+        Err(Error::streaming(format!(
+            "reasoning delta for unknown reasoning part {key:?}"
+        )))
     }
 }
 
@@ -975,7 +1056,13 @@ impl Provider for OpenAIProvider {
                 let sse_event = sse_result?;
                 debug!(event = ?sse_event, "received OpenAI SSE event");
                 let stream_event = serde_json::from_str::<OpenAIStreamEvent>(&sse_event.data)?;
-                state_for_stream.lock().unwrap().process(stream_event)
+                // A poisoned lock means `process` panicked on a prior
+                // event; surface it as a stream error instead of
+                // panicking this task too.
+                let mut guard = state_for_stream
+                    .lock()
+                    .map_err(|_| Error::streaming("OpenAI stream state lock poisoned"))?;
+                guard.process(stream_event)
             })
             .flat_map(|result| match result {
                 Ok(events) => {
@@ -999,6 +1086,7 @@ impl Provider for OpenAIProvider {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::ResponseItem;
     use super::*;
     use crate::types::{Config, Prompt};
 
@@ -1438,5 +1526,116 @@ mod tests {
         assert_eq!(openai_request.model, "gpt-4");
         assert_eq!(openai_request.temperature, Some(0.7));
         assert_eq!(openai_request.max_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn cache_key_is_none_without_breakpoint() {
+        // The common (no-breakpoint) path short-circuits to None.
+        let p = Prompt::system("sys").with_user("hello");
+        let k = provider()
+            .convert_request(&p, &Config::new("gpt-5"))
+            .prompt_cache_key;
+        assert_eq!(k, None);
+    }
+
+    fn fn_item(call_id: Option<&str>, name: Option<&str>, arguments: Option<&str>) -> ResponseItem {
+        ResponseItem {
+            r#type: "function_call".to_string(),
+            id: "fc_1".to_string(),
+            name: name.map(str::to_string),
+            call_id: call_id.map(str::to_string),
+            action: None,
+            arguments: arguments.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn reasoning_text_delta_opens_part_lazily_no_abort() {
+        // H5: the non-summary reasoning_text channel has no
+        // part-added frame; the first delta must open a Reasoning
+        // part instead of hard-aborting the stream.
+        let mut st = OpenAIStreamState::new();
+        let evs = st
+            .process(OpenAIStreamEvent::ReasoningTextDelta {
+                output_index: 0,
+                delta: "thinking…".to_string(),
+            })
+            .expect("must not error");
+        assert!(
+            matches!(
+                evs[0],
+                StreamEvent::PartStart {
+                    kind: PartKind::Reasoning,
+                    ..
+                }
+            ),
+            "expected lazy PartStart(Reasoning), got {evs:#?}"
+        );
+        assert!(matches!(evs[1], StreamEvent::Delta { .. }));
+    }
+
+    #[test]
+    fn function_call_args_reconciled_from_done_when_no_deltas() {
+        // H4: no function_call_arguments.delta streamed → the
+        // complete arguments on output_item.done must still surface.
+        let mut st = OpenAIStreamState::new();
+        st.process(OpenAIStreamEvent::OutputItemAdded {
+            output_index: 0,
+            item: fn_item(Some("call_1"), Some("get_weather"), None),
+        })
+        .unwrap();
+        let evs = st
+            .process(OpenAIStreamEvent::OutputItemDone {
+                output_index: 0,
+                item: fn_item(
+                    Some("call_1"),
+                    Some("get_weather"),
+                    Some(r#"{"city":"Paris"}"#),
+                ),
+            })
+            .unwrap();
+        let arg_delta = evs.iter().find_map(|e| match e {
+            StreamEvent::Delta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        });
+        assert_eq!(arg_delta, Some(r#"{"city":"Paris"}"#));
+    }
+
+    #[test]
+    fn function_call_args_not_duplicated_when_streamed() {
+        // If args *did* stream, output_item.done must NOT re-emit them.
+        let mut st = OpenAIStreamState::new();
+        st.process(OpenAIStreamEvent::OutputItemAdded {
+            output_index: 0,
+            item: fn_item(Some("call_1"), Some("f"), None),
+        })
+        .unwrap();
+        st.process(OpenAIStreamEvent::FunctionCallArgumentsDelta {
+            output_index: 0,
+            delta: r#"{"a":1}"#.to_string(),
+        })
+        .unwrap();
+        let evs = st
+            .process(OpenAIStreamEvent::OutputItemDone {
+                output_index: 0,
+                item: fn_item(Some("call_1"), Some("f"), Some(r#"{"a":1}"#)),
+            })
+            .unwrap();
+        assert!(
+            !evs.iter().any(|e| matches!(e, StreamEvent::Delta { .. })),
+            "args already streamed; done must not re-emit them: {evs:#?}"
+        );
+    }
+
+    #[test]
+    fn function_call_missing_name_errors() {
+        let mut st = OpenAIStreamState::new();
+        let err = st
+            .process(OpenAIStreamEvent::OutputItemAdded {
+                output_index: 0,
+                item: fn_item(Some("call_1"), None, None),
+            })
+            .expect_err("missing name must error, not fabricate 'unknown'");
+        assert!(err.to_string().contains("missing name"), "{err}");
     }
 }
