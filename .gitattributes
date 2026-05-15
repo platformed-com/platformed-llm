@@ -1,0 +1,6 @@
+# Normalise line endings to LF in the working tree on every platform.
+# Without this, Git-for-Windows' default `core.autocrlf=true` checks
+# the captured wire / snapshot fixtures out with CRLF, and the
+# `snapshot_traces` test (which generates `\n`) fails on Windows CI
+# with byte-for-byte-identical-looking diffs.
+* text=auto eol=lf
