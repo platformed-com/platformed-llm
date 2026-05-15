@@ -42,6 +42,7 @@ use std::fmt;
 use std::pin::Pin;
 
 use async_stream::stream;
+use futures::channel::oneshot;
 use futures_util::pin_mut;
 use futures_util::stream::{Stream, StreamExt};
 
@@ -244,15 +245,28 @@ where
 /// synthetic `call_id`s, and append a terminal [`StreamEvent::Done`]
 /// once the input drains.
 ///
-/// `Done`'s `finish_reason` is [`FinishReason::ToolCalls`] when any
-/// tool call passed through, otherwise [`FinishReason::Stop`]. Usage
-/// stays zero — local engines don't surface token counts. An upstream
-/// `Err` is forwarded once and suppresses the trailing `Done`
-/// (downstream handles error termination).
+/// `finish_signal` controls the terminal [`StreamEvent::Done`]'s
+/// `finish_reason`:
 ///
-/// Prefer the [`ParsedDeltaStreamExt::into_stream_events`] sugar at
-/// call sites.
-pub fn translate_to_events<S>(deltas: S) -> impl Stream<Item = Result<StreamEvent, Error>> + Send
+/// - `Some(rx)` — the producer (e.g. a local engine) reports the
+///   authoritative reason out-of-band; whatever it resolves to wins
+///   (a truncated turn must report [`FinishReason::Length`] even if a
+///   tool call also parsed). If the sender is dropped without a value
+///   the derived fallback is used.
+/// - `None` — derive: [`FinishReason::ToolCalls`] if any tool call
+///   passed through, else [`FinishReason::Stop`]. Used by templates /
+///   tests with no engine signal.
+///
+/// Usage stays zero — local engines don't surface token counts. An
+/// upstream `Err` is forwarded once and suppresses the trailing
+/// `Done` (downstream handles error termination).
+///
+/// Prefer the [`ParsedDeltaStreamExt::into_stream_events`] sugar when
+/// there's no engine signal.
+pub fn translate_to_events<S>(
+    deltas: S,
+    finish_signal: Option<oneshot::Receiver<FinishReason>>,
+) -> impl Stream<Item = Result<StreamEvent, Error>> + Send
 where
     S: Stream<Item = Result<ParsedDelta, Error>> + Send + 'static,
 {
@@ -314,10 +328,17 @@ where
             }
         }
 
-        let finish_reason = if emitted_tool_call {
+        let derived = if emitted_tool_call {
             FinishReason::ToolCalls
         } else {
             FinishReason::Stop
+        };
+        let finish_reason = match finish_signal {
+            // Engine-reported reason is authoritative (e.g. Length on
+            // a max_tokens-truncated turn). Sender dropped without a
+            // value → fall back to the derived reason.
+            Some(rx) => rx.await.unwrap_or(derived),
+            None => derived,
         };
         yield Ok(StreamEvent::Done {
             finish_reason,
@@ -332,9 +353,10 @@ where
 pub trait ParsedDeltaStreamExt:
     Stream<Item = Result<ParsedDelta, Error>> + Send + Sized + 'static
 {
-    /// See [`translate_to_events`].
+    /// See [`translate_to_events`]. No engine finish-signal — the
+    /// reason is derived (Stop / ToolCalls).
     fn into_stream_events(self) -> impl Stream<Item = Result<StreamEvent, Error>> + Send {
-        translate_to_events(self)
+        translate_to_events(self, None)
     }
 }
 
@@ -465,7 +487,7 @@ mod tests {
 
     fn events_from(deltas: Vec<Result<ParsedDelta, Error>>) -> Vec<Result<StreamEvent, Error>> {
         let s = futures_util::stream::iter(deltas);
-        futures::executor::block_on(translate_to_events(s).collect::<Vec<_>>())
+        futures::executor::block_on(translate_to_events(s, None).collect::<Vec<_>>())
     }
 
     #[test]
@@ -555,6 +577,52 @@ mod tests {
                 !matches!(r, StreamEvent::Done { .. }),
                 "Done must not follow an error"
             );
+        }
+    }
+
+    #[test]
+    fn translate_engine_finish_signal_overrides_derived_reason() {
+        // A tool call was emitted (derived would be ToolCalls) but the
+        // engine reports Length (max_tokens) — the engine signal wins.
+        let (tx, rx) = oneshot::channel();
+        tx.send(FinishReason::Length).unwrap();
+        let s = futures_util::stream::iter(vec![Ok(ParsedDelta::ToolCall {
+            name: "x".into(),
+            arguments: "{}".into(),
+        })]);
+        let events: Vec<StreamEvent> =
+            futures::executor::block_on(translate_to_events(s, Some(rx)).collect::<Vec<_>>())
+                .into_iter()
+                .map(Result::unwrap)
+                .collect();
+        match events.last().unwrap() {
+            StreamEvent::Done { finish_reason, .. } => {
+                assert_eq!(*finish_reason, FinishReason::Length);
+            }
+            _ => panic!("expected Done last"),
+        }
+    }
+
+    #[test]
+    fn translate_dropped_finish_signal_falls_back_to_derived() {
+        // Sender dropped without sending → derived reason (Stop here).
+        let (tx, rx) = oneshot::channel::<FinishReason>();
+        drop(tx);
+        let s = futures_util::stream::iter(vec![
+            Ok(ParsedDelta::TextStart),
+            Ok(ParsedDelta::TextDelta("hi".into())),
+            Ok(ParsedDelta::TextEnd),
+        ]);
+        let events: Vec<StreamEvent> =
+            futures::executor::block_on(translate_to_events(s, Some(rx)).collect::<Vec<_>>())
+                .into_iter()
+                .map(Result::unwrap)
+                .collect();
+        match events.last().unwrap() {
+            StreamEvent::Done { finish_reason, .. } => {
+                assert_eq!(*finish_reason, FinishReason::Stop);
+            }
+            _ => panic!("expected Done last"),
         }
     }
 }

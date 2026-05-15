@@ -75,13 +75,15 @@ impl ResponseAccumulator {
         })
     }
 
-    /// Consume the accumulator and produce the final response. If `Done` was
-    /// never observed, the finish reason defaults to [`FinishReason::Stop`]
-    /// and usage to zeros.
+    /// Consume the accumulator and produce the final response. If a
+    /// `Done` event was never observed (truncated / cancelled stream),
+    /// the finish reason is [`FinishReason::Incomplete`] — *not*
+    /// `Stop` — so callers can distinguish a clean finish from a cut
+    /// off one; usage falls back to zeros.
     pub fn finalize(self) -> Result<CompleteResponse, Error> {
         Ok(CompleteResponse {
             content: self.parts,
-            finish_reason: self.finish_reason.unwrap_or(FinishReason::Stop),
+            finish_reason: self.finish_reason.unwrap_or(FinishReason::Incomplete),
             usage: self.usage.unwrap_or_default(),
         })
     }
@@ -309,5 +311,36 @@ mod tests {
             AssistantPart::RedactedReasoning { data } => assert_eq!(data, "opaque-blob"),
             _ => panic!("wrong"),
         }
+    }
+
+    #[test]
+    fn finalize_without_done_is_incomplete_not_stop() {
+        // A stream that ends without a terminal `Done` (truncated /
+        // cancelled) must NOT be reported as a clean Stop.
+        let mut acc = ResponseAccumulator::new();
+        acc.process_event(StreamEvent::PartStart {
+            index: 0,
+            kind: PartKind::Text,
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::Delta {
+            index: 0,
+            delta: "partial".into(),
+        })
+        .unwrap();
+        // No PartEnd, no Done — stream just stopped.
+        let response = acc.finalize().unwrap();
+        assert_eq!(response.finish_reason, FinishReason::Incomplete);
+    }
+
+    #[test]
+    fn finalize_with_done_keeps_reported_reason() {
+        let mut acc = ResponseAccumulator::new();
+        acc.process_event(StreamEvent::Done {
+            finish_reason: FinishReason::Length,
+            usage: Usage::default(),
+        })
+        .unwrap();
+        assert_eq!(acc.finalize().unwrap().finish_reason, FinishReason::Length);
     }
 }

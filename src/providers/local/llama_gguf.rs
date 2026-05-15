@@ -30,14 +30,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use llama_gguf::engine::EngineConfig;
 
 use crate::provider::Provider;
-use crate::types::{Config, Prompt, Tool};
+use crate::types::{Config, FinishReason, Prompt, Tool};
 use crate::{Error, Response};
 
-use super::chat_template::{function_tools, ChatTemplate, ParsedDeltaStreamExt, TokenStream};
+use super::chat_template::{function_tools, translate_to_events, ChatTemplate, TokenStream};
 use super::chatml::ChatMlTemplate;
 use super::engine::{LlamaGgufEngine, LocalEngine};
 
@@ -139,31 +139,54 @@ impl Provider for LlamaGgufProvider {
         // tensor math on the calling thread). Push it onto a
         // `spawn_blocking` worker and bridge into the async world via
         // an unbounded mpsc channel — dropping `tx` at the end of the
-        // task is what signals end-of-stream to the receiver.
+        // task is what signals end-of-stream to the receiver. The
+        // `reason` oneshot carries the finish reason out-of-band so
+        // the terminal `Done` reports `Length` vs `Stop` truthfully
+        // (llama-gguf's iterator ends identically for EOS and the
+        // max_tokens cap, so we infer it from the token budget).
         let (mut tx, rx) = mpsc::unbounded::<Result<String, Error>>();
+        let (reason_tx, reason_rx) = oneshot::channel::<FinishReason>();
         tokio::task::spawn_blocking(move || {
             let stream = engine.generate_streaming(&prompt_text, max_tokens);
+            let mut emitted: usize = 0;
             for tok in stream {
                 let item =
                     tok.map_err(|e| Error::provider("llama-gguf", format!("generation: {e}")));
                 let is_err = item.is_err();
                 // `unbounded_send` only errors when the receiver was
-                // dropped — the consumer abandoned us; stop generating.
+                // dropped — the consumer abandoned us; stop generating
+                // (no finish reason: nobody is listening).
                 if tx.start_send(item).is_err() {
                     return;
                 }
                 if is_err {
+                    // Error already forwarded; `translate_to_events`
+                    // suppresses the trailing Done on error, so the
+                    // finish reason is moot — drop `reason_tx`.
                     return;
                 }
+                emitted += 1;
             }
-            // tx drops here; rx will see end-of-stream on next poll.
+            // Natural end. We can't see *why* llama-gguf stopped, so
+            // infer: if we emitted at least `max_tokens` chunks the
+            // budget was exhausted (each chunk is >= 1 token, so this
+            // never false-positives Length); otherwise the model
+            // stopped on its own (EOS / stop sequence).
+            let reason = if max_tokens > 0 && emitted >= max_tokens {
+                FinishReason::Length
+            } else {
+                FinishReason::Stop
+            };
+            let _ = reason_tx.send(reason);
+            // tx drops here; rx sees end-of-stream on next poll.
         });
 
-        // Chain: tokens → ParsedDelta → StreamEvent (+ trailing Done).
-        // Both stages are `stream!` generators in `chat_template`;
-        // this provider is purely glue.
+        // Chain: tokens → ParsedDelta → StreamEvent (+ trailing Done
+        // carrying the engine-reported finish reason). The decode
+        // stages are `stream!` generators in `chat_template`; this
+        // provider is purely glue.
         let tokens: TokenStream = Box::pin(rx);
-        let events = self.template.decode(tokens).into_stream_events();
+        let events = translate_to_events(self.template.decode(tokens), Some(reason_rx));
 
         Ok(Response::from_stream(events))
     }

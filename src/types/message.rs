@@ -373,4 +373,10 @@ pub enum FinishReason {
     ToolCalls,
     /// The provider's content filter blocked or truncated the response.
     ContentFilter,
+    /// The stream ended without a terminal `Done`/stop signal — the
+    /// response is *incomplete* (connection dropped, task cancelled,
+    /// or a local engine cut off mid-emit). Distinct from [`Self::Stop`]
+    /// so callers driving tool-call loops or billing don't mistake a
+    /// truncated turn for a clean finish.
+    Incomplete,
 }
