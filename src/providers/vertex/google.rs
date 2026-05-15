@@ -60,6 +60,13 @@ impl GoogleProvider {
         }
     }
 
+    /// Swap the static access token before it expires (GCP tokens
+    /// last ~1h). Errors if this provider was built with ADC, which
+    /// refreshes automatically. See [`VertexEndpoint::set_access_token`].
+    pub fn set_access_token(&self, token: impl Into<String>) -> Result<(), Error> {
+        self.endpoint.set_access_token(token)
+    }
+
     /// Convert internal request to Google format.
     fn convert_request(
         &self,

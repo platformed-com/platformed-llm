@@ -63,6 +63,13 @@ impl AnthropicViaVertexProvider {
         }
     }
 
+    /// Swap the static access token before it expires (GCP tokens
+    /// last ~1h). Errors if this provider was built with ADC, which
+    /// refreshes automatically. See [`VertexEndpoint::set_access_token`].
+    pub fn set_access_token(&self, token: impl Into<String>) -> Result<(), Error> {
+        self.endpoint.set_access_token(token)
+    }
+
     /// Opt into Anthropic beta features. Each `beta_id` (e.g.
     /// `"computer-use-2025-01-24"`) appears as a comma-separated value
     /// in the `anthropic-beta` header.

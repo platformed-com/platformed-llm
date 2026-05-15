@@ -15,7 +15,7 @@
 //! never carried bytes.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use gcp_auth::TokenProvider;
 
@@ -29,10 +29,13 @@ const VERTEX_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 /// [`VertexEndpoint::with_adc`] rather than constructing this directly.
 #[derive(Clone)]
 pub(crate) enum VertexAuth {
-    /// A pre-fetched access token. The caller is responsible for refresh.
-    Static(String),
-    /// Application Default Credentials. The provider caches and refreshes
-    /// tokens internally.
+    /// A pre-fetched access token, behind a shared lock so a
+    /// long-lived provider can swap it before expiry via
+    /// [`VertexEndpoint::set_access_token`] without rebuilding. GCP
+    /// access tokens last ~1h; the caller owns refresh.
+    Static(Arc<RwLock<String>>),
+    /// Application Default Credentials. Token caching/refresh is
+    /// delegated to `gcp_auth`'s `TokenProvider`.
     Adc(Arc<dyn TokenProvider>),
 }
 
@@ -57,12 +60,17 @@ pub struct VertexEndpoint {
 
 impl VertexEndpoint {
     /// Build from a static access token (sync — no network calls).
+    ///
+    /// GCP access tokens expire after ~1h. For a long-lived process,
+    /// either swap the token before expiry with
+    /// [`Self::set_access_token`], or prefer [`Self::with_adc`] which
+    /// refreshes automatically.
     pub fn with_access_token(project_id: String, location: String, access_token: String) -> Self {
         Self {
             project_id,
             location,
             base_url: None,
-            auth: VertexAuth::Static(access_token),
+            auth: VertexAuth::Static(Arc::new(RwLock::new(access_token))),
         }
     }
 
@@ -118,11 +126,33 @@ impl VertexEndpoint {
         url
     }
 
+    /// Replace the static access token (e.g. just before the current
+    /// one expires). The new token is seen by every clone of this
+    /// endpoint and every provider built from it — no rebuild needed.
+    ///
+    /// Returns an error for the ADC variant, whose tokens refresh
+    /// automatically via `gcp_auth`.
+    pub fn set_access_token(&self, token: impl Into<String>) -> Result<(), Error> {
+        match &self.auth {
+            VertexAuth::Static(slot) => {
+                *slot.write().unwrap_or_else(|e| e.into_inner()) = token.into();
+                Ok(())
+            }
+            VertexAuth::Adc(_) => Err(Error::auth(
+                "endpoint uses Application Default Credentials; tokens \
+                 refresh automatically — set_access_token applies only \
+                 to the static-token variant",
+            )),
+        }
+    }
+
     /// Resolve an access token. For ADC this delegates to the cached
     /// `gcp_auth::TokenProvider`.
     pub async fn access_token(&self) -> Result<String, Error> {
         match &self.auth {
-            VertexAuth::Static(token) => Ok(token.clone()),
+            VertexAuth::Static(token) => {
+                Ok(token.read().unwrap_or_else(|e| e.into_inner()).clone())
+            }
             VertexAuth::Adc(provider) => {
                 let token = provider
                     .token(&[VERTEX_SCOPE])
@@ -272,5 +302,16 @@ mod tests {
             t.auth_header().await.unwrap(),
             ("Authorization".to_string(), "Bearer tok".to_string()),
         );
+    }
+
+    #[tokio::test]
+    async fn set_access_token_swaps_and_is_seen_by_clones() {
+        let t = endpoint("us-east1");
+        let cloned = t.clone();
+        t.set_access_token("fresh-token").unwrap();
+        // The swap is visible through the original and any clone (the
+        // token lives behind a shared Arc) — no rebuild needed.
+        assert_eq!(t.access_token().await.unwrap(), "fresh-token");
+        assert_eq!(cloned.access_token().await.unwrap(), "fresh-token");
     }
 }
