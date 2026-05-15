@@ -19,7 +19,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::Stream;
-use platformed_llm::{Error, TransportImpl, TransportRequest, TransportResponse};
+use platformed_llm::transport::{TransportImpl, TransportRequest, TransportResponse};
+use platformed_llm::Error;
 use serde_json::Value;
 
 pub struct ScriptedTurn {
@@ -49,8 +50,8 @@ impl TransportImpl for ScriptedTransport {
             .pop_front()
             .expect("ScriptedTransport called more times than scripted");
 
-        let actual: Value = serde_json::from_slice(&req.body)
-            .expect("request body sent by lib was not valid JSON");
+        let actual: Value =
+            serde_json::from_slice(&req.body).expect("request body sent by lib was not valid JSON");
         assert_eq!(
             actual, turn.expected_body,
             "request body did not match expected payload",
@@ -69,6 +70,5 @@ impl TransportImpl for ScriptedTransport {
 
 /// Read a fixture file relative to the project root.
 pub fn load_fixture(filename: &str) -> Vec<u8> {
-    std::fs::read(filename)
-        .unwrap_or_else(|_| panic!("failed to load test fixture: {filename}"))
+    std::fs::read(filename).unwrap_or_else(|_| panic!("failed to load test fixture: {filename}"))
 }

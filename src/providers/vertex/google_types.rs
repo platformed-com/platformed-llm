@@ -240,9 +240,62 @@ pub struct GoogleCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "finishReason")]
     pub finish_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "safetyRatings")]
-    pub safety_ratings: Option<Vec<IValue>>,
+    /// Grounding metadata attached when `googleSearch` (or other
+    /// retrieval) builtin tools fire. Maps to per-span URL citations
+    /// on the unified surface.
+    #[serde(default, rename = "groundingMetadata")]
+    pub grounding_metadata: Option<GoogleGroundingMetadata>,
+}
+
+/// `groundingMetadata` payload attached to a candidate.
+///
+/// Wire shape: a flat list of `groundingChunks` (the sources the model
+/// drew from) plus a list of `groundingSupports` that map text spans
+/// onto chunk indices.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleGroundingMetadata {
+    #[serde(default)]
+    pub grounding_chunks: Vec<GoogleGroundingChunk>,
+    #[serde(default)]
+    pub grounding_supports: Vec<GoogleGroundingSupport>,
+}
+
+/// A single grounding source. Only the `web` variant is documented
+/// today; future tags (e.g. retrieval over uploaded files) deserialize
+/// into the catch-all so unknown shapes don't fail the parse.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleGroundingChunk {
+    #[serde(default)]
+    pub web: Option<GoogleGroundingWebChunk>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleGroundingWebChunk {
+    pub uri: String,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// One text-span → chunks mapping. `segment.start_index` /
+/// `segment.end_index` are byte offsets into the candidate's text.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleGroundingSupport {
+    pub segment: GoogleGroundingSegment,
+    #[serde(default)]
+    pub grounding_chunk_indices: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleGroundingSegment {
+    #[serde(default)]
+    pub start_index: usize,
+    #[serde(default)]
+    pub end_index: usize,
 }
 
 /// Google usage metadata.

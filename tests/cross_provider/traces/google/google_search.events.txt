@@ -1,9 +1,13 @@
 PartStart[0] text
-Delta[0] "Today's date is Wednesday, May 13, 2"
-Delta[0] "026."
+Delta[0] "The latest stable version of the Rust programming"
+Delta[0] " language is 1.95.0, which was released on April 16, 2026.\n\nRust releases new stable versions every"
+Delta[0] " six weeks."
+PartUpdate[0] annotation kind=UrlCitation start=67 end=107 source="https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQECblWn8aHkSJVj5P8I96hqzVnnsfWZ6E-2ZzSWgJEu1pYYjMwjzg24H_Varhwnq5MvCUHOmcb-pn64TxE_g913CNwpLpUpAnzxXKi1YkU7Zd5W8w_tV9j-AgYvSRqxVgrS2_7eEc8=" title=Some("rust-lang.org")
+PartUpdate[0] annotation kind=UrlCitation start=109 end=159 source="https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGFoo0f7bJVz0j0BovtwDYho8mt9mYOnroZLdsQFLJCTTL2ipf4GCNH2a9MuMIZ8lzWKscTNdZShPHwTPfYfMhdoVUrZ7DMLsDoOBOOtklEjXpqAQ_bpX5CcZcP7XJJfMIvImOfy-wlRMdl7cD86A-9fYvPsQ==" title=Some("github.io")
+PartUpdate[0] annotation kind=UrlCitation start=109 end=159 source="https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGzS21kkk_o0wu9WVzZsf9IVpanKXaf_drVuCiYp-Og30VavKlHZDrf9rdyobaRkJyUKC0HnACwigEpGuUhBhm3ovA17FbUzLizggFkYKU-Ow1RM1-bYg==" title=Some("endoflife.date")
 PartEnd[0]
 Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
-output[0].part[0] text "Today's date is Wednesday, May 13, 2026." annotations=0
+part[0] text "The latest stable version of the Rust programming language is 1.95.0, which was released on April 16, 2026.\n\nRust releases new stable versions every six weeks." annotations=3

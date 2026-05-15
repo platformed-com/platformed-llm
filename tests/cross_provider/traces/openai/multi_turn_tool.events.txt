@@ -14,8 +14,11 @@ Delta[0] "22"
 Delta[0] "°C"
 Delta[0] "."
 PartEnd[0]
+PartStart[1] continuation kind=OpenAI id=<n>
+PartEnd[1]
 Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
-output[0].part[0] text "The weather in Paris is sunny with a temperature of 22°C." annotations=0
+part[0] text "The weather in Paris is sunny with a temperature of 22°C." annotations=0
+part[1] continuation kind=OpenAI id=<n>

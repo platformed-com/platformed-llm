@@ -39,6 +39,8 @@ impl SseEvent {
         }
     }
 
+    /// True when every field is empty / unset — used by the parser to
+    /// avoid dispatching a zero-content event.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
             && self.event_type.is_empty()
@@ -618,7 +620,10 @@ mod tests {
             Self(seed.wrapping_add(0x9E3779B97F4A7C15))
         }
         fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             self.0
         }
         fn range(&mut self, max: usize) -> usize {
@@ -664,7 +669,8 @@ mod tests {
             // Exhaustive: every single-byte chunking.
             let by_one = parse_with_chunks(input, &vec![1; input.len()]).await;
             assert_eq!(
-                by_one, baseline,
+                by_one,
+                baseline,
                 "byte-by-byte parsing diverged from baseline for input: {:?}",
                 std::str::from_utf8(input).unwrap_or("<non-utf8>")
             );
@@ -674,7 +680,8 @@ mod tests {
                 let runs = vec![stride; input.len().div_ceil(stride).max(1)];
                 let got = parse_with_chunks(input, &runs).await;
                 assert_eq!(
-                    got, baseline,
+                    got,
+                    baseline,
                     "stride={stride} diverged from baseline for input: {:?}",
                     std::str::from_utf8(input).unwrap_or("<non-utf8>")
                 );
@@ -693,7 +700,8 @@ mod tests {
                 }
                 let got = parse_with_chunks(input, &runs).await;
                 assert_eq!(
-                    got, baseline,
+                    got,
+                    baseline,
                     "seed={seed} runs={runs:?} diverged from baseline for input: {:?}",
                     std::str::from_utf8(input).unwrap_or("<non-utf8>")
                 );
@@ -706,7 +714,8 @@ mod tests {
     /// payload shapes (large data fields, OpenAI event prefixes, etc.).
     #[tokio::test]
     async fn chunk_boundaries_invariant_on_real_capture() {
-        let path = std::path::Path::new("tests/cross_provider/traces/openai/text_only.response.sse");
+        let path =
+            std::path::Path::new("tests/cross_provider/traces/openai/text_only.response.sse");
         if !path.exists() {
             // The capture may not have been generated yet; the dedicated
             // `replay_traces` test no-ops in that case too.

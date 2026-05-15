@@ -38,10 +38,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
+use platformed_llm::providers::{
+    AnthropicViaVertexProvider, GoogleProvider, OpenAIProvider, VertexEndpoint,
+};
+use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
 use platformed_llm::{
-    AnthropicViaVertexProvider, Error, FunctionCall, GoogleProvider, InputItem, LLMProvider,
-    LLMRequest, OpenAIProvider, Prompt, ReasoningConfig, ReasoningEffort, ReasoningSummary, Tool,
-    ToolType, Transport, TransportImpl, TransportRequest, TransportResponse, VertexEndpoint,
+    Config, Error, FunctionCall, InputItem, Prompt, ReasoningConfig, ReasoningEffort,
+    ReasoningSummary, Tool,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -51,7 +54,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct Config {
+struct ScenarioFile {
     defaults: Defaults,
     scenarios: Vec<Scenario>,
 }
@@ -118,9 +121,9 @@ struct ProviderOverride {
     /// captures.
     #[serde(default)]
     auth_override: Option<String>,
-    /// Free-form provider-specific JSON. Currently translated into
-    /// `LLMRequest::reasoning` and `LLMRequest::parallel_tool_calls`; any
-    /// unknown key fails the scenario so the schema stays honest.
+    /// Free-form provider-specific JSON. Currently translated into the
+    /// lib's `Config::reasoning` and `Config::parallel_tool_calls` fields;
+    /// any unknown key fails the scenario so the schema stays honest.
     #[serde(default)]
     extra_body: Option<Value>,
 }
@@ -246,7 +249,11 @@ impl TransportImpl for RecordingTransport {
         let recording = self.recording.clone();
         let teed = response.body.map(move |chunk| {
             if let Ok(bytes) = &chunk {
-                recording.lock().unwrap().response_body.extend_from_slice(bytes);
+                recording
+                    .lock()
+                    .unwrap()
+                    .response_body
+                    .extend_from_slice(bytes);
             }
             chunk
         });
@@ -261,14 +268,14 @@ impl TransportImpl for RecordingTransport {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario → LLMRequest translation
+// Scenario → (Prompt, Config) translation
 // ---------------------------------------------------------------------------
 
 fn scenario_to_llm_request(
     scenario: &Scenario,
     model: &str,
     overrides: &ProviderOverride,
-) -> Result<LLMRequest, String> {
+) -> Result<(Prompt, Config), String> {
     // Walk messages, splitting assistant turns with tool_calls into
     // assistant message + N FunctionCall items, and turning tool-role
     // messages into FunctionCallOutput.
@@ -307,7 +314,7 @@ fn scenario_to_llm_request(
             "system" => {
                 prompt = prompt.with_system(m.content.clone().unwrap_or_default());
             }
-            "user" | _ => {
+            _ => {
                 use platformed_llm::UserPart;
                 let mut content: Vec<UserPart> = Vec::new();
                 if let Some(text) = m.content.as_ref().filter(|s| !s.is_empty()) {
@@ -337,12 +344,12 @@ fn scenario_to_llm_request(
         }
     }
 
-    let mut req = LLMRequest::from_prompt(model, &prompt);
+    let mut cfg = Config::new(model);
     if let Some(t) = scenario.temperature {
-        req = req.temperature(t);
+        cfg = cfg.temperature(t);
     }
     if let Some(m) = scenario.max_tokens {
-        req = req.max_tokens(m);
+        cfg = cfg.max_tokens(m);
     }
     let mut tools: Vec<Tool> = Vec::new();
     for t in &scenario.tools {
@@ -370,7 +377,7 @@ fn scenario_to_llm_request(
         tools.push(Tool::Builtin(builtin));
     }
     if !tools.is_empty() {
-        req = req.tools(tools);
+        cfg = cfg.tools(tools);
     }
 
     if let Some(rf) = &scenario.response_format {
@@ -390,7 +397,7 @@ fn scenario_to_llm_request(
                 }
             }
         };
-        req = req.response_format(translated);
+        cfg = cfg.response_format(translated);
     }
 
     // Translate the supported subset of `extra_body`. Anything else is
@@ -404,15 +411,15 @@ fn scenario_to_llm_request(
                         let b = v
                             .as_bool()
                             .ok_or_else(|| "parallel_tool_calls must be a bool".to_string())?;
-                        req = req.parallel_tool_calls(b);
+                        cfg = cfg.parallel_tool_calls(b);
                     }
                     "reasoning" => {
-                        let cfg = parse_reasoning(v)?;
-                        req = req.reasoning(cfg);
+                        let r = parse_reasoning(v)?;
+                        cfg = cfg.reasoning(r);
                     }
                     other => {
                         return Err(format!(
-                            "extra_body field `{other}` is not currently routed through LLMRequest; \
+                            "extra_body field `{other}` is not currently routed through Config; \
                              extend scenario_to_llm_request to support it"
                         ));
                     }
@@ -421,7 +428,7 @@ fn scenario_to_llm_request(
         }
     }
 
-    Ok(req)
+    Ok((prompt, cfg))
 }
 
 fn parse_reasoning(v: &Value) -> Result<ReasoningConfig, String> {
@@ -499,8 +506,7 @@ fn vertex_project_region(
         Provider::Anthropic => std::env::var("ANTHROPIC_REGION")
             .or_else(|_| std::env::var("GOOGLE_REGION"))
             .map_err(|_| "neither ANTHROPIC_REGION nor GOOGLE_REGION is set")?,
-        _ => std::env::var("GOOGLE_REGION")
-            .map_err(|_| "GOOGLE_REGION not set in env or .env")?,
+        _ => std::env::var("GOOGLE_REGION").map_err(|_| "GOOGLE_REGION not set in env or .env")?,
     };
     Ok((project, region))
 }
@@ -523,11 +529,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scenarios_path = cwd.join("tests").join("scenarios.json");
     let raw = fs::read_to_string(&scenarios_path)
         .map_err(|e| format!("read {}: {e}", scenarios_path.display()))?;
-    let config: Config = serde_json::from_str(&raw)?;
+    let scenario_file: ScenarioFile = serde_json::from_str(&raw)?;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let providers = parse_providers(&args);
-    let scenarios = parse_scenarios(&args, &config.scenarios);
+    let scenarios = parse_scenarios(&args, &scenario_file.scenarios);
 
     let traces_root = cwd.join("tests/cross_provider/traces");
     fs::create_dir_all(&traces_root)?;
@@ -548,9 +554,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             let model = overrides.model.clone().unwrap_or_else(|| match provider {
-                Provider::OpenAI => config.defaults.models.openai.clone(),
-                Provider::Google => config.defaults.models.google.clone(),
-                Provider::Anthropic => config.defaults.models.anthropic.clone(),
+                Provider::OpenAI => scenario_file.defaults.models.openai.clone(),
+                Provider::Google => scenario_file.defaults.models.google.clone(),
+                Provider::Anthropic => scenario_file.defaults.models.anthropic.clone(),
             });
             print!("[{}] {} ... ", provider.name(), scenario.name);
             std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -602,7 +608,7 @@ async fn capture_one(
     overrides: &ProviderOverride,
     dir: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let req = scenario_to_llm_request(scenario, model, overrides)
+    let (prompt, cfg) = scenario_to_llm_request(scenario, model, overrides)
         .map_err(|e| format!("scenario translation: {e}"))?;
 
     // Build the recording transport that wraps the default reqwest one.
@@ -623,7 +629,7 @@ async fn capture_one(
                 "https://api.openai.com/v1".to_string(),
                 transport,
             );
-            run_provider(&p, &req).await
+            run_provider(&p, &prompt, &cfg).await
         }
         Provider::Google => {
             let (project_id, region) = vertex_project_region(provider)?;
@@ -633,7 +639,7 @@ async fn capture_one(
             };
             let endpoint = VertexEndpoint::with_access_token(project_id, region, token);
             let p = GoogleProvider::with_transport(endpoint, transport);
-            run_provider(&p, &req).await
+            run_provider(&p, &prompt, &cfg).await
         }
         Provider::Anthropic => {
             let (project_id, region) = vertex_project_region(provider)?;
@@ -643,7 +649,7 @@ async fn capture_one(
             };
             let endpoint = VertexEndpoint::with_access_token(project_id, region, token);
             let p = AnthropicViaVertexProvider::with_transport(endpoint, transport);
-            run_provider(&p, &req).await
+            run_provider(&p, &prompt, &cfg).await
         }
     };
     let elapsed = started.elapsed();
@@ -720,11 +726,12 @@ async fn capture_one(
 /// Drive `provider.generate()` and consume the resulting stream so the
 /// recording transport sees every byte. Discards the unified events — the
 /// snapshot test will replay the captured bytes through the lib later.
-async fn run_provider<P: LLMProvider + ?Sized>(
+async fn run_provider<P: platformed_llm::Provider + ?Sized>(
     provider: &P,
-    request: &LLMRequest,
+    prompt: &Prompt,
+    config: &Config,
 ) -> Result<(), Error> {
-    let response = provider.generate(request).await?;
+    let response = provider.generate(prompt, config).await?;
     let mut stream = response.stream();
     while let Some(ev) = stream.next().await {
         // A streaming-level error becomes our error too.

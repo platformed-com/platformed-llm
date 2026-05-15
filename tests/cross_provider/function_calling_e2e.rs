@@ -8,7 +8,7 @@
 
 use futures_util::StreamExt;
 use platformed_llm::accumulator::ResponseAccumulator;
-use platformed_llm::{InputItem, LLMRequest, Prompt};
+use platformed_llm::{Config, InputItem, Prompt, ProviderContinuation};
 
 use super::providers::{
     anthropic::AnthropicTestSetup, create_weather_tool, google::GoogleTestSetup,
@@ -25,7 +25,7 @@ async fn run_function_calling_test<T: ProviderTestSetup>() -> Result<(), Box<dyn
     )
     .with_user("What's the weather like in Paris?");
 
-    let request = LLMRequest::from_prompt(config.model, &conversation)
+    let cfg = Config::new(config.model)
         .temperature(0.7)
         .max_tokens(150)
         .tools(vec![create_weather_tool()]);
@@ -33,7 +33,7 @@ async fn run_function_calling_test<T: ProviderTestSetup>() -> Result<(), Box<dyn
     // First turn: ScriptedTransport asserts the lib's emitted request
     // body matches the expected initial payload, then returns the
     // canned function-call SSE.
-    let response = provider.generate(&request).await?;
+    let response = provider.generate(&conversation, &cfg).await?;
 
     let mut accumulator = ResponseAccumulator::new();
     let mut stream = response.stream();
@@ -69,6 +69,27 @@ async fn run_function_calling_test<T: ProviderTestSetup>() -> Result<(), Box<dyn
     // Fold the model's tool emission back into the conversation, append
     // the tool result, and send the follow-up.
     let complete_response = accumulator.finalize()?;
+
+    // OpenAI's `response.completed` carries an `id` which the lib
+    // surfaces as a `ProviderContinuation::OpenAI`. This was silently
+    // dropped before the StreamEvent::Continuation wiring landed —
+    // pin it here so a regression in the response→stream→accumulator
+    // chain fails this test rather than corrupting downstream
+    // history-elision logic.
+    if config.name == "OpenAI" {
+        match complete_response.continuation() {
+            Some(ProviderContinuation::OpenAI { response_id }) => {
+                assert_eq!(
+                    response_id, "resp_1",
+                    "OpenAI: continuation should carry the fixture response id",
+                );
+            }
+            other => panic!(
+                "OpenAI: expected ProviderContinuation::OpenAI on CompleteResponse, got {other:?}",
+            ),
+        }
+    }
+
     conversation = conversation.with_response(&complete_response);
     conversation = conversation.with_item(InputItem::tool_result(
         weather_call.call_id.clone(),
@@ -77,12 +98,10 @@ async fn run_function_calling_test<T: ProviderTestSetup>() -> Result<(), Box<dyn
             .to_string(),
     ));
 
-    let followup_request = LLMRequest::from_prompt(config.model, &conversation)
-        .temperature(0.7)
-        .max_tokens(150);
+    let followup_cfg = Config::new(config.model).temperature(0.7).max_tokens(150);
 
     // Second turn: ScriptedTransport asserts the follow-up body shape.
-    let followup_response = provider.generate(&followup_request).await?;
+    let followup_response = provider.generate(&conversation, &followup_cfg).await?;
     let followup_text = followup_response.text().await?;
     assert!(
         !followup_text.trim().is_empty(),
@@ -112,4 +131,13 @@ async fn test_anthropic_function_calling_e2e() {
     run_function_calling_test::<AnthropicTestSetup>()
         .await
         .expect("Anthropic function calling test failed");
+}
+
+#[cfg(feature = "llama-gguf")]
+#[tokio::test]
+async fn test_llama_gguf_function_calling_e2e() {
+    use super::providers::llama_gguf::LlamaGgufTestSetup;
+    run_function_calling_test::<LlamaGgufTestSetup>()
+        .await
+        .expect("llama-gguf function calling test failed");
 }

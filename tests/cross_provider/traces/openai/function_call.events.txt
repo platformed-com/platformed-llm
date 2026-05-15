@@ -5,8 +5,11 @@ Delta[0] "\":\""
 Delta[0] "Paris"
 Delta[0] "\"}"
 PartEnd[0]
+PartStart[1] continuation kind=OpenAI id=<n>
+PartEnd[1]
 Done finish=ToolCalls input=<n> output=<n>
 
 === final ===
 finish=ToolCalls
-output[0].part[0] tool_call name="get_weather" arguments="{\"city\":\"Paris\"}"
+part[0] tool_call name="get_weather" arguments="{\"city\":\"Paris\"}"
+part[1] continuation kind=OpenAI id=<n>

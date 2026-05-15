@@ -5,4 +5,4 @@ Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
-output[0].part[0] text "hello" annotations=0
+part[0] text "hello" annotations=0

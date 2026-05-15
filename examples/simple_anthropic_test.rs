@@ -1,6 +1,7 @@
 use futures_util::StreamExt;
-use platformed_llm::providers::vertex::AnthropicViaVertexProvider;
-use platformed_llm::{Error, LLMProvider, LLMRequest, Prompt, ResponseAccumulator};
+use platformed_llm::accumulator::ResponseAccumulator;
+use platformed_llm::providers::AnthropicViaVertexProvider;
+use platformed_llm::{Config, Error, Prompt, Provider};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -31,14 +32,14 @@ async fn main() -> Result<(), Error> {
 
     // Simple request
     let conversation = Prompt::user("Please just say 'Hello world!' - nothing else.");
-    let request = LLMRequest::from_prompt("claude-3-5-sonnet-v2@20241022", &conversation)
+    let cfg = Config::new("claude-3-5-sonnet-v2@20241022")
         .temperature(0.0)
         .max_tokens(20);
 
     println!("📤 Making simple request...");
 
     // Generate response
-    let response = provider.generate(&request).await?;
+    let response = provider.generate(&conversation, &cfg).await?;
     let mut stream = response.stream();
 
     println!("📥 Processing stream:");
@@ -62,12 +63,12 @@ async fn main() -> Result<(), Error> {
     println!("🏁 Processed {event_count} events");
 
     let complete_response = accumulator.finalize()?;
-    let content = complete_response.content();
+    let text = complete_response.text();
 
-    println!("📄 Response content: '{content}'");
-    println!("📄 Content length: {} characters", content.len());
+    println!("📄 Response content: '{text}'");
+    println!("📄 Content length: {} characters", text.len());
 
-    if content.is_empty() {
+    if text.is_empty() {
         println!("❌ Empty response detected!");
     } else {
         println!("✅ Got response content");

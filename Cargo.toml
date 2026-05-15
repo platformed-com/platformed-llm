@@ -6,36 +6,68 @@ description = "A unified abstraction over multiple LLM providers"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Async runtime — minimal subset; downstream chooses the executor.
+# Always-on core: async runtime, streaming primitives, serde, tracing.
 tokio = { version = "1.40", default-features = false }
 async-trait = "0.1"
 tracing = "0.1"
+bytes = "1.0"
+memchr = "2.7"
+futures = "0.3"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+thiserror = "2.0"
 
-# HTTP client
+# Optional — pulled in by specific provider features.
+# `reqwest` is the default HTTP client behind `ReqwestTransport`. Any
+# cloud provider (openai / google / anthropic) depends on it.
 reqwest = { version = "0.12", features = [
     "json",
     "stream",
-], default-features = false }
-bytes = "1.0"
-memchr = "2.7"
+], default-features = false, optional = true }
+# Lazy JSON value used by the OpenAI and Vertex wire-type structs.
+ijson = { version = "0.1", optional = true }
+# Application Default Credentials provider for Vertex.
+gcp_auth = { version = "0.12", optional = true }
+# UUID generation — synthetic call_ids for Gemini function calls.
+uuid = { version = "1.0", features = ["v4"], optional = true }
+# Local GGUF inference for the `llama-gguf` provider.
+llama-gguf = { version = "0.14", optional = true, default-features = false }
+# Procedural `stream!` generators for the local provider's
+# token-decode / event-translation pipeline.
+async-stream = { version = "0.3", optional = true }
 
-# Streaming
-futures = "0.3"
-futures-util = "0.3"
+# Pre-test downloader for GGUF models the integration suite consumes.
+# Gated behind `fetch-test-models` so it doesn't drag TLS into the lib
+# build by default.
+[[bin]]
+name = "fetch-test-models"
+path = "src/bin/fetch_test_models.rs"
+required-features = ["fetch-test-models"]
 
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["raw_value"] }
-ijson = "0.1"
+# Every example demonstrates a specific provider, so they're each
+# gated on the matching feature. With no default features, a bare
+# `cargo build` skips them; `cargo build --features openai` (or
+# `--all-features`) compiles them.
+[[example]]
+name = "function_calling"
+required-features = ["openai"]
 
-# Error handling
-thiserror = "2.0"
+[[example]]
+name = "debug_streaming"
+required-features = ["openai"]
 
-# Google Cloud authentication
-gcp_auth = "0.12"
+[[example]]
+name = "simple_anthropic_test"
+required-features = ["anthropic"]
 
-# UUID generation
-uuid = { version = "1.0", features = ["v4"] }
+[[example]]
+name = "vertex_unified_api"
+required-features = ["vertex"]
+
+[[example]]
+name = "capture_traces"
+required-features = ["openai", "google", "anthropic"]
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["macros", "rt", "rt-multi-thread", "process"] }
@@ -46,4 +78,35 @@ dotenvy = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
+# Nothing is on by default — downstream consumers opt into the
+# providers they need with `--features openai`, `--features
+# google,anthropic`, etc. A bare `cargo build` compiles the lib core
+# only (types, transport, accumulator).
 default = []
+
+# Default `ReqwestTransport`. Implied by every hosted-provider feature
+# since all of them need an HTTP client.
+reqwest = ["dep:reqwest"]
+
+# Cloud providers.
+openai = ["reqwest", "dep:ijson"]
+# Shared base for Gemini and Claude-via-Vertex. Pulls in HTTP + Google auth.
+vertex = ["reqwest", "dep:gcp_auth", "dep:ijson", "dep:uuid"]
+google = ["vertex"]
+anthropic = ["vertex"]
+
+# Local provider — embedded GGUF inference via the `llama-gguf` crate.
+# Enables `tokio/rt` so we can shuttle synchronous inference onto
+# `spawn_blocking`; `async-stream` powers the token-decode pipeline.
+llama-gguf = ["dep:llama-gguf", "dep:async-stream", "tokio/rt"]
+
+# Internal: gate for the `fetch-test-models` binary. Pulls in
+# `rustls-tls` + a multi-thread Tokio runtime so the bin can make
+# real HTTPS downloads. Off by default — the lib itself never picks
+# a TLS backend (downstream's call).
+fetch-test-models = [
+    "dep:reqwest",
+    "reqwest/rustls-tls",
+    "tokio/rt-multi-thread",
+    "tokio/macros",
+]

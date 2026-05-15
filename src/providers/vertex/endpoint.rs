@@ -4,7 +4,7 @@
 //! Vertex) hit `https://{location}-aiplatform.googleapis.com` with the same
 //! Google auth flow and almost identical URL shapes. This module owns those
 //! two pieces — *not* the HTTP client, which is now a top-level
-//! [`crate::Transport`] each provider holds independently.
+//! [`crate::transport::Transport`] each provider holds independently.
 //!
 //! The endpoint supports both static access tokens and Application Default
 //! Credentials (via `gcp_auth`). Tests can override the host with
@@ -24,9 +24,11 @@ use crate::Error;
 /// OAuth scope used for all Vertex AI calls.
 const VERTEX_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
-/// Authentication state for Vertex AI.
+/// Authentication state for Vertex AI. Internal — callers configure
+/// auth via [`VertexEndpoint::with_access_token`] /
+/// [`VertexEndpoint::with_adc`] rather than constructing this directly.
 #[derive(Clone)]
-pub enum VertexAuth {
+pub(crate) enum VertexAuth {
     /// A pre-fetched access token. The caller is responsible for refresh.
     Static(String),
     /// Application Default Credentials. The provider caches and refreshes
@@ -55,11 +57,7 @@ pub struct VertexEndpoint {
 
 impl VertexEndpoint {
     /// Build from a static access token (sync — no network calls).
-    pub fn with_access_token(
-        project_id: String,
-        location: String,
-        access_token: String,
-    ) -> Self {
+    pub fn with_access_token(project_id: String, location: String, access_token: String) -> Self {
         Self {
             project_id,
             location,
@@ -83,7 +81,8 @@ impl VertexEndpoint {
     }
 
     /// Override the base URL (scheme + host). Intended for tests using a mock
-    /// server. The path that follows is still constructed by [`endpoint`].
+    /// server. The path that follows is still constructed by
+    /// [`VertexEndpoint::url`].
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
         self
@@ -101,13 +100,7 @@ impl VertexEndpoint {
     /// - `method` is the verb (`generateContent`, `streamGenerateContent`,
     ///   `rawPredict`, `streamRawPredict`).
     /// - `query` is appended verbatim after `?`, or omitted when `None`.
-    pub fn url(
-        &self,
-        publisher: &str,
-        model: &str,
-        method: &str,
-        query: Option<&str>,
-    ) -> String {
+    pub fn url(&self, publisher: &str, model: &str, method: &str, query: Option<&str>) -> String {
         let host = self
             .base_url
             .as_deref()
@@ -141,8 +134,8 @@ impl VertexEndpoint {
     }
 
     /// Build the `Authorization: Bearer …` header tuple. Sugar over
-    /// [`access_token`] for the common case where the provider just needs
-    /// to attach it to a `TransportRequest.headers`.
+    /// [`VertexEndpoint::access_token`] for the common case where the
+    /// provider just needs to attach it to a `TransportRequest.headers`.
     pub async fn auth_header(&self) -> Result<(String, String), Error> {
         let token = self.access_token().await?;
         Ok(("Authorization".to_string(), format!("Bearer {token}")))

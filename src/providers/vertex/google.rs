@@ -4,13 +4,14 @@ use uuid::Uuid;
 
 use super::endpoint::VertexEndpoint;
 use super::google_types::*;
-use crate::provider::LLMProvider;
+use crate::provider::Provider;
 use crate::sse_stream::SseStream;
 use crate::transport::{Transport, TransportRequest};
 use crate::types::{
-    AssistantPart, FinishReason, FunctionCall, InputItem, PartKind, UserPart,
+    Annotation, AnnotationKind, AssistantPart, FinishReason, InputItem, PartKind, PartUpdate,
+    UserPart,
 };
-use crate::{Error, LLMRequest, Response, StreamEvent};
+use crate::{Config, Error, Response, StreamEvent};
 
 /// Google provider implementation via Vertex AI (for Gemini models).
 pub struct GoogleProvider {
@@ -53,11 +54,20 @@ impl GoogleProvider {
     /// and pre-built [`VertexEndpoint`]. Lets downstream consumers / tests
     /// plug in custom recording / replaying / retrying transports.
     pub fn with_transport(endpoint: VertexEndpoint, transport: Transport) -> Self {
-        Self { endpoint, transport }
+        Self {
+            endpoint,
+            transport,
+        }
     }
 
     /// Convert internal request to Google format.
-    fn convert_request(&self, request: &LLMRequest) -> Result<GoogleRequest, Error> {
+    fn convert_request(
+        &self,
+        prompt: &crate::Prompt,
+        config: &Config,
+    ) -> Result<GoogleRequest, Error> {
+        let messages = prompt.items();
+
         let mut contents: Vec<GoogleContent> = Vec::new();
         let mut system_instruction = None;
 
@@ -85,11 +95,18 @@ impl GoogleProvider {
             });
         }
 
+        // Scan history for the latest Gemini continuation. Items at
+        // and before its index are elided — the server already has them
+        // via the referenced `cachedContent` resource. Continuations
+        // for other providers are ignored.
+        let (cached_content, start_index) = find_latest_gemini_continuation(messages);
+        let active_messages = &messages[start_index..];
+
         // First pass: collect the assistant turns' tool_call name + id
         // pairs so we can echo them back on the corresponding user
         // ToolResult (Gemini's `functionResponse` part requires the
         // function name on the wire).
-        for item in &request.messages {
+        for item in active_messages {
             if let InputItem::Assistant { content } = item {
                 for part in content {
                     if let AssistantPart::ToolCall(call) = part {
@@ -99,7 +116,7 @@ impl GoogleProvider {
             }
         }
 
-        for item in &request.messages {
+        for item in active_messages {
             match item {
                 InputItem::System(content) => {
                     system_instruction = Some(GoogleContent {
@@ -184,15 +201,14 @@ impl GoogleProvider {
                             }
                             UserPart::Document(src) => {
                                 let part = match src {
-                                    crate::types::DocumentSource::Base64 {
-                                        data,
-                                        media_type,
-                                    } => GooglePart::InlineData {
-                                        inline_data: GoogleInlineData {
-                                            mime_type: media_type.clone(),
-                                            data: data.clone(),
-                                        },
-                                    },
+                                    crate::types::DocumentSource::Base64 { data, media_type } => {
+                                        GooglePart::InlineData {
+                                            inline_data: GoogleInlineData {
+                                                mime_type: media_type.clone(),
+                                                data: data.clone(),
+                                            },
+                                        }
+                                    }
                                     crate::types::DocumentSource::Url(u) => GooglePart::FileData {
                                         file_data: GoogleFileData {
                                             mime_type: "application/pdf".to_string(),
@@ -248,6 +264,8 @@ impl GoogleProvider {
                             }
                             AssistantPart::Reasoning { .. }
                             | AssistantPart::RedactedReasoning { .. }
+                            | AssistantPart::BuiltinToolCall { .. }
+                            | AssistantPart::Continuation(_)
                             | AssistantPart::CacheBreakpoint => {
                                 tracing::debug!(
                                     "Google provider dropping unsupported assistant part"
@@ -259,8 +277,9 @@ impl GoogleProvider {
             }
         }
 
-        let thinking_config = request.reasoning.as_ref().map(|cfg| {
-            let thinking_budget = match cfg.effort.unwrap_or(crate::types::ReasoningEffort::Medium) {
+        let thinking_config = config.reasoning.as_ref().map(|cfg| {
+            let thinking_budget = match cfg.effort.unwrap_or(crate::types::ReasoningEffort::Medium)
+            {
                 crate::types::ReasoningEffort::Low => 2048,
                 crate::types::ReasoningEffort::Medium => 8192,
                 crate::types::ReasoningEffort::High => 16384,
@@ -268,31 +287,30 @@ impl GoogleProvider {
             GoogleThinkingConfig { thinking_budget }
         });
 
-        let (response_mime_type, response_schema) = match &request.response_format {
+        let (response_mime_type, response_schema) = match &config.response_format {
             Some(crate::types::ResponseFormat::JsonObject) => {
                 (Some("application/json".to_string()), None)
             }
-            Some(crate::types::ResponseFormat::JsonSchema { schema, .. }) => (
-                Some("application/json".to_string()),
-                Some(schema.clone()),
-            ),
+            Some(crate::types::ResponseFormat::JsonSchema { schema, .. }) => {
+                (Some("application/json".to_string()), Some(schema.clone()))
+            }
             // ResponseFormat::Text or None — leave unset.
             Some(crate::types::ResponseFormat::Text) | None => (None, None),
         };
 
         let generation_config = Some(GoogleGenerationConfig {
-            temperature: request.temperature,
-            max_output_tokens: request.max_tokens,
-            top_p: request.top_p,
-            stop_sequences: request.stop.clone(),
-            presence_penalty: request.presence_penalty,
-            frequency_penalty: request.frequency_penalty,
+            temperature: config.temperature,
+            max_output_tokens: config.max_tokens,
+            top_p: config.top_p,
+            stop_sequences: config.stop.clone(),
+            presence_penalty: config.presence_penalty,
+            frequency_penalty: config.frequency_penalty,
             thinking_config,
             response_mime_type,
             response_schema,
         });
 
-        let tools = request.tools.as_ref().and_then(|tools| {
+        let tools = config.tools.as_ref().and_then(|tools| {
             use crate::types::{ProviderBuiltin, Tool};
             let mut function_decls: Vec<GoogleFunctionDeclaration> = Vec::new();
             let mut entries: Vec<GoogleTool> = Vec::new();
@@ -333,43 +351,35 @@ impl GoogleProvider {
             }
         });
 
-        let tool_config =
-            request
-                .tool_choice
-                .as_ref()
-                .map(|choice| match choice {
-                    crate::types::ToolChoice::Auto => GoogleToolConfig {
-                        function_calling_config: GoogleFunctionCallingConfig {
-                            mode: "AUTO",
-                            allowed_function_names: None,
-                        },
-                    },
-                    crate::types::ToolChoice::None => GoogleToolConfig {
-                        function_calling_config: GoogleFunctionCallingConfig {
-                            mode: "NONE",
-                            allowed_function_names: None,
-                        },
-                    },
-                    crate::types::ToolChoice::Required => GoogleToolConfig {
-                        function_calling_config: GoogleFunctionCallingConfig {
-                            mode: "ANY",
-                            allowed_function_names: None,
-                        },
-                    },
-                    crate::types::ToolChoice::Function { name } => GoogleToolConfig {
-                        function_calling_config: GoogleFunctionCallingConfig {
-                            mode: "ANY",
-                            allowed_function_names: Some(vec![name.clone()]),
-                        },
-                    },
-                });
+        let tool_config = config.tool_choice.as_ref().map(|choice| match choice {
+            crate::types::ToolChoice::Auto => GoogleToolConfig {
+                function_calling_config: GoogleFunctionCallingConfig {
+                    mode: "AUTO",
+                    allowed_function_names: None,
+                },
+            },
+            crate::types::ToolChoice::None => GoogleToolConfig {
+                function_calling_config: GoogleFunctionCallingConfig {
+                    mode: "NONE",
+                    allowed_function_names: None,
+                },
+            },
+            crate::types::ToolChoice::Required => GoogleToolConfig {
+                function_calling_config: GoogleFunctionCallingConfig {
+                    mode: "ANY",
+                    allowed_function_names: None,
+                },
+            },
+            crate::types::ToolChoice::Function { name } => GoogleToolConfig {
+                function_calling_config: GoogleFunctionCallingConfig {
+                    mode: "ANY",
+                    allowed_function_names: Some(vec![name.clone()]),
+                },
+            },
+        });
 
-        let cached_content = match &request.continuation {
-            Some(crate::types::ProviderContinuation::Gemini { cached_content }) => {
-                Some(cached_content.clone())
-            }
-            _ => None,
-        };
+        // `cached_content` was extracted up-front from the message
+        // history; nothing more to do here.
 
         let google_request = GoogleRequest {
             contents,
@@ -382,27 +392,9 @@ impl GoogleProvider {
 
         Ok(google_request)
     }
-
 }
 
-/// Flatten a tool-result's content array into a single string. Non-text
-/// parts (images, etc.) aren't representable in Gemini's
-/// `functionResponse.response` shape and are dropped with a debug note.
-fn flatten_user_parts_to_text(parts: &[UserPart]) -> String {
-    let mut out = String::new();
-    for part in parts {
-        match part {
-            UserPart::Text(s) => {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(s);
-            }
-            _ => tracing::debug!("dropping non-text tool result part for Gemini flatten"),
-        }
-    }
-    out
-}
+use crate::providers::flatten_user_parts_to_text;
 
 /// Shape a tool's output for Gemini's `functionResponse.response` field,
 /// which the API requires to be a JSON object.
@@ -422,13 +414,13 @@ fn encode_function_output(output: &str) -> IValue {
 }
 
 #[async_trait::async_trait]
-impl LLMProvider for GoogleProvider {
-    async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
-        let google_request = self.convert_request(request)?;
+impl Provider for GoogleProvider {
+    async fn generate(&self, prompt: &crate::Prompt, config: &Config) -> Result<Response, Error> {
+        let google_request = self.convert_request(prompt, config)?;
 
         let url = self.endpoint.url(
             "google",
-            &request.model,
+            &config.model,
             "streamGenerateContent",
             Some("alt=sse"),
         );
@@ -456,11 +448,9 @@ impl LLMProvider for GoogleProvider {
                     Error::auth_with_status(status, format!("Google {status}: {body_text}"))
                 }
                 404 => Error::ModelNotAvailable(format!("Google 404: {body_text}")),
-                _ => Error::provider_with_status(
-                    "Google",
-                    status,
-                    format!("API error: {body_text}"),
-                ),
+                _ => {
+                    Error::provider_with_status("Google", status, format!("API error: {body_text}"))
+                }
             });
         }
 
@@ -512,37 +502,126 @@ impl LLMProvider for GoogleProvider {
     }
 }
 
-/// Stream state for Gemini's `streamGenerateContent`. Gemini emits each
-/// chunk's parts in a `parts` array — consecutive text parts continue
-/// the same logical text span, and `functionCall` parts arrive
-/// already-complete. The state tracks which part-index is open and
-/// closes it when the part changes or the stream ends.
-#[derive(Debug, Default)]
+/// Walk the history right-to-left for the most recent
+/// [`InputItem::Assistant`] containing an
+/// [`AssistantPart::Continuation`] of
+/// [`crate::types::ProviderContinuation::Gemini`]. Returns the cached-
+/// content resource name plus the index of the first item the provider
+/// should send (one past the assistant turn — the server has it via
+/// the cached content). Non-Gemini continuation parts are transparently
+/// skipped.
+fn find_latest_gemini_continuation(
+    messages: &[crate::types::InputItem],
+) -> (Option<String>, usize) {
+    use crate::types::{AssistantPart, InputItem, ProviderContinuation};
+    for (i, item) in messages.iter().enumerate().rev() {
+        if let InputItem::Assistant { content } = item {
+            for part in content.iter().rev() {
+                if let AssistantPart::Continuation(ProviderContinuation::Gemini {
+                    cached_content,
+                }) = part
+                {
+                    return (Some(cached_content.clone()), i + 1);
+                }
+            }
+        }
+    }
+    (None, 0)
+}
+
+/// Convert Gemini's batched `groundingMetadata` payload into one or
+/// more flat [`Annotation`]s. Each `groundingSupport` (span) yields one
+/// annotation per cited chunk, so a span that draws from N sources
+/// surfaces as N URL citations covering the same byte range.
+fn flatten_grounding_metadata(meta: &GoogleGroundingMetadata) -> Vec<Annotation> {
+    let mut out = Vec::new();
+    for support in &meta.grounding_supports {
+        for &chunk_idx in &support.grounding_chunk_indices {
+            let Some(chunk) = meta.grounding_chunks.get(chunk_idx as usize) else {
+                continue;
+            };
+            let Some(web) = &chunk.web else {
+                continue;
+            };
+            out.push(Annotation {
+                kind: AnnotationKind::UrlCitation,
+                start: support.segment.start_index,
+                end: support.segment.end_index,
+                source: web.uri.clone(),
+                title: web.title.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Slot key for [`GoogleStreamState::tracker`]. Gemini doesn't carry
+/// part identifiers on the wire (parts are anonymous entries in the
+/// `parts` array), so the lib uses fixed slots for the two
+/// long-running part kinds (text spans and code-execution call/result
+/// pairs) plus a fresh-key namespace for one-shot tool calls.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum GoogleSlot {
+    /// Open text span; multiple consecutive `Text` parts on the wire
+    /// continue the same logical part until a non-text emission closes
+    /// it.
+    Text,
+    /// Open `BuiltinToolCall(CodeExecution)` part. Gemini emits
+    /// `executableCode` and `codeExecutionResult` as sibling parts;
+    /// the slot keeps the call open until the result lands.
+    CodeExecution,
+}
+
+/// Stream state for Gemini's `streamGenerateContent`. Single
+/// [`PartTracker`] manages all part-index allocation so there's no
+/// chance of drift between separately-tracked counters.
+#[derive(Debug)]
 pub(crate) struct GoogleStreamState {
-    /// Synthetic counter for next-part-index allocation.
-    next_index: u32,
-    /// Index of the currently-open text part, if any.
-    text_part: Option<u32>,
+    tracker: crate::providers::part_tracker::PartTracker<GoogleSlot>,
+}
+
+impl Default for GoogleStreamState {
+    fn default() -> Self {
+        Self {
+            tracker: crate::providers::part_tracker::PartTracker::new(),
+        }
+    }
 }
 
 impl GoogleStreamState {
     fn open_text(&mut self, out: &mut Vec<StreamEvent>) -> u32 {
-        if let Some(idx) = self.text_part {
+        if let Some(idx) = self.tracker.index_of(&GoogleSlot::Text) {
             return idx;
         }
-        let idx = self.next_index;
-        self.next_index += 1;
-        self.text_part = Some(idx);
-        out.push(StreamEvent::PartStart {
-            index: idx,
-            kind: PartKind::Text,
-        });
+        let (idx, ev) = self.tracker.open(GoogleSlot::Text, PartKind::Text);
+        out.push(ev);
         idx
     }
 
     fn close_text(&mut self, out: &mut Vec<StreamEvent>) {
-        if let Some(idx) = self.text_part.take() {
-            out.push(StreamEvent::PartEnd { index: idx });
+        if let Some(ev) = self.tracker.close(&GoogleSlot::Text) {
+            out.push(ev);
+        }
+    }
+
+    fn open_code_execution(&mut self, out: &mut Vec<StreamEvent>) -> u32 {
+        let (idx, ev) = self.tracker.open(
+            GoogleSlot::CodeExecution,
+            PartKind::BuiltinToolCall {
+                kind: crate::types::ProviderBuiltin::CodeExecution,
+            },
+        );
+        out.push(ev);
+        idx
+    }
+
+    fn code_execution_index(&self) -> Option<u32> {
+        self.tracker.index_of(&GoogleSlot::CodeExecution)
+    }
+
+    fn close_code_execution(&mut self, out: &mut Vec<StreamEvent>) {
+        if let Some(ev) = self.tracker.close(&GoogleSlot::CodeExecution) {
+            out.push(ev);
         }
     }
 
@@ -553,22 +632,27 @@ impl GoogleStreamState {
         name: String,
         arguments: String,
     ) {
-        let idx = self.next_index;
-        self.next_index += 1;
-        out.push(StreamEvent::PartStart {
-            index: idx,
-            kind: PartKind::ToolCall {
-                call_id,
-                name: name.clone(),
-            },
+        let events = self.tracker.open_one_shot(PartKind::ToolCall {
+            call_id,
+            name: name.clone(),
         });
+        // open_one_shot emits PartStart + PartEnd; insert the
+        // arguments Delta between them.
+        let mut iter = events.into_iter();
+        let start = iter.next().expect("PartStart");
+        let end = iter.next().expect("PartEnd");
+        let StreamEvent::PartStart { index, .. } = &start else {
+            unreachable!("open_one_shot first event is PartStart");
+        };
+        let index = *index;
+        out.push(start);
         if !arguments.is_empty() {
             out.push(StreamEvent::Delta {
-                index: idx,
+                index,
                 delta: arguments,
             });
         }
-        out.push(StreamEvent::PartEnd { index: idx });
+        out.push(end);
     }
 }
 
@@ -587,6 +671,9 @@ pub(crate) fn convert_response_stateful(
                     if text.is_empty() {
                         continue;
                     }
+                    // Text following a code-execution call ends the
+                    // call's lifecycle; close it before opening text.
+                    state.close_code_execution(&mut events);
                     let idx = state.open_text(&mut events);
                     events.push(StreamEvent::Delta {
                         index: idx,
@@ -596,6 +683,7 @@ pub(crate) fn convert_response_stateful(
                 GooglePart::FunctionCall { function_call } => {
                     // Close any open text part before starting a tool call.
                     state.close_text(&mut events);
+                    state.close_code_execution(&mut events);
                     let base_id = Uuid::new_v4().simple().to_string();
                     let call_id = format!("call_{base_id}");
                     let arguments = serde_json::to_string(&function_call.args).map_err(|e| {
@@ -609,39 +697,42 @@ pub(crate) fn convert_response_stateful(
                     );
                 }
                 GooglePart::ExecutableCode { executable_code } => {
-                    // Surface the model-written code as a text delta in
-                    // a fenced code block. The lib has no typed
-                    // AssistantPart for code execution; emitting it as
-                    // text means callers see what the model wrote and
-                    // ran. A future Phase could lift this into a typed
-                    // surface.
+                    // `executableCode` opens a CodeExecution
+                    // BuiltinToolCall; the matching
+                    // `codeExecutionResult` (if any) populates its
+                    // `result` via PartUpdate before we close.
                     state.close_text(&mut events);
-                    let idx = state.open_text(&mut events);
-                    let lang = executable_code.language.to_lowercase();
+                    state.close_code_execution(&mut events);
+                    let idx = state.open_code_execution(&mut events);
+                    let arguments = serde_json::json!({
+                        "language": executable_code.language,
+                        "code": executable_code.code,
+                    })
+                    .to_string();
                     events.push(StreamEvent::Delta {
                         index: idx,
-                        delta: format!(
-                            "\n```{lang}\n{}\n```\n",
-                            executable_code.code
-                        ),
+                        delta: arguments,
                     });
                 }
                 GooglePart::CodeExecutionResult {
                     code_execution_result,
                 } => {
-                    state.close_text(&mut events);
-                    let idx = state.open_text(&mut events);
-                    let body = code_execution_result
-                        .output
-                        .clone()
-                        .unwrap_or_else(String::new);
-                    events.push(StreamEvent::Delta {
+                    let result = serde_json::json!({
+                        "outcome": code_execution_result.outcome,
+                        "output": code_execution_result.output,
+                    })
+                    .to_string();
+                    let idx = match state.code_execution_index() {
+                        Some(idx) => idx,
+                        // Unpaired result — open a synthetic part so
+                        // the data isn't silently lost.
+                        None => state.open_code_execution(&mut events),
+                    };
+                    events.push(StreamEvent::PartUpdate {
                         index: idx,
-                        delta: format!(
-                            "\n```\n{body}\n```\n(outcome: {})\n",
-                            code_execution_result.outcome
-                        ),
+                        update: PartUpdate::BuiltinToolResult(result),
                     });
+                    state.close_code_execution(&mut events);
                 }
                 GooglePart::FunctionResponse { .. }
                 | GooglePart::InlineData { .. }
@@ -653,8 +744,25 @@ pub(crate) fn convert_response_stateful(
 
         // Only add a Done event if this response has a finish_reason (indicates end of stream)
         if let Some(finish_reason_str) = &candidate.finish_reason {
+            // Flush grounding annotations onto the open text part before
+            // closing it. Gemini batches grounding metadata on the final
+            // chunk; we replay each support as a PartUpdate so the
+            // accumulator can attach citations to AssistantPart::Text.
+            if let (Some(text_idx), Some(meta)) = (
+                state.tracker.index_of(&GoogleSlot::Text),
+                &candidate.grounding_metadata,
+            ) {
+                for annotation in flatten_grounding_metadata(meta) {
+                    events.push(StreamEvent::PartUpdate {
+                        index: text_idx,
+                        update: PartUpdate::Annotation(annotation),
+                    });
+                }
+            }
+
             // Close any still-open text part before emitting Done.
             state.close_text(&mut events);
+            state.close_code_execution(&mut events);
 
             let finish_reason = match finish_reason_str.as_str() {
                 "STOP" => FinishReason::Stop,
@@ -707,38 +815,31 @@ pub(crate) fn convert_response_stateful(
     Ok(events)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Config;
 
     #[test]
     fn convert_simple_text_request() {
-        let provider = GoogleProvider::new(
-            "p".to_string(),
-            "us-east1".to_string(),
-            "tok".to_string(),
-        )
-        .unwrap();
-        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"));
-        let body = provider.convert_request(&req).unwrap();
+        let provider =
+            GoogleProvider::new("p".to_string(), "us-east1".to_string(), "tok".to_string())
+                .unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::new("gemini");
+        let body = provider.convert_request(&prompt, &cfg).unwrap();
         assert_eq!(body.contents.len(), 1);
         assert_eq!(body.contents[0].role, "user");
     }
 
     #[test]
     fn system_instruction_role_is_not_user() {
-        let provider = GoogleProvider::new(
-            "p".to_string(),
-            "us-east1".to_string(),
-            "tok".to_string(),
-        )
-        .unwrap();
-        let req = LLMRequest::from_prompt(
-            "gemini",
-            &crate::Prompt::system("you are helpful").with_user("hi"),
-        );
-        let body = provider.convert_request(&req).unwrap();
+        let provider =
+            GoogleProvider::new("p".to_string(), "us-east1".to_string(), "tok".to_string())
+                .unwrap();
+        let prompt = crate::Prompt::system("you are helpful").with_user("hi");
+        let cfg = Config::new("gemini");
+        let body = provider.convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         let role = json["systemInstruction"]["role"].as_str();
         assert!(
@@ -760,25 +861,26 @@ mod tests {
             .chain(convert_response_stateful(r2, &mut state).unwrap())
             .collect();
         // We expect: PartStart Text, Delta "Hello", Delta " world", PartEnd, Done
-        assert!(matches!(events[0], StreamEvent::PartStart { kind: PartKind::Text, .. }));
+        assert!(matches!(
+            events[0],
+            StreamEvent::PartStart {
+                kind: PartKind::Text,
+                ..
+            }
+        ));
         assert!(matches!(events[1], StreamEvent::Delta { .. }));
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
     }
 
     fn provider() -> GoogleProvider {
-        GoogleProvider::new(
-            "p".to_string(),
-            "us-east1".to_string(),
-            "tok".to_string(),
-        )
-        .unwrap()
+        GoogleProvider::new("p".to_string(), "us-east1".to_string(), "tok".to_string()).unwrap()
     }
 
     #[test]
     fn stop_sequences_threaded_through_request() {
-        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
-            .stop(vec!["END".to_string(), "STOP".to_string()]);
-        let body = provider().convert_request(&req).unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::new("gemini").stop(vec!["END".to_string(), "STOP".to_string()]);
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["generationConfig"]["stopSequences"],
@@ -788,10 +890,11 @@ mod tests {
 
     #[test]
     fn presence_and_frequency_penalty_threaded_through() {
-        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::new("gemini")
             .presence_penalty(0.5)
             .frequency_penalty(0.25);
-        let body = provider().convert_request(&req).unwrap();
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         // Use exact float values (0.5, 0.25) that survive f32 → JSON without
         // representation drift.
@@ -802,12 +905,12 @@ mod tests {
     #[test]
     fn reasoning_config_emits_thinking_budget() {
         use crate::types::{ReasoningConfig, ReasoningEffort};
-        let req = LLMRequest::from_prompt("gemini-2.5-flash", &crate::Prompt::user("hi"))
-            .reasoning(ReasoningConfig {
-                effort: Some(ReasoningEffort::High),
-                summary: None,
-            });
-        let body = provider().convert_request(&req).unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::new("gemini-2.5-flash").reasoning(ReasoningConfig {
+            effort: Some(ReasoningEffort::High),
+            summary: None,
+        });
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["generationConfig"]["thinkingConfig"]["thinkingBudget"],
@@ -818,24 +921,21 @@ mod tests {
     #[test]
     fn tool_choice_required_maps_to_any_mode() {
         use crate::types::ToolChoice;
-        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
-            .tool_choice(ToolChoice::Required);
-        let body = provider().convert_request(&req).unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::new("gemini").tool_choice(ToolChoice::Required);
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
-        assert_eq!(
-            json["toolConfig"]["functionCallingConfig"]["mode"],
-            "ANY",
-        );
+        assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "ANY",);
     }
 
     #[test]
     fn tool_choice_function_restricts_allowed_names() {
         use crate::types::ToolChoice;
-        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
-            .tool_choice(ToolChoice::Function {
-                name: "get_weather".to_string(),
-            });
-        let body = provider().convert_request(&req).unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::new("gemini").tool_choice(ToolChoice::Function {
+            name: "get_weather".to_string(),
+        });
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
@@ -846,9 +946,9 @@ mod tests {
     #[test]
     fn google_search_builtin_emits_separate_tool_entry() {
         use crate::types::{ProviderBuiltin, Tool};
-        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
-            .tools(vec![Tool::builtin(ProviderBuiltin::GoogleSearch)]);
-        let body = provider().convert_request(&req).unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::new("gemini").tools(vec![Tool::builtin(ProviderBuiltin::GoogleSearch)]);
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["tools"], serde_json::json!([{ "googleSearch": {} }]));
     }
@@ -856,21 +956,23 @@ mod tests {
     #[test]
     fn code_execution_builtin_emits_separate_tool_entry() {
         use crate::types::{ProviderBuiltin, Tool};
-        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
-            .tools(vec![Tool::builtin(ProviderBuiltin::CodeExecution)]);
-        let body = provider().convert_request(&req).unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::new("gemini").tools(vec![Tool::builtin(ProviderBuiltin::CodeExecution)]);
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["tools"], serde_json::json!([{ "codeExecution": {} }]));
     }
 
     #[test]
     fn cached_content_continuation_threaded_through_request() {
-        use crate::types::ProviderContinuation;
-        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
-            .continuation(ProviderContinuation::Gemini {
+        use crate::types::{InputItem, ProviderContinuation};
+        let prompt = crate::Prompt::user("hi").with_item(InputItem::assistant_continuation(
+            ProviderContinuation::Gemini {
                 cached_content: "projects/p/locations/l/cachedContents/abc".to_string(),
-            });
-        let body = provider().convert_request(&req).unwrap();
+            },
+        ));
+        let cfg = Config::new("gemini");
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["cachedContent"],
@@ -881,9 +983,9 @@ mod tests {
     #[test]
     fn response_format_json_object_sets_mime_type() {
         use crate::types::ResponseFormat;
-        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
-            .response_format(ResponseFormat::JsonObject);
-        let body = provider().convert_request(&req).unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::new("gemini").response_format(ResponseFormat::JsonObject);
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["generationConfig"]["responseMimeType"],
@@ -903,13 +1005,13 @@ mod tests {
             r#"{"type":"object","properties":{"x":{"type":"number"}}}"#.to_string(),
         )
         .unwrap();
-        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
-            .response_format(ResponseFormat::JsonSchema {
-                name: "Point".to_string(),
-                schema: Cow::Owned(schema_raw),
-                strict: true,
-            });
-        let body = provider().convert_request(&req).unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::new("gemini").response_format(ResponseFormat::JsonSchema {
+            name: "Point".to_string(),
+            schema: Cow::Owned(schema_raw),
+            strict: true,
+        });
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["generationConfig"]["responseMimeType"],
@@ -918,18 +1020,110 @@ mod tests {
         assert_eq!(json["generationConfig"]["responseSchema"]["type"], "object");
     }
 
-    /// An OpenAI continuation is ignored by Gemini — the model-
-    /// switching contract: hints from the wrong provider degrade
+    /// An OpenAI continuation part is ignored by Gemini — the
+    /// model-switching contract: hints from the wrong provider degrade
     /// silently to a full-history request.
     #[test]
     fn openai_continuation_ignored_by_gemini() {
-        use crate::types::ProviderContinuation;
-        let req = LLMRequest::from_prompt("gemini", &crate::Prompt::user("hi"))
-            .continuation(ProviderContinuation::OpenAI {
+        use crate::types::{InputItem, ProviderContinuation};
+        let prompt = crate::Prompt::user("hi").with_item(InputItem::assistant_continuation(
+            ProviderContinuation::OpenAI {
                 response_id: "resp_abc".to_string(),
-            });
-        let body = provider().convert_request(&req).unwrap();
+            },
+        ));
+        let cfg = Config::new("gemini");
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert!(json.get("cachedContent").is_none());
+    }
+
+    /// A Gemini continuation deep inside the history should elide all
+    /// prior items: the request must contain only the items that
+    /// follow the assistant turn carrying the marker.
+    #[test]
+    fn gemini_continuation_elides_prior_history() {
+        use crate::types::{InputItem, ProviderContinuation};
+        let prompt = crate::Prompt::user("first turn")
+            .with_assistant("first answer")
+            .with_item(InputItem::assistant_continuation(
+                ProviderContinuation::Gemini {
+                    cached_content: "cached/1".to_string(),
+                },
+            ))
+            .with_user("follow-up");
+        let cfg = Config::new("gemini");
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
+        assert_eq!(body.contents.len(), 1);
+        assert_eq!(body.contents[0].role, "user");
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["cachedContent"], "cached/1");
+    }
+
+    /// Full roundtrip: a Gemini `CompleteResponse` folded into the
+    /// next prompt via `with_response()` should have its continuation
+    /// picked up and prior history elided automatically.
+    #[test]
+    fn with_response_threads_continuation_into_next_request() {
+        use crate::response::CompleteResponse;
+        use crate::types::{AssistantPart, FinishReason, ProviderContinuation, Usage};
+        let prior = CompleteResponse {
+            content: vec![
+                AssistantPart::Text {
+                    content: "first answer".into(),
+                    annotations: Vec::new(),
+                },
+                AssistantPart::Continuation(ProviderContinuation::Gemini {
+                    cached_content: "cached/prior".into(),
+                }),
+            ],
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        };
+        let prompt = crate::Prompt::user("first turn")
+            .with_response(&prior)
+            .with_user("follow-up");
+        let cfg = Config::new("gemini");
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["cachedContent"], "cached/prior");
+        assert_eq!(body.contents.len(), 1);
+        if let GooglePart::Text { text } = &body.contents[0].parts[0] {
+            assert_eq!(text, "follow-up");
+        } else {
+            panic!("expected text part, got {:?}", body.contents[0].parts[0]);
+        }
+    }
+
+    /// The *most recent* matching continuation wins. Older markers of
+    /// the same type are superseded — only history after the latest
+    /// one is sent.
+    #[test]
+    fn latest_gemini_continuation_wins() {
+        use crate::types::{InputItem, ProviderContinuation};
+        let prompt = crate::Prompt::user("a")
+            .with_item(InputItem::assistant_continuation(
+                ProviderContinuation::Gemini {
+                    cached_content: "cached/old".to_string(),
+                },
+            ))
+            .with_user("b")
+            .with_item(InputItem::assistant_continuation(
+                ProviderContinuation::Gemini {
+                    cached_content: "cached/new".to_string(),
+                },
+            ))
+            .with_user("c");
+        let cfg = Config::new("gemini");
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
+        assert_eq!(body.contents.len(), 1);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["cachedContent"], "cached/new");
+        // Only the items after `cached/new` are sent.
+        assert_eq!(body.contents[0].parts.len(), 1);
+        if let GooglePart::Text { text } = &body.contents[0].parts[0] {
+            assert_eq!(text, "c");
+        } else {
+            panic!("expected text part, got {:?}", body.contents[0].parts[0]);
+        }
     }
 }

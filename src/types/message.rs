@@ -28,11 +28,17 @@ pub enum InputItem {
     System(String),
     /// User turn. Contains text, multimedia, tool results, and optional
     /// cache breakpoints in emit order.
-    User { content: Vec<UserPart> },
+    User {
+        /// Ordered user-turn parts.
+        content: Vec<UserPart>,
+    },
     /// Assistant turn. Contains the model's emissions in the order they
-    /// were produced — text, reasoning, refusals, tool calls all
-    /// interleaved as parts.
-    Assistant { content: Vec<AssistantPart> },
+    /// were produced — text, reasoning, refusals, tool calls,
+    /// continuation markers, all interleaved as parts.
+    Assistant {
+        /// Ordered assistant-turn parts.
+        content: Vec<AssistantPart>,
+    },
 }
 
 impl InputItem {
@@ -75,19 +81,36 @@ impl InputItem {
             content: vec![AssistantPart::ToolCall(call)],
         }
     }
+
+    /// Build an assistant turn whose only content is a provider
+    /// continuation marker. Useful for stitching a resumption hint into
+    /// the conversation history outside of a real model turn (e.g. in
+    /// tests).
+    pub fn assistant_continuation(continuation: super::config::ProviderContinuation) -> Self {
+        InputItem::Assistant {
+            content: vec![AssistantPart::Continuation(continuation)],
+        }
+    }
 }
 
 /// A part of a user turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UserPart {
+    /// Plain text content.
     Text(String),
+    /// Image input by URL or inline base64.
     Image(ImageSource),
+    /// Audio input by URL or inline base64.
     Audio(AudioSource),
+    /// Document (e.g. PDF) input by URL or inline base64.
     Document(DocumentSource),
     /// Result of a tool the assistant previously called. `call_id`
     /// correlates with a prior `AssistantPart::ToolCall`.
     ToolResult {
+        /// Identifier of the originating tool call.
         call_id: String,
+        /// Result payload, modelled as user parts so it can include
+        /// text, images, etc.
         content: Vec<UserPart>,
     },
     /// Anthropic-only: marks the end of a cacheable prefix in the
@@ -102,7 +125,9 @@ pub enum UserPart {
 pub enum AssistantPart {
     /// Visible text. Annotations attach citations to specific spans.
     Text {
+        /// The text body.
         content: String,
+        /// Citations / annotations over byte spans of `content`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         annotations: Vec<Annotation>,
     },
@@ -110,56 +135,126 @@ pub enum AssistantPart {
     /// Anthropic's thinking signature; dropped on cross-provider
     /// conversion.
     Reasoning {
+        /// The reasoning content.
         content: String,
+        /// Anthropic's opaque thinking signature, when supplied.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
     /// Anthropic redacted thinking — opaque blob passed back unchanged.
-    RedactedReasoning { data: String },
+    RedactedReasoning {
+        /// Opaque server-encrypted thinking blob.
+        data: String,
+    },
     /// Typed refusal (OpenAI). Translated to plain text on providers
     /// that don't model refusals separately.
     Refusal(String),
     /// A tool call the model emitted.
     ToolCall(FunctionCall),
+    /// A provider-builtin tool invocation — the provider executed the
+    /// tool natively (no client round-trip). `arguments` is JSON; the
+    /// shape depends on `kind` (`{"queries":[...]}` for web search,
+    /// `{"language":"python","code":"..."}` for code execution).
+    /// `result` is populated when the builtin returns a payload
+    /// directly (Gemini's `codeExecutionResult`); web search instead
+    /// surfaces sources via [`Annotation`]s on the trailing
+    /// [`AssistantPart::Text`].
+    BuiltinToolCall {
+        /// Which builtin tool was invoked.
+        kind: ProviderBuiltin,
+        /// JSON-encoded arguments the model passed to the builtin.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        arguments: String,
+        /// Inline result payload, when the provider returns one directly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+    },
+    /// Provider-issued resumption hint that identifies this assistant
+    /// turn server-side (e.g. OpenAI's `previous_response_id`). When
+    /// the caller sends a follow-up to the *same* provider, the
+    /// provider scans assistant history for the latest matching
+    /// continuation, sets the provider-side field, and elides this
+    /// turn (and every item before it) from the wire body — the
+    /// server already has them. Cross-provider markers are silently
+    /// dropped (model-switching contract).
+    Continuation(super::config::ProviderContinuation),
     /// Anthropic cache breakpoint marker, same semantics as
     /// [`UserPart::CacheBreakpoint`].
     CacheBreakpoint,
 }
 
 /// Citation or annotation attached to a span within an
-/// [`AssistantPart::Text`].
+/// [`AssistantPart::Text`]. `start` / `end` are byte offsets into the
+/// text content; both providers report them inclusive-of-start /
+/// exclusive-of-end.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Annotation {
+    /// What kind of citation this annotation represents.
     pub kind: AnnotationKind,
+    /// Inclusive start byte offset into the annotated text.
     pub start: usize,
+    /// Exclusive end byte offset into the annotated text.
     pub end: usize,
+    /// Primary identifier — URL for [`AnnotationKind::UrlCitation`],
+    /// file ID for [`AnnotationKind::FileCitation`].
     pub source: String,
+    /// Human-readable label, when the provider supplies one (e.g. page
+    /// title for a URL citation, filename for a file citation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
+/// Kind of citation an [`Annotation`] represents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AnnotationKind {
+    /// Cites a web URL (e.g. web search result).
     UrlCitation,
+    /// Cites a previously uploaded file.
     FileCitation,
-    WebSearch,
 }
 
+/// Source for an image input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ImageSource {
+    /// HTTP(S) URL the provider will fetch.
     Url(String),
-    Base64 { data: String, media_type: String },
+    /// Inline base64-encoded payload.
+    Base64 {
+        /// Base64-encoded image bytes.
+        data: String,
+        /// MIME type (e.g. `image/png`, `image/jpeg`).
+        media_type: String,
+    },
 }
 
+/// Source for an audio input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AudioSource {
+    /// HTTP(S) URL the provider will fetch.
     Url(String),
-    Base64 { data: String, media_type: String },
+    /// Inline base64-encoded payload.
+    Base64 {
+        /// Base64-encoded audio bytes.
+        data: String,
+        /// MIME type (e.g. `audio/mpeg`, `audio/wav`).
+        media_type: String,
+    },
 }
 
+/// Source for a document input (PDF, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DocumentSource {
+    /// HTTP(S) URL the provider will fetch.
     Url(String),
-    Base64 { data: String, media_type: String },
+    /// Inline base64-encoded payload.
+    Base64 {
+        /// Base64-encoded document bytes.
+        data: String,
+        /// MIME type (e.g. `application/pdf`).
+        media_type: String,
+    },
 }
 
 /// Tool definition the model can call.
@@ -172,7 +267,9 @@ pub enum DocumentSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Tool {
+    /// Caller-defined function tool.
     Function(Function),
+    /// Provider-builtin tool (web search, code execution, etc.).
     Builtin(ProviderBuiltin),
 }
 
@@ -205,19 +302,15 @@ impl Tool {
     }
 }
 
-/// Legacy alias retained for documentation symmetry. New code should
-/// match on `Tool` directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ToolType {
-    Function,
-}
-
+/// Caller-defined function tool the model can call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
+    /// Identifier the model uses to call the function.
     pub name: String,
+    /// Optional natural-language description shown to the model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// JSON Schema describing the argument object.
     pub parameters: Cow<'static, RawValue>,
 }
 
@@ -226,6 +319,7 @@ pub struct Function {
 /// the tools array on providers that don't offer the same builtin.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ProviderBuiltin {
     /// OpenAI / Anthropic web search.
     WebSearch,
@@ -244,7 +338,9 @@ pub enum ProviderBuiltin {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct ComputerUseConfig {
+    /// Virtual display width in pixels.
     pub display_width: u32,
+    /// Virtual display height in pixels.
     pub display_height: u32,
     /// Environment the model controls — `"browser"`, `"mac"`,
     /// `"windows"`, `"ubuntu"` on OpenAI; Anthropic accepts the same
@@ -255,17 +351,26 @@ pub struct ComputerUseConfig {
 /// A tool call emitted by the assistant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionCall {
+    /// Identifier the model assigns to this call; echoed back in the
+    /// matching `UserPart::ToolResult`.
     pub call_id: String,
+    /// Name of the tool the model is invoking.
     pub name: String,
     /// JSON-encoded argument object.
     pub arguments: String,
 }
 
+/// Why the model stopped generating.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FinishReason {
+    /// Natural end of the response (hit a stop sequence or the model decided to stop).
     Stop,
+    /// Hit `max_tokens` / provider-side length cap before finishing.
     Length,
+    /// The turn ended because the model emitted one or more tool calls.
     ToolCalls,
+    /// The provider's content filter blocked or truncated the response.
     ContentFilter,
 }

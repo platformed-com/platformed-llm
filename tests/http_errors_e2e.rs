@@ -1,3 +1,4 @@
+#![cfg(feature = "openai")]
 //! End-to-end tests for OpenAI HTTP error mapping.
 //!
 //! `parse_openai_error` has unit tests, but those don't exercise the path
@@ -13,10 +14,9 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::Stream;
-use platformed_llm::{
-    Error, LLMProvider, LLMRequest, OpenAIProvider, Prompt, Transport, TransportImpl,
-    TransportRequest, TransportResponse,
-};
+use platformed_llm::providers::OpenAIProvider;
+use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
+use platformed_llm::{Config, Error, Prompt, Provider};
 
 /// Test-only `TransportImpl` returning a fixed status / headers / body.
 /// The lib's error path will read these in the same order as it would
@@ -56,8 +56,9 @@ async fn openai_against(
         "http://placeholder".to_string(),
         transport,
     );
-    let req = LLMRequest::from_prompt("gpt-4o-mini", &Prompt::user("hi"));
-    provider.generate(&req).await.map(|_| ())
+    let prompt = Prompt::user("hi");
+    let cfg = Config::new("gpt-4o-mini");
+    provider.generate(&prompt, &cfg).await.map(|_| ())
 }
 
 #[tokio::test]
@@ -129,7 +130,9 @@ async fn http_500_surfaces_as_provider() {
         .expect_err("500 must error");
 
     match err {
-        Error::Provider { provider, message, .. } => {
+        Error::Provider {
+            provider, message, ..
+        } => {
             assert_eq!(provider, "OpenAI");
             assert!(message.contains("500"), "should mention status: {message}");
             assert!(message.contains("boom"), "should mention body: {message}");
@@ -148,7 +151,9 @@ async fn non_json_error_body_is_preserved() {
         .expect_err("503 must error");
 
     match err {
-        Error::Provider { provider, message, .. } => {
+        Error::Provider {
+            provider, message, ..
+        } => {
             assert_eq!(provider, "OpenAI");
             assert!(message.contains("upstream proxy timeout"), "got: {message}");
         }

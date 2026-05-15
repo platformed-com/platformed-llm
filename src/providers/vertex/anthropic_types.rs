@@ -66,9 +66,8 @@ pub enum AnthropicContent {
 
 /// Anthropic content block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicContentBlock {
-    #[serde(rename = "text")]
     Text {
         text: String,
         /// Anthropic prompt-caching hint. Marks the prefix up to this
@@ -76,7 +75,6 @@ pub enum AnthropicContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<AnthropicCacheControl>,
     },
-    #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
         name: String,
@@ -84,7 +82,6 @@ pub enum AnthropicContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<AnthropicCacheControl>,
     },
-    #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
         content: AnthropicToolResultContent,
@@ -96,7 +93,6 @@ pub enum AnthropicContentBlock {
     /// Extended-thinking block. The model's chain-of-thought reasoning;
     /// `signature` must be echoed back unchanged in subsequent turns to
     /// preserve thinking continuity.
-    #[serde(rename = "thinking")]
     Thinking {
         #[serde(default)]
         thinking: String,
@@ -105,17 +101,14 @@ pub enum AnthropicContentBlock {
     },
     /// Encrypted thinking that's been classified as sensitive. Pass-through
     /// only — opaque blob to be echoed back unchanged.
-    #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
     /// Image content block (request side).
-    #[serde(rename = "image")]
     Image {
         source: IValue,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<AnthropicCacheControl>,
     },
     /// Document (PDF) content block (request side).
-    #[serde(rename = "document")]
     Document {
         source: IValue,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,7 +119,6 @@ pub enum AnthropicContentBlock {
 /// Anthropic cache-control hint on a content block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicCacheControl {
-    #[serde(rename = "type")]
     pub r#type: String,
 }
 
@@ -142,11 +134,9 @@ pub enum AnthropicToolResultContent {
 
 /// Block forms acceptable inside a `tool_result.content` array.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicToolResultBlock {
-    #[serde(rename = "text")]
     Text { text: String },
-    #[serde(rename = "image")]
     Image { source: IValue },
 }
 
@@ -164,13 +154,11 @@ pub enum AnthropicTool {
     },
     /// Parameterless builtin (`web_search_20250305`).
     Builtin {
-        #[serde(rename = "type")]
         r#type: &'static str,
         name: &'static str,
     },
     /// Anthropic `computer_20250124` — display dimensions + environment.
     Computer {
-        #[serde(rename = "type")]
         r#type: &'static str,
         name: &'static str,
         display_width_px: u32,
@@ -178,15 +166,15 @@ pub enum AnthropicTool {
     },
 }
 
-/// Anthropic API response.
+/// Anthropic API response shell as it arrives on `message_start`.
+/// Only [`Self::usage`] is consumed today; other top-level fields
+/// (`id`, `model`, `role`, `content`, `stop_reason`) are present on
+/// the wire but stripped by serde since the streaming converter
+/// reconstructs them from the per-block events.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnthropicResponse {
-    pub id: String,
-    pub model: String,
-    pub role: String, // Always "assistant"
-    pub content: Vec<AnthropicContentBlock>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_reason: Option<String>,
+    /// Initial usage snapshot — Anthropic reports `input_tokens` here
+    /// and accumulates `output_tokens` via `message_delta` events.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<AnthropicUsage>,
 }
@@ -206,23 +194,22 @@ pub struct AnthropicUsage {
 
 /// Anthropic streaming events.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicStreamEvent {
-    #[serde(rename = "message_start")]
-    MessageStart { message: AnthropicResponse },
-    #[serde(rename = "content_block_start")]
+    MessageStart {
+        message: AnthropicResponse,
+    },
     ContentBlockStart {
         index: u32,
         content_block: AnthropicContentBlock,
     },
-    #[serde(rename = "content_block_delta")]
     ContentBlockDelta {
         index: u32,
         delta: AnthropicContentDelta,
     },
-    #[serde(rename = "content_block_stop")]
-    ContentBlockStop { index: u32 },
-    #[serde(rename = "message_delta")]
+    ContentBlockStop {
+        index: u32,
+    },
     MessageDelta {
         delta: AnthropicMessageDelta,
         // On the wire, `usage` is a top-level sibling of `delta` on
@@ -232,15 +219,14 @@ pub enum AnthropicStreamEvent {
         #[serde(default)]
         usage: Option<AnthropicUsage>,
     },
-    #[serde(rename = "message_stop")]
     MessageStop,
-    #[serde(rename = "ping")]
     Ping,
     /// Operational error delivered mid-stream (e.g. `overloaded_error`,
     /// `api_error`). Surfaces as a stream `Err` rather than being parsed as
     /// a "failed to parse SSE event".
-    #[serde(rename = "error")]
-    Error { error: AnthropicErrorPayload },
+    Error {
+        error: AnthropicErrorPayload,
+    },
 }
 
 /// Payload of a mid-stream `event: error` frame.
@@ -251,21 +237,28 @@ pub struct AnthropicErrorPayload {
     pub message: String,
 }
 
-/// Delta for content blocks.
+/// Delta for content blocks. Variant names mirror the wire `type`
+/// discriminator (`text_delta`, `input_json_delta`, …); the shared
+/// `Delta` suffix is intentional.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 pub enum AnthropicContentDelta {
-    #[serde(rename = "text_delta")]
-    TextDelta { text: String },
-    #[serde(rename = "input_json_delta")]
-    InputJsonDelta { partial_json: String },
+    TextDelta {
+        text: String,
+    },
+    InputJsonDelta {
+        partial_json: String,
+    },
     /// Incremental update to a `thinking` content block.
-    #[serde(rename = "thinking_delta")]
-    ThinkingDelta { thinking: String },
+    ThinkingDelta {
+        thinking: String,
+    },
     /// Signature appended to a `thinking` block at end-of-block. Required to
     /// be echoed back unchanged in subsequent turns.
-    #[serde(rename = "signature_delta")]
-    SignatureDelta { signature: String },
+    SignatureDelta {
+        signature: String,
+    },
 }
 
 /// Delta for message-level changes carried by a `message_delta` event.
@@ -275,10 +268,9 @@ pub enum AnthropicContentDelta {
 /// nested inside it — the parent enum variant carries it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnthropicMessageDelta {
+    /// Reason the model stopped (`end_turn`, `max_tokens`, …).
     #[serde(default)]
     pub stop_reason: Option<String>,
-    #[serde(default)]
-    pub stop_sequence: Option<String>,
 }
 
 impl From<AnthropicUsage> for Usage {

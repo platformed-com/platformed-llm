@@ -1,8 +1,13 @@
-use super::types::{OpenAIReasoning, OpenAIToolChoice, ResponsesRequest, ResponsesStreamEvent};
-use crate::provider::LLMProvider;
+use super::types::{
+    OpenAIAnnotation, OpenAIReasoning, OpenAIStreamEvent, OpenAIToolChoice, ResponsesRequest,
+};
+use crate::provider::Provider;
 use crate::transport::{Transport, TransportRequest};
-use crate::types::{PartKind, ReasoningConfig, ReasoningEffort, ReasoningSummary, ToolChoice};
-use crate::{Error, LLMRequest, Response, StreamEvent};
+use crate::types::{
+    Annotation, AnnotationKind, PartKind, PartUpdate, ProviderBuiltin, ReasoningConfig,
+    ReasoningEffort, ReasoningSummary, ToolChoice,
+};
+use crate::{Config, Error, Response, StreamEvent};
 use futures_util::StreamExt as _;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
@@ -68,45 +73,45 @@ impl OpenAIProvider {
     }
 
     /// Convert internal request to OpenAI Responses API format.
-    fn convert_request(&self, request: &LLMRequest) -> ResponsesRequest {
+    fn convert_request(&self, prompt: &crate::Prompt, config: &Config) -> ResponsesRequest {
+        let messages = prompt.items();
+
+        // Scan history for the latest InputItem::Continuation carrying
+        // an OpenAI hint. Items at and before that index are elided —
+        // the server already has them via `previous_response_id`.
+        // Continuation markers for other providers are ignored.
+        let (previous_response_id, start_index) = find_latest_openai_continuation(messages);
+
         let mut input: Vec<crate::providers::openai::types::OpenAIInputMessage> = Vec::new();
-        for item in &request.messages {
+        for item in &messages[start_index..] {
             Self::flatten_input_item(item, &mut input);
         }
 
-        // ProviderContinuation::OpenAI carries previous_response_id when
-        // the caller wants to chain via server-side state. Other variants
-        // (none exist yet) are silently ignored — that's the
-        // model-switching contract.
-        let previous_response_id = match &request.continuation {
-            Some(crate::types::ProviderContinuation::OpenAI { response_id }) => {
-                Some(response_id.clone())
-            }
-            _ => None,
-        };
-
         ResponsesRequest {
-            model: request.model.clone(),
+            model: config.model.clone(),
             input,
             instructions: None,
-            temperature: request.temperature,
-            max_output_tokens: request.max_tokens,
-            top_p: request.top_p,
-            tools: request
+            temperature: config.temperature,
+            max_output_tokens: config.max_tokens,
+            top_p: config.top_p,
+            tools: config
                 .tools
                 .as_ref()
                 .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.as_ref().map(convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
+            tool_choice: config.tool_choice.as_ref().map(convert_tool_choice),
+            parallel_tool_calls: config.parallel_tool_calls,
             previous_response_id,
             stream: None,
-            store: Some(request.store.unwrap_or(false)),
-            reasoning: request.reasoning.as_ref().map(convert_reasoning),
-            stop: request.stop.clone(),
-            presence_penalty: request.presence_penalty,
-            frequency_penalty: request.frequency_penalty,
-            prompt_cache_key: derive_prompt_cache_key(&request.messages),
-            text: request.response_format.as_ref().and_then(convert_response_format),
+            store: Some(config.store.unwrap_or(false)),
+            reasoning: config.reasoning.as_ref().map(convert_reasoning),
+            stop: config.stop.clone(),
+            presence_penalty: config.presence_penalty,
+            frequency_penalty: config.frequency_penalty,
+            prompt_cache_key: derive_prompt_cache_key(messages),
+            text: config
+                .response_format
+                .as_ref()
+                .and_then(convert_response_format),
         }
     }
 
@@ -132,7 +137,7 @@ impl OpenAIProvider {
                 });
             }
             InputItem::User { content } => {
-                use crate::providers::openai::types::{OpenAIContentPart, OpenAIMessageContent};
+                use crate::providers::openai::types::OpenAIContentPart;
                 // Build a content-parts list. Tool results become their own
                 // top-level items; text and images become InputText /
                 // InputImage parts. If we end up with just one text part
@@ -140,9 +145,9 @@ impl OpenAIProvider {
                 let mut parts: Vec<OpenAIContentPart> = Vec::new();
                 for part in content {
                     match part {
-                        UserPart::Text(s) => parts.push(OpenAIContentPart::InputText {
-                            text: s.clone(),
-                        }),
+                        UserPart::Text(s) => {
+                            parts.push(OpenAIContentPart::InputText { text: s.clone() })
+                        }
                         UserPart::Image(src) => {
                             let url = match src {
                                 crate::types::ImageSource::Url(u) => u.clone(),
@@ -194,9 +199,7 @@ impl OpenAIProvider {
                             crate::types::DocumentSource::Base64 { data, media_type } => {
                                 parts.push(OpenAIContentPart::InputFile {
                                     file_url: None,
-                                    file_data: Some(format!(
-                                        "data:{media_type};base64,{data}"
-                                    )),
+                                    file_data: Some(format!("data:{media_type};base64,{data}")),
                                     filename: None,
                                 });
                             }
@@ -231,9 +234,10 @@ impl OpenAIProvider {
                             if !buffered_text.is_empty() {
                                 out.push(OpenAIInputMessage::Regular {
                                     role: "assistant".to_string(),
-                                    content: crate::providers::openai::types::OpenAIMessageContent::Text(
-                                        std::mem::take(&mut buffered_text),
-                                    ),
+                                    content:
+                                        crate::providers::openai::types::OpenAIMessageContent::Text(
+                                            std::mem::take(&mut buffered_text),
+                                        ),
                                 });
                             }
                             out.push(OpenAIInputMessage::FunctionCall {
@@ -244,6 +248,8 @@ impl OpenAIProvider {
                         }
                         AssistantPart::Reasoning { .. }
                         | AssistantPart::RedactedReasoning { .. }
+                        | AssistantPart::BuiltinToolCall { .. }
+                        | AssistantPart::Continuation(_)
                         | AssistantPart::CacheBreakpoint => {
                             tracing::debug!(
                                 "OpenAI provider dropping unsupported assistant part during request build"
@@ -290,10 +296,7 @@ impl OpenAIProvider {
                         });
                     }
                     ProviderBuiltin::GoogleSearch | ProviderBuiltin::CodeExecution => {
-                        tracing::debug!(
-                            ?b,
-                            "OpenAI provider dropping unsupported builtin tool"
-                        );
+                        tracing::debug!(?b, "OpenAI provider dropping unsupported builtin tool");
                     }
                 },
             }
@@ -418,6 +421,23 @@ fn derive_prompt_cache_key(messages: &[crate::types::InputItem]) -> Option<Strin
                         AssistantPart::Reasoning { content, .. } => content.hash(&mut hasher),
                         AssistantPart::Refusal(s) => s.hash(&mut hasher),
                         AssistantPart::RedactedReasoning { data } => data.hash(&mut hasher),
+                        AssistantPart::BuiltinToolCall {
+                            kind,
+                            arguments,
+                            result,
+                        } => {
+                            // Provider-side; nothing the caller controls
+                            // changes the cacheable prefix here, but
+                            // hash the fields anyway so distinct calls
+                            // don't collide.
+                            format!("{kind:?}").hash(&mut hasher);
+                            arguments.hash(&mut hasher);
+                            result.hash(&mut hasher);
+                        }
+                        AssistantPart::Continuation(c) => {
+                            "continuation".hash(&mut hasher);
+                            format!("{c:?}").hash(&mut hasher);
+                        }
                         AssistantPart::CacheBreakpoint => {
                             saw_breakpoint = true;
                             break 'outer;
@@ -466,28 +486,7 @@ fn push_user_parts(
     });
 }
 
-/// Best-effort flatten of a tool-result content array into a single string.
-/// Multi-modal tool results aren't currently representable on OpenAI's
-/// function_call_output (which takes a plain string `output`), so non-text
-/// parts are dropped with a tracing note.
-fn flatten_user_parts_to_text(parts: &[crate::types::UserPart]) -> String {
-    use crate::types::UserPart;
-    let mut out = String::new();
-    for part in parts {
-        match part {
-            UserPart::Text(s) => {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(s);
-            }
-            _ => {
-                tracing::debug!("dropping non-text tool result part for OpenAI flatten");
-            }
-        }
-    }
-    out
-}
+use crate::providers::flatten_user_parts_to_text;
 
 fn convert_response_format(
     rf: &crate::types::ResponseFormat,
@@ -525,6 +524,63 @@ fn convert_reasoning(cfg: &ReasoningConfig) -> OpenAIReasoning {
     }
 }
 
+/// Walk the history right-to-left for the most recent
+/// [`InputItem::Assistant`] containing an
+/// [`AssistantPart::Continuation`] of [`ProviderContinuation::OpenAI`].
+/// Returns the response ID plus the index of the first item the
+/// provider should actually send (one past the assistant turn that
+/// carried the marker — the server already has that turn and
+/// everything before it). Other providers' continuation parts are
+/// transparently skipped.
+fn find_latest_openai_continuation(
+    messages: &[crate::types::InputItem],
+) -> (Option<String>, usize) {
+    use crate::types::{AssistantPart, InputItem, ProviderContinuation};
+    for (i, item) in messages.iter().enumerate().rev() {
+        if let InputItem::Assistant { content } = item {
+            for part in content.iter().rev() {
+                if let AssistantPart::Continuation(ProviderContinuation::OpenAI { response_id }) =
+                    part
+                {
+                    return (Some(response_id.clone()), i + 1);
+                }
+            }
+        }
+    }
+    (None, 0)
+}
+
+/// Map an OpenAI annotation onto the unified [`Annotation`] surface.
+///
+/// `Other` variants (forward-compat tag values we don't recognize) are
+/// dropped rather than fabricated as broken citations.
+fn map_openai_annotation(a: OpenAIAnnotation) -> Option<Annotation> {
+    match a {
+        OpenAIAnnotation::UrlCitation {
+            start_index,
+            end_index,
+            url,
+            title,
+        } => Some(Annotation {
+            kind: AnnotationKind::UrlCitation,
+            start: start_index,
+            end: end_index,
+            source: url,
+            title,
+        }),
+        OpenAIAnnotation::FileCitation {
+            file_id, filename, ..
+        } => Some(Annotation {
+            kind: AnnotationKind::FileCitation,
+            start: 0,
+            end: 0,
+            source: file_id,
+            title: filename,
+        }),
+        OpenAIAnnotation::Other => None,
+    }
+}
+
 fn convert_tool_choice(choice: &ToolChoice) -> OpenAIToolChoice {
     match choice {
         ToolChoice::Auto => OpenAIToolChoice::Mode("auto"),
@@ -546,45 +602,54 @@ fn convert_tool_choice(choice: &ToolChoice) -> OpenAIToolChoice {
 /// `None` for top-level items that don't have nested content parts.
 pub(crate) struct OpenAIStreamState {
     tracker: crate::providers::part_tracker::PartTracker<(u32, Option<u32>)>,
-    /// Recorded continuation hint from the most recent response payload.
-    continuation: Option<crate::types::ProviderContinuation>,
+    /// Whether we've already emitted the one-shot
+    /// [`PartKind::Continuation`] for this response. OpenAI carries the
+    /// `response.id` on `created` / `in_progress` / `completed` frames;
+    /// we surface it once at end-of-stream so the marker lands *after*
+    /// the assistant content in the resulting `AssistantPart` order.
+    emitted_continuation: bool,
 }
 
 impl OpenAIStreamState {
     pub(crate) fn new() -> Self {
         Self {
             tracker: crate::providers::part_tracker::PartTracker::new(),
-            continuation: None,
+            emitted_continuation: false,
         }
     }
 
-    pub(crate) fn continuation(&self) -> Option<crate::types::ProviderContinuation> {
-        self.continuation.clone()
+    /// Open and immediately close a one-shot Continuation part. The
+    /// PartTracker doesn't have a slot for keyless one-shot parts, so
+    /// we go through `open_one_shot` instead.
+    fn continuation_events(&mut self, response_id: &str) -> Vec<StreamEvent> {
+        if self.emitted_continuation {
+            return Vec::new();
+        }
+        self.emitted_continuation = true;
+        self.tracker.open_one_shot(PartKind::Continuation(
+            crate::types::ProviderContinuation::OpenAI {
+                response_id: response_id.to_string(),
+            },
+        ))
     }
 
     /// Process one OpenAI wire event into 0 or more `StreamEvent`s.
-    pub(crate) fn process(
-        &mut self,
-        event: ResponsesStreamEvent,
-    ) -> Result<Vec<StreamEvent>, Error> {
-        match event.r#type.as_str() {
-            "error" => {
-                let (kind, message) = match &event.error {
-                    Some(e) => (e.r#type.as_str(), e.message.as_str()),
-                    None => ("unknown", "Unknown error occurred"),
-                };
-                return Err(Error::provider("OpenAI", format!("{kind}: {message}")));
+    pub(crate) fn process(&mut self, event: OpenAIStreamEvent) -> Result<Vec<StreamEvent>, Error> {
+        match event {
+            OpenAIStreamEvent::Error { error } => Err(Error::provider(
+                "OpenAI",
+                format!("{}: {}", error.r#type, error.message),
+            )),
+
+            // `response.id` is stable across created/in_progress/
+            // completed frames — emit the Continuation part at
+            // end-of-stream (response.completed) so it lands after the
+            // assistant content in the final part order.
+            OpenAIStreamEvent::ResponseCreated | OpenAIStreamEvent::ResponseInProgress => {
+                Ok(vec![])
             }
-            "response.created" | "response.in_progress" => {
-                if let Some(response) = &event.response {
-                    self.continuation = Some(crate::types::ProviderContinuation::OpenAI {
-                        response_id: response.id.clone(),
-                    });
-                }
-            }
-            "response.output_item.added" => {
-                let Some(item) = event.item else { return Ok(vec![]); };
-                let Some(output_index) = event.output_index else { return Ok(vec![]); };
+
+            OpenAIStreamEvent::OutputItemAdded { output_index, item } => {
                 match item.r#type.as_str() {
                     "function_call" => {
                         let call_id = item.call_id.ok_or_else(|| {
@@ -597,184 +662,273 @@ impl OpenAIStreamState {
                             )
                         })?;
                         let name = item.name.unwrap_or_else(|| "unknown".to_string());
-                        let (_idx, ev) = self.tracker.open(
-                            (output_index, None),
-                            PartKind::ToolCall { call_id, name },
-                        );
-                        return Ok(vec![ev]);
-                    }
-                    "reasoning" => {
                         let (_idx, ev) = self
                             .tracker
-                            .open((output_index, None), PartKind::Reasoning);
-                        return Ok(vec![ev]);
+                            .open((output_index, None), PartKind::ToolCall { call_id, name });
+                        Ok(vec![ev])
                     }
-                    "message" => {
-                        // Wait for response.content_part.added — message
-                        // items contain an array of content parts, each of
-                        // which maps to its own AssistantPart.
+                    "web_search_call" => {
+                        let (_idx, ev) = self.tracker.open(
+                            (output_index, None),
+                            PartKind::BuiltinToolCall {
+                                kind: ProviderBuiltin::WebSearch,
+                            },
+                        );
+                        Ok(vec![ev])
                     }
-                    _ => {}
+                    // `reasoning` items contain one or more
+                    // `reasoning_summary_part` children — each is its
+                    // own Reasoning AssistantPart. `message` items
+                    // contain content parts — each opens via
+                    // `content_part.added`. Both outer items are
+                    // wire-level wrappers; don't open a part for them.
+                    "reasoning" | "message" => Ok(vec![]),
+                    other => {
+                        tracing::debug!(
+                            item_type = other,
+                            "OpenAI output_item.added with unhandled item type — open ignored"
+                        );
+                        Ok(vec![])
+                    }
                 }
             }
-            "response.content_part.added" => {
-                let Some(output_index) = event.output_index else { return Ok(vec![]); };
-                let Some(content_index) = event.content_index else { return Ok(vec![]); };
-                let kind = match event.part.as_ref().map(|p| p.r#type.as_str()) {
-                    Some("output_text") => PartKind::Text,
-                    Some("refusal") => PartKind::Refusal,
-                    _ => PartKind::Text,
+
+            OpenAIStreamEvent::OutputItemDone { output_index, item } => {
+                let key = (output_index, None);
+                let mut out = Vec::new();
+                // For web_search_call items, emit the final action
+                // payload as a Delta against the BuiltinToolCall part
+                // before closing. That's the only point in the stream
+                // where the queries arrive — `output_item.added` only
+                // carries the in-progress shell.
+                if let Some(idx) = self.tracker.index_of(&key) {
+                    if item.r#type == "web_search_call" {
+                        if let Some(action) = &item.action {
+                            if let Ok(delta) = serde_json::to_string(action) {
+                                out.push(StreamEvent::Delta { index: idx, delta });
+                            }
+                        }
+                    }
+                }
+                if let Some(ev) = self.tracker.close(&key) {
+                    out.push(ev);
+                }
+                Ok(out)
+            }
+
+            OpenAIStreamEvent::ContentPartAdded {
+                output_index,
+                content_index,
+                part,
+            } => {
+                let kind = match part.r#type.as_str() {
+                    "output_text" => PartKind::Text,
+                    "refusal" => PartKind::Refusal,
+                    other => {
+                        tracing::warn!(
+                            part_type = other,
+                            "unknown content_part.added type — treating as text"
+                        );
+                        PartKind::Text
+                    }
                 };
+                let (_idx, ev) = self.tracker.open((output_index, Some(content_index)), kind);
+                Ok(vec![ev])
+            }
+            OpenAIStreamEvent::ContentPartDone {
+                output_index,
+                content_index,
+            } => Ok(self
+                .tracker
+                .close(&(output_index, Some(content_index)))
+                .into_iter()
+                .collect()),
+
+            OpenAIStreamEvent::ReasoningSummaryPartAdded {
+                output_index,
+                summary_index,
+            } => {
                 let (_idx, ev) = self
                     .tracker
-                    .open((output_index, Some(content_index)), kind);
-                return Ok(vec![ev]);
+                    .open((output_index, Some(summary_index)), PartKind::Reasoning);
+                Ok(vec![ev])
             }
-            "response.output_text.delta" => {
-                let Some(output_index) = event.output_index else { return Ok(vec![]); };
-                let Some(content_index) = event.content_index else { return Ok(vec![]); };
-                let Some(delta) = event.delta else { return Ok(vec![]); };
-                if delta.is_empty() {
-                    return Ok(vec![]);
-                }
-                let key = (output_index, Some(content_index));
-                let index = self
-                    .tracker
-                    .index_of(&key)
-                    .ok_or_else(|| Error::streaming(format!(
-                        "output_text.delta for unknown content part {key:?}"
-                    )))?;
-                return Ok(vec![StreamEvent::Delta { index, delta }]);
-            }
-            "response.refusal.delta" => {
-                let Some(output_index) = event.output_index else { return Ok(vec![]); };
-                let Some(content_index) = event.content_index else { return Ok(vec![]); };
-                let Some(delta) = event.delta else { return Ok(vec![]); };
-                if delta.is_empty() {
-                    return Ok(vec![]);
-                }
-                let key = (output_index, Some(content_index));
-                let index = self
-                    .tracker
-                    .index_of(&key)
-                    .ok_or_else(|| Error::streaming(format!(
-                        "refusal.delta for unknown content part {key:?}"
-                    )))?;
-                return Ok(vec![StreamEvent::Delta { index, delta }]);
-            }
-            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                let Some(output_index) = event.output_index else { return Ok(vec![]); };
-                let Some(delta) = event.delta else { return Ok(vec![]); };
-                if delta.is_empty() {
-                    return Ok(vec![]);
-                }
-                let key = (output_index, None);
-                let index = self
-                    .tracker
-                    .index_of(&key)
-                    .ok_or_else(|| Error::streaming(format!(
-                        "reasoning delta for unknown reasoning part {key:?}"
-                    )))?;
-                return Ok(vec![StreamEvent::Delta { index, delta }]);
-            }
-            "response.function_call_arguments.delta" => {
-                let Some(output_index) = event.output_index else { return Ok(vec![]); };
-                let Some(delta) = event.delta else { return Ok(vec![]); };
+            OpenAIStreamEvent::ReasoningSummaryPartDone {
+                output_index,
+                summary_index,
+            } => Ok(self
+                .tracker
+                .close(&(output_index, Some(summary_index)))
+                .into_iter()
+                .collect()),
+
+            OpenAIStreamEvent::OutputTextDelta {
+                output_index,
+                content_index,
+                delta,
+            } => self.text_or_refusal_delta(output_index, content_index, delta, "output_text"),
+            OpenAIStreamEvent::RefusalDelta {
+                output_index,
+                content_index,
+                delta,
+            } => self.text_or_refusal_delta(output_index, content_index, delta, "refusal"),
+
+            OpenAIStreamEvent::ReasoningSummaryTextDelta {
+                output_index,
+                summary_index,
+                delta,
+            } => self.reasoning_delta(output_index, Some(summary_index), delta),
+            OpenAIStreamEvent::ReasoningTextDelta {
+                output_index,
+                delta,
+            } => self.reasoning_delta(output_index, None, delta),
+
+            OpenAIStreamEvent::FunctionCallArgumentsDelta {
+                output_index,
+                delta,
+            } => {
                 if delta.is_empty() {
                     return Ok(vec![]);
                 }
                 let key = (output_index, None);
-                let index = self
-                    .tracker
-                    .index_of(&key)
-                    .ok_or_else(|| Error::streaming(format!(
+                let index = self.tracker.index_of(&key).ok_or_else(|| {
+                    Error::streaming(format!(
                         "function_call_arguments.delta for unknown tool part {key:?}"
-                    )))?;
-                return Ok(vec![StreamEvent::Delta { index, delta }]);
+                    ))
+                })?;
+                Ok(vec![StreamEvent::Delta { index, delta }])
             }
-            "response.content_part.done" => {
-                let Some(output_index) = event.output_index else { return Ok(vec![]); };
-                let Some(content_index) = event.content_index else { return Ok(vec![]); };
-                if let Some(ev) = self.tracker.close(&(output_index, Some(content_index))) {
-                    return Ok(vec![ev]);
-                }
+
+            OpenAIStreamEvent::OutputTextAnnotationAdded {
+                output_index,
+                content_index,
+                annotation,
+            } => {
+                let key = (output_index, Some(content_index));
+                let index = self.tracker.index_of(&key).ok_or_else(|| {
+                    Error::streaming(format!("annotation.added for unknown content part {key:?}"))
+                })?;
+                let Some(annotation) = map_openai_annotation(annotation) else {
+                    return Ok(vec![]);
+                };
+                Ok(vec![StreamEvent::PartUpdate {
+                    index,
+                    update: PartUpdate::Annotation(annotation),
+                }])
             }
-            "response.output_item.done" => {
-                let Some(output_index) = event.output_index else { return Ok(vec![]); };
-                if let Some(ev) = self.tracker.close(&(output_index, None)) {
-                    return Ok(vec![ev]);
-                }
+
+            OpenAIStreamEvent::ResponseCompleted { response } => {
+                let mut out = self.continuation_events(&response.id);
+                let finish_reason = if response.output.iter().any(|o| o.r#type == "function_call") {
+                    crate::types::FinishReason::ToolCalls
+                } else {
+                    crate::types::FinishReason::Stop
+                };
+                out.push(StreamEvent::Done {
+                    finish_reason,
+                    usage: response.usage.map(Into::into).unwrap_or_default(),
+                });
+                Ok(out)
             }
-            "response.output_text.done" | "response.reasoning_summary_text.done"
-            | "response.reasoning_text.done" | "response.refusal.done"
-            | "response.function_call_arguments.done" => {
-                // Final canonical value — we already received it via deltas.
+            OpenAIStreamEvent::ResponseIncomplete { response } => {
+                let mut out = self.continuation_events(&response.id);
+                let finish_reason = match response
+                    .incomplete_details
+                    .as_ref()
+                    .map(|d| d.reason.as_str())
+                {
+                    Some("max_output_tokens") => crate::types::FinishReason::Length,
+                    Some("content_filter") => crate::types::FinishReason::ContentFilter,
+                    _ => crate::types::FinishReason::Stop,
+                };
+                out.push(StreamEvent::Done {
+                    finish_reason,
+                    usage: response.usage.map(Into::into).unwrap_or_default(),
+                });
+                Ok(out)
             }
-            "response.completed" => {
-                if let Some(response) = event.response {
-                    self.continuation = Some(crate::types::ProviderContinuation::OpenAI {
-                        response_id: response.id.clone(),
-                    });
-                    let finish_reason =
-                        if response.output.iter().any(|o| o.r#type == "function_call") {
-                            crate::types::FinishReason::ToolCalls
-                        } else {
-                            crate::types::FinishReason::Stop
-                        };
-                    return Ok(vec![StreamEvent::Done {
-                        finish_reason,
-                        usage: response.usage.unwrap_or_default(),
-                    }]);
-                }
+            OpenAIStreamEvent::ResponseFailed { response, error } => {
+                let message = response
+                    .as_ref()
+                    .and_then(|r| r.error.as_ref())
+                    .map(|e| format!("{}: {}", e.r#type, e.message))
+                    .or_else(|| {
+                        error
+                            .as_ref()
+                            .map(|e| format!("{}: {}", e.r#type, e.message))
+                    })
+                    .unwrap_or_else(|| "response failed without error details".to_string());
+                Err(Error::provider(
+                    "OpenAI",
+                    format!("response.failed — {message}"),
+                ))
             }
-            "response.incomplete" => {
-                if let Some(response) = event.response {
-                    self.continuation = Some(crate::types::ProviderContinuation::OpenAI {
-                        response_id: response.id.clone(),
-                    });
-                    let finish_reason = match response
-                        .incomplete_details
-                        .as_ref()
-                        .map(|d| d.reason.as_str())
-                    {
-                        Some("max_output_tokens") => crate::types::FinishReason::Length,
-                        Some("content_filter") => crate::types::FinishReason::ContentFilter,
-                        _ => crate::types::FinishReason::Stop,
-                    };
-                    return Ok(vec![StreamEvent::Done {
-                        finish_reason,
-                        usage: response.usage.unwrap_or_default(),
-                    }]);
-                }
+
+            // Final-canonical-value / lifecycle frames whose payload
+            // we don't need (we already accumulated via deltas, or
+            // they're informational).
+            OpenAIStreamEvent::OutputTextDone
+            | OpenAIStreamEvent::ReasoningSummaryTextDone
+            | OpenAIStreamEvent::ReasoningTextDone
+            | OpenAIStreamEvent::RefusalDone
+            | OpenAIStreamEvent::FunctionCallArgumentsDone
+            | OpenAIStreamEvent::WebSearchCallInProgress
+            | OpenAIStreamEvent::WebSearchCallSearching
+            | OpenAIStreamEvent::WebSearchCallCompleted => Ok(vec![]),
+
+            OpenAIStreamEvent::Unknown => {
+                tracing::warn!(
+                    "received an OpenAI stream event with an unrecognised `type` — \
+                     ignoring. Inspect the captured `.response.sse` for the wire shape."
+                );
+                Ok(vec![])
             }
-            "response.failed" => {
-                if let Some(response) = event.response {
-                    let message = response
-                        .error
-                        .as_ref()
-                        .map(|e| format!("{}: {}", e.r#type, e.message))
-                        .unwrap_or_else(|| "response failed without error details".to_string());
-                    return Err(Error::provider("OpenAI", format!("response.failed — {message}")));
-                }
-                if let Some(error) = &event.error {
-                    return Err(Error::provider(
-                        "OpenAI",
-                        format!("response.failed — {}: {}", error.r#type, error.message),
-                    ));
-                }
-                return Err(Error::provider("OpenAI", "response.failed without details"));
-            }
-            _ => {}
         }
-        Ok(vec![])
+    }
+
+    fn text_or_refusal_delta(
+        &self,
+        output_index: u32,
+        content_index: u32,
+        delta: String,
+        kind_label: &str,
+    ) -> Result<Vec<StreamEvent>, Error> {
+        if delta.is_empty() {
+            return Ok(vec![]);
+        }
+        let key = (output_index, Some(content_index));
+        let index = self.tracker.index_of(&key).ok_or_else(|| {
+            Error::streaming(format!(
+                "{kind_label}.delta for unknown content part {key:?}"
+            ))
+        })?;
+        Ok(vec![StreamEvent::Delta { index, delta }])
+    }
+
+    fn reasoning_delta(
+        &self,
+        output_index: u32,
+        summary_index: Option<u32>,
+        delta: String,
+    ) -> Result<Vec<StreamEvent>, Error> {
+        if delta.is_empty() {
+            return Ok(vec![]);
+        }
+        let key = (output_index, summary_index);
+        let index = self.tracker.index_of(&key).ok_or_else(|| {
+            Error::streaming(format!(
+                "reasoning delta for unknown reasoning part {key:?}"
+            ))
+        })?;
+        Ok(vec![StreamEvent::Delta { index, delta }])
     }
 }
 
 #[async_trait::async_trait]
-impl LLMProvider for OpenAIProvider {
+impl Provider for OpenAIProvider {
     /// Generate a chat completion (internally always streams).
-    async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
-        let mut openai_request = self.convert_request(request);
+    async fn generate(&self, prompt: &crate::Prompt, config: &Config) -> Result<Response, Error> {
+        let mut openai_request = self.convert_request(prompt, config);
         openai_request.stream = Some(true);
 
         debug!(
@@ -822,14 +976,13 @@ impl LLMProvider for OpenAIProvider {
             .map(move |sse_result| -> Result<Vec<StreamEvent>, Error> {
                 let sse_event = sse_result?;
                 debug!(event = ?sse_event, "received OpenAI SSE event");
-                let stream_event =
-                    serde_json::from_str::<ResponsesStreamEvent>(&sse_event.data)?;
+                let stream_event = serde_json::from_str::<OpenAIStreamEvent>(&sse_event.data)?;
                 state_for_stream.lock().unwrap().process(stream_event)
             })
             .flat_map(|result| match result {
-                Ok(events) => futures_util::stream::iter(
-                    events.into_iter().map(Ok).collect::<Vec<_>>(),
-                ),
+                Ok(events) => {
+                    futures_util::stream::iter(events.into_iter().map(Ok).collect::<Vec<_>>())
+                }
                 Err(e) => futures_util::stream::iter(vec![Err(e)]),
             });
 
@@ -849,7 +1002,7 @@ impl LLMProvider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Prompt;
+    use crate::types::{Config, Prompt};
 
     #[test]
     fn test_provider_creation() {
@@ -883,10 +1036,18 @@ mod tests {
 
     #[test]
     fn http_401_maps_to_auth() {
-        let body =
-            r#"{"error":{"message":"Bad key","type":"invalid_request_error","code":"invalid_api_key"}}"#;
+        let body = r#"{"error":{"message":"Bad key","type":"invalid_request_error","code":"invalid_api_key"}}"#;
         let err = parse_openai_error(401, None, body);
-        assert!(matches!(err, Error::Auth { status: Some(401), .. }), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Auth {
+                    status: Some(401),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
         assert!(format!("{err}").contains("Bad key"));
     }
 
@@ -904,21 +1065,19 @@ mod tests {
         }
     }
 
-    fn request_with_tool_choice(choice: ToolChoice) -> LLMRequest {
-        LLMRequest::from_prompt("gpt-4", &Prompt::user("hi")).tool_choice(choice)
-    }
-
     /// `tool_choice` must serialize to OpenAI's expected wire forms:
     /// the bare strings `"auto"` / `"none"` / `"required"` for modes, and
     /// `{"type":"function","name":"…"}` for a forced specific tool.
     #[test]
     fn tool_choice_serializes_modes_as_strings() {
+        let prompt = Prompt::user("hi");
         for (choice, expected) in [
             (ToolChoice::Auto, serde_json::json!("auto")),
             (ToolChoice::None, serde_json::json!("none")),
             (ToolChoice::Required, serde_json::json!("required")),
         ] {
-            let req = provider().convert_request(&request_with_tool_choice(choice.clone()));
+            let cfg = Config::new("gpt-4").tool_choice(choice.clone());
+            let req = provider().convert_request(&prompt, &cfg);
             let json = serde_json::to_value(&req).unwrap();
             assert_eq!(
                 json["tool_choice"], expected,
@@ -929,9 +1088,11 @@ mod tests {
 
     #[test]
     fn tool_choice_serializes_function_as_typed_object() {
-        let req = provider().convert_request(&request_with_tool_choice(ToolChoice::Function {
+        let prompt = Prompt::user("hi");
+        let cfg = Config::new("gpt-4").tool_choice(ToolChoice::Function {
             name: "get_weather".to_string(),
-        }));
+        });
+        let req = provider().convert_request(&prompt, &cfg);
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
             json["tool_choice"],
@@ -944,12 +1105,12 @@ mod tests {
     #[test]
     fn reasoning_config_serializes_to_correct_shape() {
         use crate::types::{ReasoningConfig, ReasoningEffort, ReasoningSummary};
-        let req = provider().convert_request(
-            &LLMRequest::from_prompt("gpt-5", &Prompt::user("hi")).reasoning(ReasoningConfig {
-                effort: Some(ReasoningEffort::High),
-                summary: Some(ReasoningSummary::Auto),
-            }),
-        );
+        let prompt = Prompt::user("hi");
+        let cfg = Config::new("gpt-5").reasoning(ReasoningConfig {
+            effort: Some(ReasoningEffort::High),
+            summary: Some(ReasoningSummary::Auto),
+        });
+        let req = provider().convert_request(&prompt, &cfg);
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
             json["reasoning"],
@@ -957,23 +1118,39 @@ mod tests {
         );
     }
 
-    /// OpenAI's reasoning streaming events should open a Reasoning part
-    /// and stream deltas into it.
+    /// OpenAI's reasoning streaming should open one Reasoning part per
+    /// `reasoning_summary_part.added` (not per outer `reasoning` item),
+    /// since a single reasoning item often emits multiple summaries.
     #[test]
     fn reasoning_summary_text_delta_routes_to_reasoning_part() {
         let mut state = OpenAIStreamState::new();
-        let added: ResponsesStreamEvent = serde_json::from_str(
+        // Outer reasoning item — no part opens here.
+        let added: OpenAIStreamEvent = serde_json::from_str(
             r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#,
         )
         .unwrap();
-        let events = state.process(added).unwrap();
+        assert!(state.process(added).unwrap().is_empty());
+
+        // First summary opens.
+        let summary_added: OpenAIStreamEvent = serde_json::from_str(
+            r#"{"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}"#,
+        )
+        .unwrap();
+        let events = state.process(summary_added).unwrap();
         assert!(
-            matches!(&events[0], StreamEvent::PartStart { index: 0, kind: PartKind::Reasoning }),
-            "expected PartStart(Reasoning), got {:?}", events,
+            matches!(
+                &events[0],
+                StreamEvent::PartStart {
+                    index: 0,
+                    kind: PartKind::Reasoning
+                }
+            ),
+            "expected PartStart(Reasoning), got {:?}",
+            events,
         );
 
-        let delta: ResponsesStreamEvent = serde_json::from_str(
-            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"hmm,"}"#,
+        let delta: OpenAIStreamEvent = serde_json::from_str(
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"hmm,"}"#,
         )
         .unwrap();
         let events = state.process(delta).unwrap();
@@ -991,11 +1168,9 @@ mod tests {
     /// (opt-out) so we don't unintentionally retain prompts server-side.
     #[test]
     fn parallel_tool_calls_and_store_are_caller_controlled() {
-        let req = provider().convert_request(
-            &LLMRequest::from_prompt("gpt-4", &Prompt::user("hi"))
-                .parallel_tool_calls(false)
-                .store(true),
-        );
+        let prompt = Prompt::user("hi");
+        let cfg = Config::new("gpt-4").parallel_tool_calls(false).store(true);
+        let req = provider().convert_request(&prompt, &cfg);
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["parallel_tool_calls"], false);
         assert_eq!(json["store"], true);
@@ -1018,7 +1193,7 @@ mod tests {
                 "call_id":"call_abc"
             }
         }"#;
-        let event: ResponsesStreamEvent = serde_json::from_str(json).unwrap();
+        let event: OpenAIStreamEvent = serde_json::from_str(json).unwrap();
         let events = state.process(event).unwrap();
         match &events[0] {
             StreamEvent::PartStart {
@@ -1048,7 +1223,7 @@ mod tests {
                 "arguments":""
             }
         }"#;
-        let event: ResponsesStreamEvent = serde_json::from_str(json).unwrap();
+        let event: OpenAIStreamEvent = serde_json::from_str(json).unwrap();
         let result = state.process(event);
         assert!(
             result.is_err(),
@@ -1056,18 +1231,117 @@ mod tests {
         );
     }
 
+    /// A `Continuation` part inside an assistant turn threads through
+    /// as `previous_response_id` *and* elides that assistant turn plus
+    /// every item before it.
+    #[test]
+    fn openai_continuation_elides_prior_history() {
+        use crate::types::{InputItem, ProviderContinuation};
+        let prompt = Prompt::user("first turn")
+            .with_assistant("first answer")
+            .with_item(InputItem::assistant_continuation(
+                ProviderContinuation::OpenAI {
+                    response_id: "resp_1".to_string(),
+                },
+            ))
+            .with_user("follow-up");
+        let cfg = Config::new("gpt-5");
+        let body = provider().convert_request(&prompt, &cfg);
+        assert_eq!(body.previous_response_id.as_deref(), Some("resp_1"));
+        // Only the items after the assistant turn carrying the
+        // continuation reach the wire.
+        assert_eq!(body.input.len(), 1);
+    }
+
+    /// Full roundtrip: a `CompleteResponse` from a prior turn, folded
+    /// into the next prompt via `with_response()`, should have its
+    /// continuation picked up and prior history elided automatically —
+    /// no caller-side bookkeeping required.
+    #[test]
+    fn with_response_threads_continuation_into_next_request() {
+        use crate::response::CompleteResponse;
+        use crate::types::{AssistantPart, FinishReason, ProviderContinuation, Usage};
+        let prior = CompleteResponse {
+            content: vec![
+                AssistantPart::Text {
+                    content: "first answer".into(),
+                    annotations: Vec::new(),
+                },
+                AssistantPart::Continuation(ProviderContinuation::OpenAI {
+                    response_id: "resp_prior".into(),
+                }),
+            ],
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        };
+        let prompt = Prompt::user("first turn")
+            .with_response(&prior)
+            .with_user("follow-up");
+        let cfg = Config::new("gpt-5");
+        let body = provider().convert_request(&prompt, &cfg);
+        assert_eq!(body.previous_response_id.as_deref(), Some("resp_prior"));
+        // Only the follow-up reaches the wire — everything else is
+        // covered by the server-side response state.
+        assert_eq!(body.input.len(), 1);
+    }
+
+    /// The *most recent* matching continuation wins; older markers are
+    /// superseded.
+    #[test]
+    fn latest_openai_continuation_wins() {
+        use crate::types::{InputItem, ProviderContinuation};
+        let prompt = Prompt::user("a")
+            .with_item(InputItem::assistant_continuation(
+                ProviderContinuation::OpenAI {
+                    response_id: "resp_old".to_string(),
+                },
+            ))
+            .with_user("b")
+            .with_item(InputItem::assistant_continuation(
+                ProviderContinuation::OpenAI {
+                    response_id: "resp_new".to_string(),
+                },
+            ))
+            .with_user("c");
+        let cfg = Config::new("gpt-5");
+        let body = provider().convert_request(&prompt, &cfg);
+        assert_eq!(body.previous_response_id.as_deref(), Some("resp_new"));
+        // Only items strictly after the latest matching assistant turn.
+        assert_eq!(body.input.len(), 1);
+    }
+
+    /// A Gemini-flavored continuation part in the history is ignored
+    /// by OpenAI and does *not* elide history — the model-switching
+    /// contract.
+    #[test]
+    fn gemini_continuation_ignored_by_openai() {
+        use crate::types::{InputItem, ProviderContinuation};
+        let prompt = Prompt::user("a")
+            .with_item(InputItem::assistant_continuation(
+                ProviderContinuation::Gemini {
+                    cached_content: "cached/x".to_string(),
+                },
+            ))
+            .with_user("b");
+        let cfg = Config::new("gpt-5");
+        let body = provider().convert_request(&prompt, &cfg);
+        assert!(body.previous_response_id.is_none());
+        // Both user items still on the wire (continuation part drops out).
+        assert_eq!(body.input.len(), 2);
+    }
+
     #[test]
     fn computer_use_builtin_carries_config_on_openai() {
         use crate::types::{ComputerUseConfig, ProviderBuiltin, Tool};
-        let req = LLMRequest::from_prompt("gpt-5", &Prompt::user("hi"))
-            .tools(vec![Tool::builtin(ProviderBuiltin::ComputerUse(
-                ComputerUseConfig {
-                    display_width: 1280,
-                    display_height: 800,
-                    environment: "browser".to_string(),
-                },
-            ))]);
-        let body = provider().convert_request(&req);
+        let prompt = Prompt::user("hi");
+        let cfg = Config::new("gpt-5").tools(vec![Tool::builtin(ProviderBuiltin::ComputerUse(
+            ComputerUseConfig {
+                display_width: 1280,
+                display_height: 800,
+                environment: "browser".to_string(),
+            },
+        ))]);
+        let body = provider().convert_request(&prompt, &cfg);
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["tools"][0]["type"], "computer_use_preview");
         assert_eq!(json["tools"][0]["display_width"], 1280);
@@ -1078,9 +1352,9 @@ mod tests {
     #[test]
     fn response_format_json_object_emits_text_format() {
         use crate::types::ResponseFormat;
-        let req = LLMRequest::from_prompt("gpt-5", &Prompt::user("hi"))
-            .response_format(ResponseFormat::JsonObject);
-        let body = provider().convert_request(&req);
+        let prompt = Prompt::user("hi");
+        let cfg = Config::new("gpt-5").response_format(ResponseFormat::JsonObject);
+        let body = provider().convert_request(&prompt, &cfg);
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["text"]["format"]["type"], "json_object");
     }
@@ -1089,17 +1363,15 @@ mod tests {
     fn response_format_json_schema_emits_schema_block() {
         use crate::types::ResponseFormat;
         use std::borrow::Cow;
-        let schema_raw = serde_json::value::RawValue::from_string(
-            r#"{"type":"object"}"#.to_string(),
-        )
-        .unwrap();
-        let req = LLMRequest::from_prompt("gpt-5", &Prompt::user("hi"))
-            .response_format(ResponseFormat::JsonSchema {
-                name: "Point".to_string(),
-                schema: Cow::Owned(schema_raw),
-                strict: true,
-            });
-        let body = provider().convert_request(&req);
+        let schema_raw =
+            serde_json::value::RawValue::from_string(r#"{"type":"object"}"#.to_string()).unwrap();
+        let prompt = Prompt::user("hi");
+        let cfg = Config::new("gpt-5").response_format(ResponseFormat::JsonSchema {
+            name: "Point".to_string(),
+            schema: Cow::Owned(schema_raw),
+            strict: true,
+        });
+        let body = provider().convert_request(&prompt, &cfg);
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["text"]["format"]["type"], "json_schema");
         assert_eq!(json["text"]["format"]["name"], "Point");
@@ -1123,17 +1395,20 @@ mod tests {
             });
             p
         };
-        let req1 = provider().convert_request(&LLMRequest::from_prompt("gpt-5", &make_prompt()));
-        let req2 = provider().convert_request(&LLMRequest::from_prompt("gpt-5", &make_prompt()));
+        let prompt1 = make_prompt();
+        let prompt2 = make_prompt();
+        let cfg = Config::new("gpt-5");
+        let req1 = provider().convert_request(&prompt1, &cfg);
+        let req2 = provider().convert_request(&prompt2, &cfg);
         assert!(req1.prompt_cache_key.is_some());
         assert_eq!(req1.prompt_cache_key, req2.prompt_cache_key);
     }
 
     #[test]
     fn no_cache_breakpoint_means_no_prompt_cache_key() {
-        let req = provider().convert_request(
-            &LLMRequest::from_prompt("gpt-5", &Prompt::user("hi")),
-        );
+        let prompt = Prompt::user("hi");
+        let cfg = Config::new("gpt-5");
+        let req = provider().convert_request(&prompt, &cfg);
         assert!(req.prompt_cache_key.is_none());
     }
 
@@ -1142,19 +1417,16 @@ mod tests {
     #[test]
     fn different_prefix_produces_different_key() {
         use crate::types::{InputItem, UserPart};
-        let make = |prefix: &str| {
-            LLMRequest::from_prompt(
-                "gpt-5",
-                &Prompt::system(prefix).with_item(InputItem::User {
-                    content: vec![
-                        UserPart::Text("ctx".into()),
-                        UserPart::CacheBreakpoint,
-                    ],
-                }),
-            )
+        let make_prompt = |prefix: &str| {
+            Prompt::system(prefix).with_item(InputItem::User {
+                content: vec![UserPart::Text("ctx".into()), UserPart::CacheBreakpoint],
+            })
         };
-        let k1 = provider().convert_request(&make("system one")).prompt_cache_key;
-        let k2 = provider().convert_request(&make("system two")).prompt_cache_key;
+        let cfg = Config::new("gpt-5");
+        let p1 = make_prompt("system one");
+        let p2 = make_prompt("system two");
+        let k1 = provider().convert_request(&p1, &cfg).prompt_cache_key;
+        let k2 = provider().convert_request(&p2, &cfg).prompt_cache_key;
         assert!(k1.is_some());
         assert_ne!(k1, k2);
     }
@@ -1163,11 +1435,8 @@ mod tests {
     fn test_request_conversion() {
         let provider = OpenAIProvider::new("test-key".to_string()).unwrap();
         let prompt = Prompt::user("Hello");
-        let request = LLMRequest::from_prompt("gpt-4", &prompt)
-            .temperature(0.7)
-            .max_tokens(100);
-
-        let openai_request = provider.convert_request(&request);
+        let cfg = Config::new("gpt-4").temperature(0.7).max_tokens(100);
+        let openai_request = provider.convert_request(&prompt, &cfg);
         assert_eq!(openai_request.model, "gpt-4");
         assert_eq!(openai_request.temperature, Some(0.7));
         assert_eq!(openai_request.max_output_tokens, Some(100));

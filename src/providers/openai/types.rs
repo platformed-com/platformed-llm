@@ -42,20 +42,24 @@ pub enum OpenAIMessageContent {
     Parts(Vec<OpenAIContentPart>),
 }
 
-/// Tagged content part within an OpenAI message.
+/// Tagged content part within an OpenAI message. Variant names mirror
+/// the wire `type` discriminator (`input_text`, `input_image`, …) so
+/// the Rust-side naming stays in lock-step with the API; the shared
+/// `Input` prefix is intentional.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 pub enum OpenAIContentPart {
-    #[serde(rename = "input_text")]
-    InputText { text: String },
-    #[serde(rename = "input_image")]
+    InputText {
+        text: String,
+    },
     InputImage {
         #[serde(skip_serializing_if = "Option::is_none")]
         image_url: Option<String>,
     },
-    #[serde(rename = "input_audio")]
-    InputAudio { input_audio: OpenAIInputAudio },
-    #[serde(rename = "input_file")]
+    InputAudio {
+        input_audio: OpenAIInputAudio,
+    },
     InputFile {
         #[serde(skip_serializing_if = "Option::is_none")]
         file_url: Option<String>,
@@ -187,17 +191,15 @@ pub enum OpenAIToolChoice {
     },
 }
 
-/// OpenAI Responses API response.
+/// OpenAI Responses API response. Only carries the fields the
+/// streaming converter actually reads — extra metadata (`object`,
+/// `created_at`, `model`, …) is on the wire but stripped by serde
+/// since nothing consumes it today.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // Will be used in non-streaming mode later
 pub struct ResponsesResponse {
     pub id: String,
-    pub object: String,
-    pub created_at: u64,
-    pub status: String,
-    pub model: String,
     pub output: Vec<ResponseItem>,
-    pub usage: Option<Usage>,
+    pub usage: Option<OpenAIUsage>,
     /// Populated by `response.incomplete` events with `{ reason: ... }`
     /// where `reason` is one of `max_output_tokens`, `content_filter`,
     /// or similar. We map this onto `FinishReason::Length` /
@@ -211,42 +213,76 @@ pub struct ResponsesResponse {
     /// streaming-level error.
     #[serde(default)]
     pub error: Option<ErrorDetails>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub store: Option<bool>,
 }
 
-/// Output item in a Responses API response.
+/// OpenAI usage wire shape. The `*_tokens_details` sub-objects
+/// surface cached-prompt and reasoning-output counts that the
+/// canonical [`Usage`] flattens into top-level fields.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // Will be used in non-streaming mode later
+pub struct OpenAIUsage {
+    #[serde(default)]
+    pub input_tokens: u32,
+    #[serde(default)]
+    pub output_tokens: u32,
+    #[serde(default)]
+    pub input_tokens_details: Option<OpenAIInputTokensDetails>,
+    #[serde(default)]
+    pub output_tokens_details: Option<OpenAIOutputTokensDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAIInputTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAIOutputTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
+}
+
+impl From<OpenAIUsage> for Usage {
+    fn from(u: OpenAIUsage) -> Self {
+        Usage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_read_input_tokens: u.input_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
+            reasoning_tokens: u.output_tokens_details.and_then(|d| d.reasoning_tokens),
+        }
+    }
+}
+
+/// Output item in a Responses API response. Carries only the fields
+/// the streaming converter reads today; additional metadata fields are
+/// stripped by serde.
+#[derive(Debug, Clone, Deserialize)]
 pub struct ResponseItem {
-    pub r#type: String, // "message" or "function_call"
+    pub r#type: String, // "message" / "function_call" / "web_search_call" / "reasoning"
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<Vec<ResponseContent>>,
-    // For function call outputs
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Function name on a `function_call` item.
+    #[serde(default)]
     pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Function `call_id` on a `function_call` item — distinct from
+    /// `id` (`fc_…`) and the one that must be echoed back as the
+    /// `call_id` on the matching `function_call_output`.
+    #[serde(default)]
     pub call_id: Option<String>,
+    /// Builtin-tool call payload. Populated on items like
+    /// `web_search_call` (search action with queries) or
+    /// `code_interpreter_call`. Preserved as an opaque JSON value so
+    /// new builtins don't fail the parse.
+    #[serde(default)]
+    pub action: Option<IValue>,
 }
 
-/// Content item in a Responses API output.
+/// Content item in a Responses API output. Currently only the `type`
+/// discriminator is consumed (to pick `PartKind::Text` vs
+/// `PartKind::Refusal` on `response.content_part.added`).
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // Will be used in non-streaming mode later
 pub struct ResponseContent {
-    pub r#type: String, // "output_text", "tool_call", etc.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<Vec<IValue>>,
+    pub r#type: String, // "output_text", "refusal", etc.
 }
 
 /// Error details from OpenAI API.
@@ -269,29 +305,181 @@ pub struct IncompleteDetails {
     pub reason: String,
 }
 
-/// OpenAI streaming Responses API event.
+/// OpenAI streaming Responses API event — one variant per wire event
+/// type. Replaces the previous string-matching dispatch over an
+/// any-of-these-fields-may-be-set struct: the enum makes per-event
+/// required fields explicit, dispatches via serde, and surfaces
+/// unknown event types through [`Self::Unknown`] (logged at warning
+/// level) instead of silently dropping into a catch-all.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // Some fields used for metadata
-pub struct ResponsesStreamEvent {
-    pub r#type: String, // Event type
-    pub sequence_number: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub item_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_index: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_index: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logprobs: Option<Vec<IValue>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<ResponsesResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub item: Option<ResponseItem>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub part: Option<ResponseContent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<ErrorDetails>,
+#[serde(tag = "type")]
+pub enum OpenAIStreamEvent {
+    /// Wire-level error frame.
+    #[serde(rename = "error")]
+    Error { error: ErrorDetails },
+
+    /// Initial frame — carries the response shell with its id. The
+    /// id is stable across created/in_progress/completed, so we lift
+    /// the continuation only at end-of-stream; this variant is
+    /// acknowledged but its payload isn't consumed.
+    #[serde(rename = "response.created")]
+    ResponseCreated,
+    /// Heartbeat-style status frame; payload unused (see `ResponseCreated`).
+    #[serde(rename = "response.in_progress")]
+    ResponseInProgress,
+
+    /// New output item opening (message / function_call / reasoning /
+    /// web_search_call / …).
+    #[serde(rename = "response.output_item.added")]
+    OutputItemAdded {
+        output_index: u32,
+        item: ResponseItem,
+    },
+    /// Output item closing — final canonical item is in `item`.
+    #[serde(rename = "response.output_item.done")]
+    OutputItemDone {
+        output_index: u32,
+        item: ResponseItem,
+    },
+
+    /// Content part within a `message` item opening.
+    #[serde(rename = "response.content_part.added")]
+    ContentPartAdded {
+        output_index: u32,
+        content_index: u32,
+        part: ResponseContent,
+    },
+    /// Content part closing.
+    #[serde(rename = "response.content_part.done")]
+    ContentPartDone {
+        output_index: u32,
+        content_index: u32,
+    },
+
+    /// Token-by-token text delta on an `output_text` content part.
+    #[serde(rename = "response.output_text.delta")]
+    OutputTextDelta {
+        output_index: u32,
+        content_index: u32,
+        delta: String,
+    },
+    /// Token-by-token refusal delta on a `refusal` content part.
+    #[serde(rename = "response.refusal.delta")]
+    RefusalDelta {
+        output_index: u32,
+        content_index: u32,
+        delta: String,
+    },
+
+    /// New reasoning summary part inside a `reasoning` item opening.
+    #[serde(rename = "response.reasoning_summary_part.added")]
+    ReasoningSummaryPartAdded {
+        output_index: u32,
+        summary_index: u32,
+    },
+    /// Reasoning summary part closing.
+    #[serde(rename = "response.reasoning_summary_part.done")]
+    ReasoningSummaryPartDone {
+        output_index: u32,
+        summary_index: u32,
+    },
+    /// Token delta within an open reasoning summary part.
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    ReasoningSummaryTextDelta {
+        output_index: u32,
+        summary_index: u32,
+        delta: String,
+    },
+    /// Alternative reasoning channel (some models emit
+    /// `reasoning_text.delta` instead of `reasoning_summary_text.delta`).
+    #[serde(rename = "response.reasoning_text.delta")]
+    ReasoningTextDelta { output_index: u32, delta: String },
+
+    /// JSON-argument delta on a function_call item.
+    #[serde(rename = "response.function_call_arguments.delta")]
+    FunctionCallArgumentsDelta { output_index: u32, delta: String },
+
+    /// Citation / file reference added to an `output_text` part.
+    #[serde(rename = "response.output_text.annotation.added")]
+    OutputTextAnnotationAdded {
+        output_index: u32,
+        content_index: u32,
+        annotation: OpenAIAnnotation,
+    },
+
+    /// Terminal success frame. Carries the final response with usage.
+    #[serde(rename = "response.completed")]
+    ResponseCompleted { response: ResponsesResponse },
+    /// Terminal frame for premature termination
+    /// (max_output_tokens, content_filter, …). Carries
+    /// `incomplete_details.reason`.
+    #[serde(rename = "response.incomplete")]
+    ResponseIncomplete { response: ResponsesResponse },
+    /// Terminal error frame mid-generation (rate limit, server error,
+    /// safety block). Either `response.error` or top-level `error` is
+    /// populated.
+    #[serde(rename = "response.failed")]
+    ResponseFailed {
+        #[serde(default)]
+        response: Option<ResponsesResponse>,
+        #[serde(default)]
+        error: Option<ErrorDetails>,
+    },
+
+    // ---- intentionally-ignored frames (no `StreamEvent` produced) ----
+    /// Final-canonical-value frame for `output_text` — we already have
+    /// the content via deltas.
+    #[serde(rename = "response.output_text.done")]
+    OutputTextDone,
+    #[serde(rename = "response.reasoning_summary_text.done")]
+    ReasoningSummaryTextDone,
+    #[serde(rename = "response.reasoning_text.done")]
+    ReasoningTextDone,
+    #[serde(rename = "response.refusal.done")]
+    RefusalDone,
+    #[serde(rename = "response.function_call_arguments.done")]
+    FunctionCallArgumentsDone,
+    /// Lifecycle frames for `web_search_call` items — status is folded
+    /// into the queries `Delta` emitted at `output_item.done`.
+    #[serde(rename = "response.web_search_call.in_progress")]
+    WebSearchCallInProgress,
+    #[serde(rename = "response.web_search_call.searching")]
+    WebSearchCallSearching,
+    #[serde(rename = "response.web_search_call.completed")]
+    WebSearchCallCompleted,
+
+    /// Unknown event type — OpenAI added something we don't yet
+    /// recognise. The stream-state logs the variant at `warn` level
+    /// and continues; investigate via the captured `.response.sse`
+    /// file when it fires.
+    #[serde(other)]
+    Unknown,
 }
 
+/// Tagged annotation payload OpenAI emits with `output_text` parts. The
+/// concrete variants follow OpenAI's `type` discriminator:
+/// `url_citation` (web_search grounding), `file_citation`
+/// (retrieval / file_search tools), `container_file_citation` (code
+/// interpreter), `file_path` (file_search output references).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpenAIAnnotation {
+    UrlCitation {
+        #[serde(default)]
+        start_index: usize,
+        #[serde(default)]
+        end_index: usize,
+        url: String,
+        #[serde(default)]
+        title: Option<String>,
+    },
+    FileCitation {
+        file_id: String,
+        #[serde(default)]
+        filename: Option<String>,
+    },
+    /// Unknown / future annotation variants — captured generically so
+    /// new shapes don't fail the parse.
+    #[serde(other)]
+    Other,
+}

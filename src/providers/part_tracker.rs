@@ -16,6 +16,11 @@ pub(crate) struct PartTracker<K: Eq + Hash> {
     by_key: HashMap<K, u32>,
 }
 
+// Per-method dead-code allow: each provider uses a different subset
+// (Anthropic doesn't need `new` / `open_one_shot`, etc.), so the
+// "unused" set varies by feature combination. The allow keeps the
+// shared impl block warning-free under every gate combo.
+#[allow(dead_code)]
 impl<K: Eq + Hash + Clone> PartTracker<K> {
     pub fn new() -> Self {
         Self {
@@ -35,6 +40,19 @@ impl<K: Eq + Hash + Clone> PartTracker<K> {
 
     pub fn index_of(&self, key: &K) -> Option<u32> {
         self.by_key.get(key).copied()
+    }
+
+    /// Allocate a part index without binding it to a key, then emit
+    /// the PartStart + PartEnd pair atomically. Use for one-shot parts
+    /// whose payload is fully carried in `kind` (e.g.
+    /// [`PartKind::Continuation`], [`PartKind::RedactedReasoning`]).
+    pub fn open_one_shot(&mut self, kind: PartKind) -> Vec<StreamEvent> {
+        let index = self.next_index;
+        self.next_index += 1;
+        vec![
+            StreamEvent::PartStart { index, kind },
+            StreamEvent::PartEnd { index },
+        ]
     }
 
     /// Close a previously-opened part. Returns the `PartEnd` event or

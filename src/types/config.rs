@@ -43,22 +43,34 @@ pub struct ReasoningConfig {
     pub summary: Option<ReasoningSummary>,
 }
 
+/// Coarse "how hard to think" knob. Each provider maps it onto its own
+/// budget / effort parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
+    /// Minimal reasoning, optimized for latency.
     Low,
+    /// Balanced reasoning budget — the typical default.
     Medium,
+    /// Maximum reasoning budget; useful for hard problems.
     High,
 }
 
+/// Verbosity level for reasoning summaries that are surfaced to the
+/// caller (OpenAI Responses API).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningSummary {
+    /// Let the provider pick a summary style.
     Auto,
+    /// Short, high-level summary.
     Concise,
+    /// Long, step-by-step summary.
     Detailed,
 }
 
-/// Provider-specific continuation hint that the caller can carry from
-/// a [`crate::CompleteResponse`] into the next [`LLMRequest`].
+/// Provider-specific continuation hint that the caller carries from a
+/// [`crate::CompleteResponse`] into the next conversation turn by
+/// appending an [`crate::AssistantPart::Continuation`] part on the
+/// assistant turn that produced it.
 ///
 /// When the next request targets the *same* provider that issued the
 /// hint, the provider uses it as an optimization (e.g. OpenAI's
@@ -66,15 +78,21 @@ pub enum ReasoningSummary {
 /// targets a *different* provider, the hint is silently ignored and
 /// the lib falls back to sending the full conversation. Continuations
 /// are *always* optional — the lib works the same with or without one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderContinuation {
     /// OpenAI Responses API `previous_response_id`.
-    OpenAI { response_id: String },
+    OpenAI {
+        /// The `id` field of the previous OpenAI response.
+        response_id: String,
+    },
     /// Gemini `cachedContent` resource name (pre-created via the
     /// Vertex AI CachedContent API). When the next request targets the
     /// same Gemini deployment, Vertex looks up the cached prefix and
     /// elides the message history that produced it.
-    Gemini { cached_content: String },
+    Gemini {
+        /// Fully-qualified cached-content resource name.
+        cached_content: String,
+    },
 }
 
 /// Structured output mode for the response.
@@ -98,8 +116,11 @@ pub enum ResponseFormat {
     /// JSON Schema constraint. `strict` requests strict-mode validation
     /// on providers that support it.
     JsonSchema {
+        /// Schema identifier surfaced to providers that require one.
         name: String,
+        /// The JSON Schema itself.
         schema: std::borrow::Cow<'static, serde_json::value::RawValue>,
+        /// Request strict-mode validation where supported.
         strict: bool,
     },
 }
@@ -117,53 +138,62 @@ pub enum ToolChoice {
     /// Force the model to call exactly one tool (any tool).
     Required,
     /// Force the model to call this specific tool.
-    Function { name: String },
+    Function {
+        /// Name of the required tool.
+        name: String,
+    },
 }
 
-/// Request structure used by LLM providers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LLMRequest {
+/// Model selection plus sampling / tool / structured-output settings
+/// for an LLM call. Independent of the prompt so a single `Config`
+/// can be reused across many prompts targeting the same model.
+///
+/// `model` is required; every other field is `Option` and `None` means
+/// "use the provider's default."
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Provider-specific model identifier (e.g. `"gpt-4o"`,
+    /// `"gemini-2.5-pro"`, `"claude-sonnet-4-5"`).
     pub model: String,
-    pub messages: Vec<super::message::InputItem>,
+    /// Sampling temperature (`0.0` = deterministic, higher = more random).
     pub temperature: Option<f32>,
+    /// Hard cap on output tokens.
     pub max_tokens: Option<u32>,
+    /// Nucleus sampling — restrict to the smallest token set whose
+    /// cumulative probability is `top_p`.
     pub top_p: Option<f32>,
+    /// Stop sequences. The model halts as soon as it would emit any of these.
     pub stop: Option<Vec<String>>,
+    /// Penalty for tokens that have already appeared in the response.
     pub presence_penalty: Option<f32>,
+    /// Penalty proportional to a token's prior occurrence count.
     pub frequency_penalty: Option<f32>,
+    /// Functions / builtins the model may call.
     pub tools: Option<Vec<super::message::Tool>>,
     /// How the model should choose among tools.
-    #[serde(default, skip_serializing_if = "Option::is_none", skip)]
     pub tool_choice: Option<ToolChoice>,
     /// Whether to allow more than one tool call per turn (OpenAI). `None`
     /// uses the provider's default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     /// Whether OpenAI should retain the response server-side for use with
     /// `previous_response_id` chaining. `None` uses the provider's default
     /// (which is currently `true` for OpenAI).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
     /// Reasoning configuration. Only meaningful for models that support
     /// chain-of-thought reasoning.
-    #[serde(default, skip_serializing_if = "Option::is_none", skip)]
     pub reasoning: Option<ReasoningConfig>,
-    /// Optional provider continuation hint from a prior response.
-    /// Silently ignored on cross-provider switches.
-    #[serde(default, skip_serializing_if = "Option::is_none", skip)]
-    pub continuation: Option<ProviderContinuation>,
     /// Structured-output constraint (JSON mode / JSON schema). `None`
     /// means unconstrained text output.
-    #[serde(default, skip_serializing_if = "Option::is_none", skip)]
     pub response_format: Option<ResponseFormat>,
 }
 
-impl LLMRequest {
-    /// Create a new request with required fields.
-    pub fn new(model: impl Into<String>, messages: Vec<super::message::InputItem>) -> Self {
+impl Config {
+    /// Build a config targeting `model`. All other fields default to
+    /// `None` (provider default); set them via the chainable builder
+    /// methods.
+    pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
-            messages,
             temperature: None,
             max_tokens: None,
             top_p: None,
@@ -175,14 +205,8 @@ impl LLMRequest {
             parallel_tool_calls: None,
             store: None,
             reasoning: None,
-            continuation: None,
             response_format: None,
         }
-    }
-
-    /// Create a new request from a Prompt.
-    pub fn from_prompt(model: impl Into<String>, prompt: &crate::Prompt) -> Self {
-        Self::new(model, prompt.items().to_vec())
     }
 
     /// Set the temperature (randomness) parameter.
@@ -251,12 +275,6 @@ impl LLMRequest {
         self
     }
 
-    /// Attach a provider continuation hint from a prior response.
-    pub fn continuation(mut self, continuation: ProviderContinuation) -> Self {
-        self.continuation = Some(continuation);
-        self
-    }
-
     /// Constrain the response to a structured shape (JSON mode / schema).
     pub fn response_format(mut self, response_format: ResponseFormat) -> Self {
         self.response_format = Some(response_format);
@@ -267,34 +285,17 @@ impl LLMRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InputItem, Prompt};
 
     #[test]
-    fn test_llm_request_builder() {
-        let prompt = Prompt::user("Hello");
-
-        let request = LLMRequest::from_prompt("gpt-4", &prompt)
+    fn llm_config_builder_chains() {
+        let cfg = Config::new("gpt-4")
             .temperature(0.8)
             .max_tokens(500)
             .top_p(0.9);
-
-        assert_eq!(request.model, "gpt-4");
-        assert_eq!(request.messages.len(), 1);
-        assert_eq!(request.temperature, Some(0.8));
-        assert_eq!(request.max_tokens, Some(500));
-        assert_eq!(request.top_p, Some(0.9));
-        assert!(request.tools.is_none());
-    }
-
-    #[test]
-    fn test_llm_request_minimal() {
-        let messages = vec![InputItem::user("Test")];
-
-        let request = LLMRequest::new("gpt-3.5-turbo", messages);
-
-        assert_eq!(request.model, "gpt-3.5-turbo");
-        assert_eq!(request.messages.len(), 1);
-        assert_eq!(request.temperature, None);
-        assert_eq!(request.max_tokens, None);
+        assert_eq!(cfg.model, "gpt-4");
+        assert_eq!(cfg.temperature, Some(0.8));
+        assert_eq!(cfg.max_tokens, Some(500));
+        assert_eq!(cfg.top_p, Some(0.9));
+        assert!(cfg.tools.is_none());
     }
 }

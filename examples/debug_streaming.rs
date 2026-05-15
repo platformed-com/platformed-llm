@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
-use platformed_llm::{Error, LLMRequest, Prompt, ProviderFactory, ResponseAccumulator};
+use platformed_llm::accumulator::ResponseAccumulator;
+use platformed_llm::{Config, Error, Prompt, ProviderFactory};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -33,19 +34,17 @@ async fn main() -> Result<(), Error> {
 
     // Simple request
     let conversation = Prompt::user("Say 'Hello World' exactly.");
-    let request = LLMRequest::from_prompt("gpt-4o-mini", &conversation)
-        .temperature(0.0)
-        .max_tokens(10);
+    let cfg = Config::new("gpt-4o-mini").temperature(0.0).max_tokens(10);
 
     println!("📡 Making request...");
 
     // Generate response
-    match provider.generate(&request).await {
+    match provider.generate(&conversation, &cfg).await {
         Ok(response) => {
             println!("✅ Request succeeded");
 
             // Test direct text method
-            let response_clone = provider.generate(&request).await?;
+            let response_clone = provider.generate(&conversation, &cfg).await?;
             let text = response_clone.text().await?;
             println!("📄 Direct text result: '{text}'");
             println!("📄 Text length: {}", text.len());
@@ -73,8 +72,8 @@ async fn main() -> Result<(), Error> {
             println!("🏁 {event_count} total events");
 
             let complete_response = accumulator.finalize()?;
-            let content = complete_response.content();
-            println!("📄 Accumulated content: '{content}'");
+            let text = complete_response.text();
+            println!("📄 Accumulated content: '{text}'");
         }
         Err(e) => {
             println!("❌ Request failed: {e}");

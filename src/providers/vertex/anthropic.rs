@@ -1,16 +1,14 @@
 use futures_util::StreamExt;
-use std::collections::HashMap;
 
 use super::anthropic_types::*;
 use super::endpoint::VertexEndpoint;
-use crate::provider::LLMProvider;
+use crate::provider::Provider;
 use crate::sse_stream::SseStream;
 use crate::transport::{Transport, TransportRequest};
 use crate::types::{
-    AssistantPart, FinishReason, FunctionCall, InputItem, PartKind, PartUpdate, ReasoningEffort,
-    UserPart, Usage,
+    AssistantPart, FinishReason, InputItem, PartKind, PartUpdate, ReasoningEffort, Usage, UserPart,
 };
-use crate::{Error, LLMRequest, Response, StreamEvent};
+use crate::{Config, Error, Response, StreamEvent};
 
 /// Anthropic Claude provider implementation via Vertex AI.
 pub struct AnthropicViaVertexProvider {
@@ -74,11 +72,15 @@ impl AnthropicViaVertexProvider {
     }
 
     /// Convert internal request to Anthropic format.
-    fn convert_request(&self, request: &LLMRequest) -> Result<AnthropicRequest, Error> {
+    fn convert_request(
+        &self,
+        prompt: &crate::Prompt,
+        config: &Config,
+    ) -> Result<AnthropicRequest, Error> {
         let mut messages = Vec::new();
         let mut system_message = None;
 
-        for item in &request.messages {
+        for item in prompt.items() {
             match item {
                 InputItem::System(content) => {
                     system_message = Some(content.clone());
@@ -124,7 +126,7 @@ impl AnthropicViaVertexProvider {
             }
         }
 
-        let tools = request.tools.as_ref().and_then(|tools| {
+        let tools = config.tools.as_ref().and_then(|tools| {
             use crate::types::{ProviderBuiltin, Tool};
             let converted: Vec<AnthropicTool> = tools
                 .iter()
@@ -162,7 +164,7 @@ impl AnthropicViaVertexProvider {
         // Map our unified ReasoningConfig onto Anthropic's `thinking` field.
         // We derive budget_tokens from `effort` with sensible defaults;
         // callers needing precise control can construct providers directly.
-        let thinking = request.reasoning.as_ref().map(|cfg| {
+        let thinking = config.reasoning.as_ref().map(|cfg| {
             let budget_tokens = match cfg.effort.unwrap_or(ReasoningEffort::Medium) {
                 ReasoningEffort::Low => 2048,
                 ReasoningEffort::Medium => 8192,
@@ -174,49 +176,52 @@ impl AnthropicViaVertexProvider {
         // Anthropic requires temperature == 1 when thinking is enabled.
         // Override with a warning rather than erroring; better DX.
         let temperature = if thinking.is_some() {
-            if matches!(request.temperature, Some(t) if (t - 1.0).abs() > f32::EPSILON) {
+            if matches!(config.temperature, Some(t) if (t - 1.0).abs() > f32::EPSILON) {
                 tracing::warn!(
-                    requested = ?request.temperature,
+                    requested = ?config.temperature,
                     "Anthropic requires temperature=1 when extended thinking is enabled; \
                      overriding"
                 );
             }
             Some(1.0)
         } else {
-            request.temperature
+            config.temperature
         };
 
-        let tool_choice = request.tool_choice.as_ref().map(|choice| match choice {
+        let tool_choice = config.tool_choice.as_ref().map(|choice| match choice {
             crate::types::ToolChoice::Auto => AnthropicToolChoice::Auto,
             crate::types::ToolChoice::None => AnthropicToolChoice::None,
             crate::types::ToolChoice::Required => AnthropicToolChoice::Any,
-            crate::types::ToolChoice::Function { name } => AnthropicToolChoice::Tool {
-                name: name.clone(),
-            },
+            crate::types::ToolChoice::Function { name } => {
+                AnthropicToolChoice::Tool { name: name.clone() }
+            }
         });
 
         let anthropic_request = AnthropicRequest {
             messages,
-            max_tokens: request.max_tokens.unwrap_or(1024),
+            max_tokens: config.max_tokens.unwrap_or(1024),
             anthropic_version: "vertex-2023-10-16".to_string(),
             system: system_message,
             temperature,
-            top_p: request.top_p,
+            top_p: config.top_p,
             tools,
             stream: Some(true), // Enable streaming for SSE responses
             thinking,
-            stop_sequences: request.stop.clone(),
+            stop_sequences: config.stop.clone(),
             tool_choice,
         };
 
-        if request.presence_penalty.is_some() || request.frequency_penalty.is_some() {
+        if config.presence_penalty.is_some() || config.frequency_penalty.is_some() {
             tracing::debug!(
                 "Anthropic provider does not support presence/frequency penalty; dropping"
             );
         }
         if matches!(
-            request.response_format,
-            Some(crate::types::ResponseFormat::JsonObject | crate::types::ResponseFormat::JsonSchema { .. })
+            config.response_format,
+            Some(
+                crate::types::ResponseFormat::JsonObject
+                    | crate::types::ResponseFormat::JsonSchema { .. }
+            )
         ) {
             tracing::debug!(
                 "Anthropic has no native JSON mode; response_format dropped — use a function \
@@ -364,33 +369,32 @@ fn build_assistant_blocks(parts: &[AssistantPart]) -> Result<Vec<AnthropicConten
                     cache_control: None,
                 });
             }
+            AssistantPart::BuiltinToolCall { .. } => {
+                // Provider-side tool calls don't round-trip through
+                // history on Anthropic; drop them per the
+                // model-switching contract.
+                tracing::debug!("Anthropic provider dropping BuiltinToolCall during request build");
+            }
+            AssistantPart::Continuation(_) => {
+                // Anthropic has no equivalent server-side resumption
+                // surface; drop the continuation marker silently.
+            }
             AssistantPart::CacheBreakpoint => attach_cache_control(blocks.last_mut()),
         }
     }
     Ok(blocks)
 }
 
-fn flatten_user_parts_to_text(parts: &[UserPart]) -> String {
-    let mut out = String::new();
-    for part in parts {
-        if let UserPart::Text(s) = part {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(s);
-        }
-    }
-    out
-}
+use crate::providers::flatten_user_parts_to_text;
 
 #[async_trait::async_trait]
-impl LLMProvider for AnthropicViaVertexProvider {
-    async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
-        let anthropic_request = self.convert_request(request)?;
+impl Provider for AnthropicViaVertexProvider {
+    async fn generate(&self, prompt: &crate::Prompt, config: &Config) -> Result<Response, Error> {
+        let anthropic_request = self.convert_request(prompt, config)?;
 
         let url = self.endpoint.url(
             "anthropic",
-            &request.model,
+            &config.model,
             "streamRawPredict",
             Some("alt=sse"),
         );
@@ -403,11 +407,7 @@ impl LLMProvider for AnthropicViaVertexProvider {
         if !self.beta.is_empty() {
             headers.push(("anthropic-beta".to_string(), self.beta.join(",")));
         }
-        let req = TransportRequest {
-            url,
-            headers,
-            body,
-        };
+        let req = TransportRequest { url, headers, body };
         let response = self.transport.send(req).await?;
 
         if !(200..300).contains(&response.status) {
@@ -558,14 +558,12 @@ pub(crate) fn convert_stream_event_stateful(
                     });
                 }
             }
-            AnthropicContentBlock::ToolUse { id, name, input, .. } => {
-                let (_lib_idx, ev) = state.tracker.open(
-                    index,
-                    PartKind::ToolCall {
-                        call_id: id,
-                        name,
-                    },
-                );
+            AnthropicContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                let (_lib_idx, ev) = state
+                    .tracker
+                    .open(index, PartKind::ToolCall { call_id: id, name });
                 events.push(ev);
                 // Per the streaming protocol the initial `input` is `{}`.
                 // Arguments arrive via input_json_delta.
@@ -580,7 +578,10 @@ pub(crate) fn convert_stream_event_stateful(
                     );
                 }
             }
-            AnthropicContentBlock::Thinking { thinking, signature } => {
+            AnthropicContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
                 let (lib_idx, ev) = state.tracker.open(index, PartKind::Reasoning);
                 events.push(ev);
                 if !thinking.is_empty() {
@@ -662,8 +663,7 @@ pub(crate) fn convert_stream_event_stateful(
             }
         }
         AnthropicStreamEvent::MessageStop => {
-            let finish_reason =
-                map_anthropic_stop_reason(state.pending_stop_reason.as_deref());
+            let finish_reason = map_anthropic_stop_reason(state.pending_stop_reason.as_deref());
             let usage = std::mem::take(&mut state.pending_usage);
             events.push(StreamEvent::Done {
                 finish_reason,
@@ -684,34 +684,42 @@ pub(crate) fn convert_stream_event_stateful(
     Ok(events)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LLMRequest, Prompt};
+    use crate::{Config, Prompt};
 
     fn provider() -> AnthropicViaVertexProvider {
-        AnthropicViaVertexProvider::new(
-            "p".to_string(),
-            "us-east5".to_string(),
-            "tok".to_string(),
-        )
-        .unwrap()
+        AnthropicViaVertexProvider::new("p".to_string(), "us-east5".to_string(), "tok".to_string())
+            .unwrap()
     }
 
     #[test]
     fn map_anthropic_stop_reason_known_values() {
-        assert_eq!(map_anthropic_stop_reason(Some("end_turn")), FinishReason::Stop);
-        assert_eq!(map_anthropic_stop_reason(Some("tool_use")), FinishReason::ToolCalls);
-        assert_eq!(map_anthropic_stop_reason(Some("max_tokens")), FinishReason::Length);
-        assert_eq!(map_anthropic_stop_reason(Some("refusal")), FinishReason::ContentFilter);
+        assert_eq!(
+            map_anthropic_stop_reason(Some("end_turn")),
+            FinishReason::Stop
+        );
+        assert_eq!(
+            map_anthropic_stop_reason(Some("tool_use")),
+            FinishReason::ToolCalls
+        );
+        assert_eq!(
+            map_anthropic_stop_reason(Some("max_tokens")),
+            FinishReason::Length
+        );
+        assert_eq!(
+            map_anthropic_stop_reason(Some("refusal")),
+            FinishReason::ContentFilter
+        );
         assert_eq!(map_anthropic_stop_reason(None), FinishReason::Stop);
     }
 
     #[test]
     fn convert_simple_text_request() {
-        let req = LLMRequest::from_prompt("claude", &Prompt::user("hi"));
-        let body = provider().convert_request(&req).unwrap();
+        let prompt = Prompt::user("hi");
+        let cfg = Config::new("claude");
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
         assert_eq!(body.messages.len(), 1);
         assert_eq!(body.messages[0].role, "user");
     }

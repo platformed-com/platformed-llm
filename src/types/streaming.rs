@@ -5,7 +5,7 @@
 //! (0, 1, 2, …). The accumulator becomes a straight-line dispatch on
 //! variant — no implicit "currently-active part" state.
 
-use crate::types::{Annotation, FinishReason, Usage};
+use crate::types::{Annotation, FinishReason, ProviderBuiltin, ProviderContinuation, Usage};
 
 /// Events emitted by [`crate::Response`] streams.
 #[derive(Debug, Clone)]
@@ -14,43 +14,92 @@ pub enum StreamEvent {
     /// increasing within the turn. One-shot parts
     /// ([`PartKind::RedactedReasoning`]) carry all their data in `kind`
     /// and emit no subsequent Delta / PartUpdate for this index.
-    PartStart { index: u32, kind: PartKind },
+    PartStart {
+        /// Monotonic part index within the turn.
+        index: u32,
+        /// What kind of part is opening.
+        kind: PartKind,
+    },
 
     /// Append data to the part at `index`. The interpretation depends on
     /// the part's kind:
     /// - [`PartKind::Text`] / [`PartKind::Refusal`] → text delta.
     /// - [`PartKind::Reasoning`] → reasoning text delta.
     /// - [`PartKind::ToolCall`] → JSON-argument delta.
-    Delta { index: u32, delta: String },
+    Delta {
+        /// Index of the part being extended.
+        index: u32,
+        /// The delta payload to append.
+        delta: String,
+    },
 
     /// Out-of-band metadata for a part. Always arrives before the
     /// matching `PartEnd`. May arrive multiple times.
-    PartUpdate { index: u32, update: PartUpdate },
+    PartUpdate {
+        /// Index of the part being updated.
+        index: u32,
+        /// Metadata update to apply.
+        update: PartUpdate,
+    },
 
     /// No further events will arrive for this part.
-    PartEnd { index: u32 },
+    PartEnd {
+        /// Index of the part that just closed.
+        index: u32,
+    },
 
     /// The assistant turn is complete.
     Done {
+        /// Why the model stopped.
         finish_reason: FinishReason,
+        /// Final usage counters for the turn.
         usage: Usage,
     },
 
     /// Mid-stream fatal error.
-    Error { error: String },
+    Error {
+        /// Human-readable error description.
+        error: String,
+    },
 }
 
+/// Kind of part being streamed. Mirrors [`crate::AssistantPart`] but in
+/// "header" form — the content arrives via subsequent [`StreamEvent`]s.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PartKind {
+    /// Visible text part.
     Text,
+    /// Reasoning / chain-of-thought part.
     Reasoning,
     /// Anthropic opaque thinking blob. One-shot — no subsequent deltas.
-    RedactedReasoning { data: String },
+    RedactedReasoning {
+        /// Opaque server-encrypted thinking blob.
+        data: String,
+    },
+    /// OpenAI-style refusal part.
     Refusal,
     /// Tool call header. Arguments stream via `Delta` events.
-    ToolCall { call_id: String, name: String },
+    ToolCall {
+        /// Identifier the model assigns to the call.
+        call_id: String,
+        /// Tool name.
+        name: String,
+    },
+    /// Builtin tool invocation the provider executed natively (web
+    /// search, code execution, …). Arguments stream via `Delta`;
+    /// result (when present) arrives via
+    /// [`PartUpdate::BuiltinToolResult`].
+    BuiltinToolCall {
+        /// Which builtin tool the provider executed.
+        kind: ProviderBuiltin,
+    },
+    /// Provider-issued resumption hint identifying this assistant
+    /// turn. One-shot — all data lives in `kind`, no subsequent
+    /// `Delta` / `PartUpdate` events for this index.
+    Continuation(ProviderContinuation),
 }
 
+/// Metadata update for a streaming part.
 #[derive(Debug, Clone)]
 pub enum PartUpdate {
     /// Anthropic thinking signature, arriving after the last reasoning
@@ -58,6 +107,10 @@ pub enum PartUpdate {
     Signature(String),
     /// Citation / annotation on the text up to this point.
     Annotation(Annotation),
+    /// Result payload for a [`PartKind::BuiltinToolCall`] part — JSON,
+    /// shape depends on the builtin (`{"outcome": "...", "output":
+    /// "..."}` for code execution).
+    BuiltinToolResult(String),
 }
 
 #[cfg(test)]

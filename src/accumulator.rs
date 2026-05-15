@@ -3,12 +3,16 @@
 //! Every event names its target part by index. Reconstruction is a
 //! straight-line dispatch — no implicit "currently-active part" state.
 
-use crate::response::{CompleteResponse, OutputItem};
+use crate::response::CompleteResponse;
 use crate::types::{
     AssistantPart, FinishReason, FunctionCall, PartKind, PartUpdate, StreamEvent, Usage,
 };
 use crate::Error;
 
+/// Reassembles a sequence of [`StreamEvent`]s into a [`CompleteResponse`].
+///
+/// Useful when you want to consume a stream incrementally but also produce
+/// the final buffered response at the end.
 #[derive(Debug, Default)]
 pub struct ResponseAccumulator {
     parts: Vec<AssistantPart>,
@@ -17,10 +21,14 @@ pub struct ResponseAccumulator {
 }
 
 impl ResponseAccumulator {
+    /// Create an empty accumulator.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Apply a single stream event. Returns an error if the event references
+    /// a part index that wasn't opened by a preceding `PartStart`, or if the
+    /// stream itself reported an error.
     pub fn process_event(&mut self, event: StreamEvent) -> Result<(), Error> {
         match event {
             StreamEvent::PartStart { index, kind } => {
@@ -67,22 +75,19 @@ impl ResponseAccumulator {
         })
     }
 
+    /// Consume the accumulator and produce the final response. If `Done` was
+    /// never observed, the finish reason defaults to [`FinishReason::Stop`]
+    /// and usage to zeros.
     pub fn finalize(self) -> Result<CompleteResponse, Error> {
-        let output = if self.parts.is_empty() {
-            Vec::new()
-        } else {
-            vec![OutputItem::Assistant {
-                content: self.parts,
-            }]
-        };
         Ok(CompleteResponse {
-            output,
+            content: self.parts,
             finish_reason: self.finish_reason.unwrap_or(FinishReason::Stop),
             usage: self.usage.unwrap_or_default(),
-            continuation: None,
         })
     }
 
+    /// Concatenation of all accumulated text-part content so far. Intended
+    /// for live previews while streaming is still in flight.
     pub fn current_content(&self) -> String {
         self.parts
             .iter()
@@ -93,6 +98,9 @@ impl ResponseAccumulator {
             .collect()
     }
 
+    /// All function-call parts seen so far, cloned out. Note that the
+    /// `arguments` JSON is only guaranteed to be complete once the
+    /// corresponding `PartEnd` event has been processed.
     pub fn completed_function_calls(&self) -> Vec<FunctionCall> {
         self.parts
             .iter()
@@ -121,6 +129,12 @@ fn open_part(kind: PartKind) -> AssistantPart {
             name,
             arguments: String::new(),
         }),
+        PartKind::BuiltinToolCall { kind } => AssistantPart::BuiltinToolCall {
+            kind,
+            arguments: String::new(),
+            result: None,
+        },
+        PartKind::Continuation(c) => AssistantPart::Continuation(c),
     }
 }
 
@@ -130,7 +144,10 @@ fn append_delta(part: &mut AssistantPart, delta: &str) {
         AssistantPart::Reasoning { content, .. } => content.push_str(delta),
         AssistantPart::Refusal(content) => content.push_str(delta),
         AssistantPart::ToolCall(call) => call.arguments.push_str(delta),
-        AssistantPart::RedactedReasoning { .. } | AssistantPart::CacheBreakpoint => {}
+        AssistantPart::BuiltinToolCall { arguments, .. } => arguments.push_str(delta),
+        AssistantPart::RedactedReasoning { .. }
+        | AssistantPart::Continuation(_)
+        | AssistantPart::CacheBreakpoint => {}
     }
 }
 
@@ -141,6 +158,9 @@ fn apply_update(part: &mut AssistantPart, update: PartUpdate) {
         }
         (AssistantPart::Text { annotations, .. }, PartUpdate::Annotation(ann)) => {
             annotations.push(ann);
+        }
+        (AssistantPart::BuiltinToolCall { result, .. }, PartUpdate::BuiltinToolResult(r)) => {
+            *result = Some(r);
         }
         _ => {}
     }
@@ -182,7 +202,8 @@ mod tests {
             delta: "world!".into(),
         })
         .unwrap();
-        acc.process_event(StreamEvent::PartEnd { index: 0 }).unwrap();
+        acc.process_event(StreamEvent::PartEnd { index: 0 })
+            .unwrap();
         assert_eq!(acc.current_content(), "Hello, world!");
     }
 
@@ -207,7 +228,8 @@ mod tests {
             delta: r#" "Paris"}"#.into(),
         })
         .unwrap();
-        acc.process_event(StreamEvent::PartEnd { index: 0 }).unwrap();
+        acc.process_event(StreamEvent::PartEnd { index: 0 })
+            .unwrap();
 
         let calls = acc.completed_function_calls();
         assert_eq!(calls.len(), 1);
@@ -232,17 +254,16 @@ mod tests {
             update: PartUpdate::Signature("sig_abc".into()),
         })
         .unwrap();
-        acc.process_event(StreamEvent::PartEnd { index: 0 }).unwrap();
+        acc.process_event(StreamEvent::PartEnd { index: 0 })
+            .unwrap();
 
         let response = acc.finalize().unwrap();
-        match &response.output[0] {
-            OutputItem::Assistant { content } => match &content[0] {
-                AssistantPart::Reasoning { signature, content } => {
-                    assert_eq!(content, "Thinking...");
-                    assert_eq!(signature.as_deref(), Some("sig_abc"));
-                }
-                _ => panic!("wrong part"),
-            },
+        match &response.content[0] {
+            AssistantPart::Reasoning { signature, content } => {
+                assert_eq!(content, "Thinking...");
+                assert_eq!(signature.as_deref(), Some("sig_abc"));
+            }
+            _ => panic!("wrong part"),
         }
     }
 
@@ -280,14 +301,13 @@ mod tests {
             },
         })
         .unwrap();
-        acc.process_event(StreamEvent::PartEnd { index: 0 }).unwrap();
+        acc.process_event(StreamEvent::PartEnd { index: 0 })
+            .unwrap();
 
         let response = acc.finalize().unwrap();
-        match &response.output[0] {
-            OutputItem::Assistant { content } => match &content[0] {
-                AssistantPart::RedactedReasoning { data } => assert_eq!(data, "opaque-blob"),
-                _ => panic!("wrong"),
-            },
+        match &response.content[0] {
+            AssistantPart::RedactedReasoning { data } => assert_eq!(data, "opaque-blob"),
+            _ => panic!("wrong"),
         }
     }
 }

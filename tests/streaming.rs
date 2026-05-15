@@ -1,3 +1,4 @@
+#![cfg(feature = "openai")]
 //! Verify the lib actually streams — consumers get events as their bytes
 //! arrive, not bulk-buffered at the end.
 //!
@@ -19,18 +20,17 @@
 //!    consumer can be doing other work between events.
 
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::Stream;
 use futures_util::StreamExt;
-use platformed_llm::{
-    Error, LLMProvider, LLMRequest, OpenAIProvider, PartKind, Prompt, StreamEvent, Transport,
-    TransportImpl, TransportRequest, TransportResponse,
-};
+use platformed_llm::providers::OpenAIProvider;
+use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
+use platformed_llm::{Config, Error, PartKind, Prompt, Provider, StreamEvent};
 
 /// A response body that yields exactly one byte per poll AND inserts a
 /// `Pending` between bytes (waking itself so the runtime makes progress).
@@ -75,12 +75,13 @@ struct PerByteTransport {
 #[async_trait]
 impl TransportImpl for PerByteTransport {
     async fn send(&self, _req: TransportRequest) -> Result<TransportResponse, Error> {
-        let stream: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> = Box::pin(PerByteBody {
-            bytes: self.body.clone(),
-            pos: 0,
-            pending_next: true,
-            consumed: self.consumed.clone(),
-        });
+        let stream: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> =
+            Box::pin(PerByteBody {
+                bytes: self.body.clone(),
+                pos: 0,
+                pending_next: true,
+                consumed: self.consumed.clone(),
+            });
         Ok(TransportResponse {
             status: 200,
             headers: vec![("content-type".to_string(), "text/event-stream".to_string())],
@@ -128,8 +129,9 @@ async fn consumer_gets_events_as_bytes_arrive_not_bulk() {
         "http://placeholder".to_string(),
         transport,
     );
-    let req = LLMRequest::from_prompt("gpt-4o-mini", &Prompt::user("hi"));
-    let response = provider.generate(&req).await.unwrap();
+    let prompt = Prompt::user("hi");
+    let cfg = Config::new("gpt-4o-mini");
+    let response = provider.generate(&prompt, &cfg).await.unwrap();
     let mut stream = response.stream();
 
     // Read events as they come. After each event we assert the source
@@ -140,7 +142,10 @@ async fn consumer_gets_events_as_bytes_arrive_not_bulk() {
     while let Some(ev) = stream.next().await {
         let ev = ev.expect("no errors");
         match &ev {
-            StreamEvent::PartStart { kind: PartKind::Text, .. } => {
+            StreamEvent::PartStart {
+                kind: PartKind::Text,
+                ..
+            } => {
                 saw_part_start = true;
                 // PartStart for text arrives once content_part.added
                 // has been parsed — well before the rest of the script
@@ -152,6 +157,12 @@ async fn consumer_gets_events_as_bytes_arrive_not_bulk() {
                      (consumed {bytes_seen}/{total_bytes})",
                 );
             }
+            // The continuation part fires at response.completed near
+            // end-of-stream; not interesting for the pipelining check.
+            StreamEvent::PartStart {
+                kind: PartKind::Continuation(_),
+                ..
+            } => {}
             StreamEvent::Delta { delta, .. } => {
                 let bytes_seen = consumed.load(Ordering::SeqCst);
                 deltas.push(delta.clone());

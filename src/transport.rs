@@ -12,19 +12,22 @@
 //! directly. That made every provider responsible for its own retry /
 //! recording / mocking story and forced tests to either spin up wiremock or
 //! reach into provider internals. This module factors step 2 behind a
-//! [`Transport`] handle so providers compose against an interface and tests
-//! can inject anything that implements [`TransportImpl`] (e.g. a recorder
-//! that tees the body to disk, or a replayer that returns canned bytes).
+//! [`crate::transport::Transport`] handle so providers compose against an
+//! interface and tests can inject anything that implements
+//! [`crate::transport::TransportImpl`] (e.g. a recorder that tees the body
+//! to disk, or a replayer that returns canned bytes).
 //!
 //! The split is:
 //!
-//! - [`TransportImpl`] — the extension trait. Implement this to plug in
-//!   recording, replay, mocking, custom retry, etc.
-//! - [`Transport`] — the public concrete type providers store and clone.
-//!   Wraps `Arc<dyn TransportImpl>` internally so cloning is cheap.
-//! - [`ReqwestTransport`] — the default implementation backed by
-//!   `reqwest::Client`. Constructed via [`Transport::reqwest`] /
-//!   [`Transport::reqwest_with_client`].
+//! - [`crate::transport::TransportImpl`] — the extension trait. Implement
+//!   this to plug in recording, replay, mocking, custom retry, etc.
+//! - [`crate::transport::Transport`] — the public concrete type providers
+//!   store and clone. Wraps `Arc<dyn TransportImpl>` internally so cloning
+//!   is cheap.
+//! - [`crate::transport::ReqwestTransport`] — the default implementation
+//!   backed by `reqwest::Client`. Constructed via
+//!   [`crate::transport::Transport::reqwest`] /
+//!   [`crate::transport::Transport::reqwest_with_client`].
 //!
 //! All current LLM requests are `POST` so we don't expose a method field
 //! yet; add it when we need `GET` (e.g. for fetching files / models /
@@ -32,6 +35,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(feature = "reqwest")]
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,16 +44,21 @@ use futures_util::{Stream, StreamExt as _};
 
 use crate::Error;
 
-/// Connect timeout for the default reqwest-backed transport. We deliberately
-/// do **not** set a total request timeout — streaming responses (especially
-/// reasoning / extended thinking) can legitimately run for many minutes.
+/// Connect timeout for the default reqwest-backed transport. We
+/// deliberately do **not** set a total request timeout — streaming
+/// responses (especially reasoning / extended thinking) can
+/// legitimately run for many minutes.
+#[cfg(feature = "reqwest")]
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A request to be sent by a [`Transport`]. POST-only for now.
 #[derive(Debug, Clone)]
 pub struct TransportRequest {
+    /// Full request URL.
     pub url: String,
+    /// Request headers (case preserved as supplied).
     pub headers: Vec<(String, String)>,
+    /// Raw request body bytes.
     pub body: Vec<u8>,
 }
 
@@ -61,8 +70,11 @@ pub struct TransportRequest {
 /// closes the underlying connection — the cancellation contract verified
 /// by `tests/cancellation.rs`.
 pub struct TransportResponse {
+    /// HTTP status code.
     pub status: u16,
+    /// Response headers, in the order the server sent them.
     pub headers: Vec<(String, String)>,
+    /// Streaming response body. Dropping closes the underlying connection.
     pub body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
 }
 
@@ -98,6 +110,8 @@ impl TransportResponse {
 /// `bytes_stream` carries the underlying connection in its drop).
 #[async_trait]
 pub trait TransportImpl: Send + Sync + 'static {
+    /// Issue an HTTP request and return a streaming response. Implementations
+    /// must propagate cancellation through the returned body stream.
     async fn send(&self, req: TransportRequest) -> Result<TransportResponse, Error>;
 }
 
@@ -118,12 +132,17 @@ impl Transport {
 
     /// Default `reqwest::Client`-backed transport with a sensible connect
     /// timeout and no whole-request timeout. Most callers want this.
+    ///
+    /// Available when any hosted-provider feature
+    /// (`openai` / `google` / `anthropic`) is enabled.
+    #[cfg(feature = "reqwest")]
     pub fn reqwest() -> Result<Self, Error> {
         Ok(Self::new(ReqwestTransport::with_default_client()?))
     }
 
     /// Build a transport from a caller-owned `reqwest::Client`. Useful when
     /// the caller already configures TLS, proxies, retry middleware, etc.
+    #[cfg(feature = "reqwest")]
     pub fn reqwest_with_client(client: reqwest::Client) -> Self {
         Self::new(ReqwestTransport::new(client))
     }
@@ -142,10 +161,16 @@ impl std::fmt::Debug for Transport {
 
 /// Default transport: a `reqwest::Client` configured for streaming LLM
 /// responses (connect timeout, no whole-request timeout, no retry).
+///
+/// Available when the `reqwest` feature is enabled — implicitly the
+/// case under any hosted-provider feature (`openai`, `google`,
+/// `anthropic`).
+#[cfg(feature = "reqwest")]
 pub struct ReqwestTransport {
     client: reqwest::Client,
 }
 
+#[cfg(feature = "reqwest")]
 impl ReqwestTransport {
     /// Wrap a caller-supplied client.
     pub fn new(client: reqwest::Client) -> Self {
@@ -162,6 +187,7 @@ impl ReqwestTransport {
     }
 }
 
+#[cfg(feature = "reqwest")]
 #[async_trait]
 impl TransportImpl for ReqwestTransport {
     async fn send(&self, req: TransportRequest) -> Result<TransportResponse, Error> {
@@ -175,7 +201,11 @@ impl TransportImpl for ReqwestTransport {
         let headers: Vec<(String, String)> = response
             .headers()
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (k.as_str().to_string(), s.to_string()))
+            })
             .collect();
 
         // Map reqwest's per-chunk stream error onto ours. Dropping this

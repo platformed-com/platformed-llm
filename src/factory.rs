@@ -1,12 +1,20 @@
-use crate::providers::vertex::{AnthropicViaVertexProvider, GoogleProvider};
-use crate::{Error, LLMProvider, OpenAIProvider};
+#[cfg(feature = "anthropic")]
+use crate::providers::AnthropicViaVertexProvider;
+#[cfg(feature = "google")]
+use crate::providers::GoogleProvider;
+#[cfg(feature = "openai")]
+use crate::providers::OpenAIProvider;
+use crate::{Error, Provider};
 use std::env;
 
 /// Supported LLM providers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderType {
+    /// OpenAI's hosted API (`api.openai.com`).
     OpenAI,
+    /// Google Gemini via Vertex AI.
     Google,
+    /// Anthropic Claude via Vertex AI.
     Anthropic,
 }
 
@@ -18,12 +26,26 @@ impl ProviderType {
 }
 
 /// Configuration for creating providers.
+///
+/// Fields are public for inspection but the safe way to *construct*
+/// values is via [`ProviderConfig::openai`] / [`ProviderConfig::vertex`]
+/// / [`ProviderConfig::vertex_with_adc`] — those validate that the
+/// credential set matches the provider type. Direct struct literals
+/// can build inconsistent states (e.g. `provider_type: OpenAI` paired
+/// with `access_token: Some(_)`) which [`ProviderFactory::create`]
+/// will then surface as a missing-credential error.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
+    /// Which backend to instantiate.
     pub provider_type: ProviderType,
+    /// API key for direct-API providers (OpenAI).
     pub api_key: Option<String>,
+    /// GCP project ID for Vertex providers.
     pub project_id: Option<String>,
+    /// GCP region for Vertex providers (e.g. `europe-west1`, `us-east5`).
     pub location: Option<String>,
+    /// Pre-fetched OAuth access token for Vertex providers. When absent,
+    /// the factory uses Application Default Credentials.
     pub access_token: Option<String>,
 }
 
@@ -126,8 +148,8 @@ impl ProviderConfig {
                         "GOOGLE_CLOUD_PROJECT environment variable is required for {kind} provider"
                     ))
                 })?;
-                let location = env::var("GOOGLE_CLOUD_REGION")
-                    .unwrap_or_else(|_| "europe-west1".to_string());
+                let location =
+                    env::var("GOOGLE_CLOUD_REGION").unwrap_or_else(|_| "europe-west1".to_string());
                 if let Ok(access_token) = env::var("VERTEX_ACCESS_TOKEN") {
                     Self::vertex(provider, project_id, location, access_token)
                 } else {
@@ -146,8 +168,13 @@ pub struct ProviderFactory;
 
 impl ProviderFactory {
     /// Create a provider from configuration.
-    pub async fn create(config: &ProviderConfig) -> Result<Box<dyn LLMProvider>, Error> {
+    ///
+    /// Returns `Error::Config` when the requested `provider_type`
+    /// targets a backend whose Cargo feature is not enabled in this
+    /// build.
+    pub async fn create(config: &ProviderConfig) -> Result<Box<dyn Provider>, Error> {
         match config.provider_type {
+            #[cfg(feature = "openai")]
             ProviderType::OpenAI => {
                 let api_key = config
                     .api_key
@@ -156,6 +183,13 @@ impl ProviderFactory {
                 let provider = OpenAIProvider::new(api_key.clone())?;
                 Ok(Box::new(provider))
             }
+            #[cfg(not(feature = "openai"))]
+            ProviderType::OpenAI => Err(Error::config(
+                "OpenAI provider is not enabled in this build \
+                 (rebuild with `--features openai`)",
+            )),
+
+            #[cfg(feature = "google")]
             ProviderType::Google => {
                 let project_id = config
                     .project_id
@@ -165,15 +199,20 @@ impl ProviderFactory {
                     .location
                     .as_ref()
                     .ok_or_else(|| Error::config("Location required for Google provider"))?;
-                // Determine authentication method
                 let provider = if let Some(access_token) = &config.access_token {
                     GoogleProvider::new(project_id.clone(), location.clone(), access_token.clone())?
                 } else {
-                    // Use Application Default Credentials
                     GoogleProvider::with_adc(project_id.clone(), location.clone()).await?
                 };
                 Ok(Box::new(provider))
             }
+            #[cfg(not(feature = "google"))]
+            ProviderType::Google => Err(Error::config(
+                "Google provider is not enabled in this build \
+                 (rebuild with `--features google`)",
+            )),
+
+            #[cfg(feature = "anthropic")]
             ProviderType::Anthropic => {
                 let project_id = config
                     .project_id
@@ -183,7 +222,6 @@ impl ProviderFactory {
                     .location
                     .as_ref()
                     .ok_or_else(|| Error::config("Location required for Anthropic provider"))?;
-                // Determine authentication method
                 let provider = if let Some(access_token) = &config.access_token {
                     AnthropicViaVertexProvider::new(
                         project_id.clone(),
@@ -191,17 +229,21 @@ impl ProviderFactory {
                         access_token.clone(),
                     )?
                 } else {
-                    // Use Application Default Credentials
                     AnthropicViaVertexProvider::with_adc(project_id.clone(), location.clone())
                         .await?
                 };
                 Ok(Box::new(provider))
             }
+            #[cfg(not(feature = "anthropic"))]
+            ProviderType::Anthropic => Err(Error::config(
+                "Anthropic provider is not enabled in this build \
+                 (rebuild with `--features anthropic`)",
+            )),
         }
     }
 
     /// Create a provider from environment variables.
-    pub async fn from_env() -> Result<Box<dyn LLMProvider>, Error> {
+    pub async fn from_env() -> Result<Box<dyn Provider>, Error> {
         let config = ProviderConfig::from_env()?;
         Self::create(&config).await
     }
@@ -276,6 +318,129 @@ mod tests {
         assert!(ProviderType::Google.is_supported_via_vertex());
         assert!(ProviderType::Anthropic.is_supported_via_vertex());
         assert!(!ProviderType::OpenAI.is_supported_via_vertex());
+    }
+
+    // ---------------------------------------------------------------------
+    // `ProviderFactory::create()` construction tests.
+    //
+    // These confirm the factory wires each config variant to the right
+    // concrete provider without making any network calls. We use the
+    // explicit-access-token path because it lets the provider be built
+    // synchronously (no ADC fetch); the ADC fallback is still exercised
+    // by the `*_with_adc_paths` test which expects an error in offline
+    // CI environments.
+    // ---------------------------------------------------------------------
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn create_openai_succeeds() {
+        let config = ProviderConfig::openai("sk-test".into());
+        let provider = ProviderFactory::create(&config)
+            .await
+            .expect("create openai");
+        // We can't inspect the boxed concrete type without downcasting,
+        // but reaching `Ok` proves the OpenAI branch wired up.
+        drop(provider);
+    }
+
+    #[cfg(feature = "google")]
+    #[tokio::test]
+    async fn create_google_with_access_token_succeeds() {
+        let config = ProviderConfig::vertex(
+            ProviderType::Google,
+            "test-project".into(),
+            "us-east1".into(),
+            "ya29.token".into(),
+        )
+        .unwrap();
+        let provider = ProviderFactory::create(&config)
+            .await
+            .expect("create google");
+        drop(provider);
+    }
+
+    #[cfg(feature = "anthropic")]
+    #[tokio::test]
+    async fn create_anthropic_with_access_token_succeeds() {
+        let config = ProviderConfig::vertex(
+            ProviderType::Anthropic,
+            "test-project".into(),
+            "europe-west1".into(),
+            "ya29.token".into(),
+        )
+        .unwrap();
+        let provider = ProviderFactory::create(&config)
+            .await
+            .expect("create anthropic");
+        drop(provider);
+    }
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn create_openai_without_api_key_errors() {
+        let config = ProviderConfig {
+            provider_type: ProviderType::OpenAI,
+            api_key: None,
+            project_id: None,
+            location: None,
+            access_token: None,
+        };
+        let err = ProviderFactory::create(&config)
+            .await
+            .map(|_| ())
+            .expect_err("openai needs api_key");
+        assert!(err.to_string().contains("API key"), "got: {err}");
+    }
+
+    #[cfg(feature = "google")]
+    #[tokio::test]
+    async fn create_google_without_project_id_errors() {
+        let config = ProviderConfig {
+            provider_type: ProviderType::Google,
+            api_key: None,
+            project_id: None,
+            location: Some("us-east1".into()),
+            access_token: Some("tok".into()),
+        };
+        let err = ProviderFactory::create(&config)
+            .await
+            .map(|_| ())
+            .expect_err("google needs project_id");
+        assert!(err.to_string().contains("Project ID"), "got: {err}");
+    }
+
+    #[cfg(feature = "google")]
+    #[tokio::test]
+    async fn create_google_without_location_errors() {
+        let config = ProviderConfig {
+            provider_type: ProviderType::Google,
+            api_key: None,
+            project_id: Some("p".into()),
+            location: None,
+            access_token: Some("tok".into()),
+        };
+        let err = ProviderFactory::create(&config)
+            .await
+            .map(|_| ())
+            .expect_err("google needs location");
+        assert!(err.to_string().contains("Location"), "got: {err}");
+    }
+
+    #[cfg(feature = "anthropic")]
+    #[tokio::test]
+    async fn create_anthropic_without_project_id_errors() {
+        let config = ProviderConfig {
+            provider_type: ProviderType::Anthropic,
+            api_key: None,
+            project_id: None,
+            location: Some("us-east1".into()),
+            access_token: Some("tok".into()),
+        };
+        let err = ProviderFactory::create(&config)
+            .await
+            .map(|_| ())
+            .expect_err("anthropic needs project_id");
+        assert!(err.to_string().contains("Project ID"), "got: {err}");
     }
 
     // ---------------------------------------------------------------------

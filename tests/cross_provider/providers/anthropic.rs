@@ -1,7 +1,8 @@
 use super::{create_weather_tool, ProviderConfig, ProviderTestSetup};
 use crate::cross_provider::scripted::{load_fixture, ScriptedTransport, ScriptedTurn};
-use platformed_llm::providers::vertex::AnthropicViaVertexProvider;
-use platformed_llm::{LLMProvider, Transport, VertexEndpoint};
+use platformed_llm::providers::{AnthropicViaVertexProvider, VertexEndpoint};
+use platformed_llm::transport::Transport;
+use platformed_llm::Provider;
 use serde_json::json;
 use std::pin::Pin;
 
@@ -15,7 +16,7 @@ impl ProviderTestSetup for AnthropicTestSetup {
         }
     }
 
-    fn build_provider() -> Pin<Box<dyn LLMProvider>> {
+    fn build_provider() -> Pin<Box<dyn Provider>> {
         let weather_tool = create_weather_tool();
         let initial = json!({
             "messages": [

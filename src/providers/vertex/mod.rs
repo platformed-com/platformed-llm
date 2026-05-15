@@ -1,9 +1,19 @@
-pub mod anthropic;
-pub mod anthropic_types;
-pub mod endpoint;
-pub mod google;
-pub mod google_types;
+//! Google Vertex AI hosted providers — Gemini natively, plus Anthropic
+//! Claude via Vertex's Model Garden. Both share a single endpoint /
+//! auth surface ([`VertexEndpoint`]).
 
+#[cfg(feature = "anthropic")]
+mod anthropic;
+#[cfg(feature = "anthropic")]
+pub(crate) mod anthropic_types;
+mod endpoint;
+#[cfg(feature = "google")]
+mod google;
+#[cfg(feature = "google")]
+pub(crate) mod google_types;
+
+#[cfg(feature = "anthropic")]
 pub use anthropic::AnthropicViaVertexProvider;
-pub use endpoint::{VertexAuth, VertexEndpoint};
+pub use endpoint::VertexEndpoint;
+#[cfg(feature = "google")]
 pub use google::GoogleProvider;

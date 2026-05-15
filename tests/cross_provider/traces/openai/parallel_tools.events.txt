@@ -7,10 +7,13 @@ PartEnd[1]
 PartStart[2] tool_call call_id="<id-3>" name="get_weather"
 Delta[2] "{\"city\":\"Tokyo\"}"
 PartEnd[2]
+PartStart[3] continuation kind=OpenAI id=<n>
+PartEnd[3]
 Done finish=ToolCalls input=<n> output=<n>
 
 === final ===
 finish=ToolCalls
-output[0].part[0] tool_call name="get_weather" arguments="{\"city\":\"Paris\"}"
-output[0].part[1] tool_call name="get_weather" arguments="{\"city\":\"London\"}"
-output[0].part[2] tool_call name="get_weather" arguments="{\"city\":\"Tokyo\"}"
+part[0] tool_call name="get_weather" arguments="{\"city\":\"Paris\"}"
+part[1] tool_call name="get_weather" arguments="{\"city\":\"London\"}"
+part[2] tool_call name="get_weather" arguments="{\"city\":\"Tokyo\"}"
+part[3] continuation kind=OpenAI id=<n>

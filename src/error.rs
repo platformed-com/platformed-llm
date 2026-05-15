@@ -6,6 +6,10 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum Error {
     /// Low-level HTTP transport failure (connect timeout, TLS error, etc.).
+    ///
+    /// Only present when the `reqwest` feature is enabled — that's the
+    /// only path through which a `reqwest::Error` reaches us.
+    #[cfg(feature = "reqwest")]
     #[error("transport error: {0}")]
     Transport(#[from] reqwest::Error),
 
@@ -13,7 +17,9 @@ pub enum Error {
     /// is the HTTP status code we observed, if any.
     #[error("authentication failed{}{}", status_suffix(*status), .message)]
     Auth {
+        /// HTTP status observed (typically 401 or 403), if available.
         status: Option<u16>,
+        /// Provider-supplied error description.
         message: String,
     },
 
@@ -25,9 +31,14 @@ pub enum Error {
     /// hint: 5xx and 429 are retryable, 4xx generally isn't.
     #[error("provider error ({provider}{}{}", status_suffix(*status), .message)]
     Provider {
+        /// Short identifier of the provider that raised the error
+        /// (e.g. `"OpenAI"`, `"Google"`, `"Anthropic"`).
         provider: &'static str,
+        /// HTTP status if the failure was an HTTP response.
         status: Option<u16>,
+        /// `true` when the operation is safe to retry (5xx or 429).
         retryable: bool,
+        /// Provider-supplied error description.
         message: String,
     },
 
@@ -43,7 +54,10 @@ pub enum Error {
     /// `Retry-After` header or equivalent, if any.
     #[error("rate limit exceeded{}{}", retry_after_suffix(*retry_after), .message)]
     RateLimit {
+        /// Suggested wait duration from a `Retry-After` header, if the
+        /// provider supplied one.
         retry_after: Option<Duration>,
+        /// Provider-supplied error description.
         message: String,
     },
 
@@ -81,6 +95,7 @@ impl Error {
         }
     }
 
+    /// Build a configuration error (invalid env, missing required field, etc.).
     pub fn config(message: impl Into<String>) -> Self {
         Error::Config(message.into())
     }
@@ -101,6 +116,7 @@ impl Error {
         }
     }
 
+    /// Build a streaming error (SSE parse failure, out-of-order events, etc.).
     pub fn streaming(message: impl Into<String>) -> Self {
         Error::Streaming(message.into())
     }

@@ -7,44 +7,32 @@ use crate::{Error, StreamEvent};
 use futures_util::stream::Stream;
 use std::pin::Pin;
 
-/// A complete (buffered) response from an LLM provider.
+/// A complete (buffered) response from an LLM provider — a single
+/// assistant turn's worth of [`AssistantPart`]s plus terminal
+/// metadata.
+///
+/// Fields are public; the lib doesn't maintain hidden invariants on
+/// this struct. The accessor methods ([`Self::text`],
+/// [`Self::function_calls`], [`Self::continuation`], [`Self::to_items`])
+/// are convenience views over `content` — readers can pick whichever
+/// is more ergonomic. Callers that need to mutate the response should
+/// edit `content` directly.
 #[derive(Debug, Clone)]
 pub struct CompleteResponse {
-    /// The assistant's output. Currently always a single
-    /// [`OutputItem::Assistant`] (one assistant turn); modeled as a
-    /// `Vec` for forward-compatibility.
-    pub output: Vec<OutputItem>,
+    /// The assistant's emitted parts in order: text, reasoning, tool
+    /// calls, continuation marker, etc.
+    pub content: Vec<AssistantPart>,
+    /// Why the model stopped generating.
     pub finish_reason: FinishReason,
+    /// Token accounting for the turn.
     pub usage: Usage,
-    /// Provider-specific continuation hint for optional optimization on
-    /// the next request — always optional, always safe to ignore.
-    pub continuation: Option<ProviderContinuation>,
-}
-
-/// One assistant turn in the response output.
-#[derive(Debug, Clone)]
-pub enum OutputItem {
-    Assistant { content: Vec<AssistantPart> },
-}
-
-impl OutputItem {
-    pub fn to_input_item(&self) -> InputItem {
-        match self {
-            OutputItem::Assistant { content } => InputItem::Assistant {
-                content: content.clone(),
-            },
-        }
-    }
 }
 
 impl CompleteResponse {
     /// Concatenated text of all `AssistantPart::Text` parts.
     pub fn text(&self) -> String {
-        self.output
+        self.content
             .iter()
-            .flat_map(|item| match item {
-                OutputItem::Assistant { content } => content.iter(),
-            })
             .filter_map(|part| match part {
                 AssistantPart::Text { content, .. } => Some(content.as_str()),
                 _ => None,
@@ -52,18 +40,10 @@ impl CompleteResponse {
             .collect()
     }
 
-    /// Concatenated text — back-compat alias for `text()`.
-    pub fn content(&self) -> String {
-        self.text()
-    }
-
     /// All tool calls emitted by the assistant, in emit order.
     pub fn function_calls(&self) -> Vec<&FunctionCall> {
-        self.output
+        self.content
             .iter()
-            .flat_map(|item| match item {
-                OutputItem::Assistant { content } => content.iter(),
-            })
             .filter_map(|part| match part {
                 AssistantPart::ToolCall(call) => Some(call),
                 _ => None,
@@ -71,53 +51,72 @@ impl CompleteResponse {
             .collect()
     }
 
+    /// The provider's resumption hint for the next conversation turn,
+    /// if any. Surfaces the latest [`AssistantPart::Continuation`] in
+    /// the assistant content. Always optional, always safe to ignore.
+    pub fn continuation(&self) -> Option<&ProviderContinuation> {
+        self.content.iter().rev().find_map(|part| match part {
+            AssistantPart::Continuation(c) => Some(c),
+            _ => None,
+        })
+    }
+
+    /// Convert the response into a list of input items suitable for
+    /// appending to the next [`crate::Prompt`]. Returns a single
+    /// `InputItem::Assistant { content }`; any
+    /// [`AssistantPart::Continuation`] inside is automatically picked
+    /// up by the next same-provider request and elides prior history.
     pub fn to_items(&self) -> Vec<InputItem> {
-        self.output.iter().map(|item| item.to_input_item()).collect()
+        if self.content.is_empty() {
+            Vec::new()
+        } else {
+            vec![InputItem::Assistant {
+                content: self.content.clone(),
+            }]
+        }
     }
 }
 
 /// A streaming response.
 pub struct Response {
     stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>>,
-    continuation: Option<ProviderContinuation>,
 }
 
 impl Response {
+    /// Wrap an arbitrary stream of [`StreamEvent`]s as a [`Response`].
+    /// Mainly useful for tests and for callers that drive their own
+    /// transport.
     pub fn from_stream<S>(stream: S) -> Self
     where
         S: Stream<Item = Result<StreamEvent, Error>> + Send + 'static,
     {
         Self {
             stream: Box::pin(stream),
-            continuation: None,
         }
     }
 
-    pub fn with_continuation<S>(stream: S, continuation: Option<ProviderContinuation>) -> Self
-    where
-        S: Stream<Item = Result<StreamEvent, Error>> + Send + 'static,
-    {
-        Self {
-            stream: Box::pin(stream),
-            continuation,
-        }
-    }
-
+    /// Drain the stream and return the buffered [`CompleteResponse`].
     pub async fn buffer(self) -> Result<CompleteResponse, Error> {
         Ok(self.collect().await?.1)
     }
 
+    /// Drain the stream and return the concatenated text of all text parts.
     pub async fn text(self) -> Result<String, Error> {
         let complete = self.buffer().await?;
         Ok(complete.text())
     }
 
-    /// Drain the stream and return BOTH the full event sequence and the
-    /// accumulated [`CompleteResponse`]. Use when you need to render
-    /// streaming UI events live AND want a buffered final result without
-    /// double-consuming the response.
+    /// Drain the entire stream and return the full event log
+    /// alongside the buffered [`CompleteResponse`].
+    ///
+    /// Returns *after* the stream completes — the `Vec<StreamEvent>` is
+    /// a post-hoc record, not a live feed. Use it for inspection,
+    /// snapshot testing, or audit logging of an exchange you already
+    /// have a buffered result for. If you need live event handling
+    /// while the model streams, consume [`Self::stream`] directly and
+    /// feed events into a [`crate::accumulator::ResponseAccumulator`]
+    /// yourself.
     pub async fn collect(self) -> Result<(Vec<StreamEvent>, CompleteResponse), Error> {
-        let continuation = self.continuation.clone();
         let mut accumulator = crate::accumulator::ResponseAccumulator::new();
         let mut events = Vec::new();
 
@@ -141,11 +140,11 @@ impl Response {
             }
         }
 
-        let mut response = accumulator.finalize()?;
-        response.continuation = continuation;
+        let response = accumulator.finalize()?;
         Ok((events, response))
     }
 
+    /// Unwrap to the raw event stream for direct consumption.
     pub fn stream(self) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>> {
         self.stream
     }
@@ -228,21 +227,18 @@ mod tests {
     #[test]
     fn text_concatenates_across_parts() {
         let response = CompleteResponse {
-            output: vec![OutputItem::Assistant {
-                content: vec![
-                    AssistantPart::Text {
-                        content: "Hello, ".to_string(),
-                        annotations: Vec::new(),
-                    },
-                    AssistantPart::Text {
-                        content: "world!".to_string(),
-                        annotations: Vec::new(),
-                    },
-                ],
-            }],
+            content: vec![
+                AssistantPart::Text {
+                    content: "Hello, ".to_string(),
+                    annotations: Vec::new(),
+                },
+                AssistantPart::Text {
+                    content: "world!".to_string(),
+                    annotations: Vec::new(),
+                },
+            ],
             finish_reason: FinishReason::Stop,
             usage: Usage::default(),
-            continuation: None,
         };
         assert_eq!(response.text(), "Hello, world!");
     }
@@ -273,26 +269,65 @@ mod tests {
         assert_eq!(complete.text(), "hello");
     }
 
+    /// `to_items()` wraps the response's content in a single
+    /// `InputItem::Assistant`, preserving any `Continuation` part so
+    /// the next same-provider request picks it up and elides prior
+    /// history.
+    #[test]
+    fn to_items_includes_continuation_marker() {
+        use crate::types::{InputItem, ProviderContinuation};
+        let response = CompleteResponse {
+            content: vec![
+                AssistantPart::Text {
+                    content: "hi".into(),
+                    annotations: Vec::new(),
+                },
+                AssistantPart::Continuation(ProviderContinuation::OpenAI {
+                    response_id: "resp_42".into(),
+                }),
+            ],
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        };
+        let items = response.to_items();
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            InputItem::Assistant { content } => {
+                assert_eq!(content.len(), 2);
+                assert!(matches!(&content[0], AssistantPart::Text { .. }));
+                match &content[1] {
+                    AssistantPart::Continuation(ProviderContinuation::OpenAI { response_id }) => {
+                        assert_eq!(response_id, "resp_42");
+                    }
+                    other => panic!("expected continuation part, got {other:?}"),
+                }
+            }
+            other => panic!("expected assistant item, got {other:?}"),
+        }
+        // And the accessor matches.
+        assert!(matches!(
+            response.continuation(),
+            Some(ProviderContinuation::OpenAI { response_id }) if response_id == "resp_42"
+        ));
+    }
+
     #[test]
     fn function_calls_iter_returns_in_order() {
         let response = CompleteResponse {
-            output: vec![OutputItem::Assistant {
-                content: vec![
-                    AssistantPart::ToolCall(FunctionCall {
-                        call_id: "call_1".to_string(),
-                        name: "get_weather".to_string(),
-                        arguments: "{}".to_string(),
-                    }),
-                    AssistantPart::ToolCall(FunctionCall {
-                        call_id: "call_2".to_string(),
-                        name: "get_news".to_string(),
-                        arguments: "{}".to_string(),
-                    }),
-                ],
-            }],
+            content: vec![
+                AssistantPart::ToolCall(FunctionCall {
+                    call_id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: "{}".to_string(),
+                }),
+                AssistantPart::ToolCall(FunctionCall {
+                    call_id: "call_2".to_string(),
+                    name: "get_news".to_string(),
+                    arguments: "{}".to_string(),
+                }),
+            ],
             finish_reason: FinishReason::ToolCalls,
             usage: Usage::default(),
-            continuation: None,
         };
         let calls = response.function_calls();
         assert_eq!(calls.len(), 2);

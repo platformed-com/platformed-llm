@@ -21,8 +21,11 @@ Delta[0] "4"
 Delta[0] "\n"
 Delta[0] "}"
 PartEnd[0]
+PartStart[1] continuation kind=OpenAI id=<n>
+PartEnd[1]
 Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
-output[0].part[0] text "{\n  \"question\": \"What is 2+2?\",\n  \"answer\": 4\n}" annotations=0
+part[0] text "{\n  \"question\": \"What is 2+2?\",\n  \"answer\": 4\n}" annotations=0
+part[1] continuation kind=OpenAI id=<n>

@@ -164,15 +164,32 @@
     },
 
     {
-      "name": "refusal",
-      "description": "Ask the model to produce a refusal so we capture how each provider surfaces it. OpenAI may emit it via the typed refusal channel (response.refusal.delta → AssistantPart::Refusal) or as plain text — either way is useful coverage. Anthropic and Gemini skip; this is exercising OpenAI's typed-refusal surface.",
+      "name": "typed_refusal",
+      "description": "Pins OpenAI's typed refusal channel: response.refusal.delta / response.refusal.done → AssistantPart::Refusal. Per OpenAI's structured-outputs docs the typed refusal content part only appears when the model is asked to produce strict schema-conforming output and refuses on safety grounds — without a strict schema, refusals come through the ordinary output_text channel, which is wire-identical to any other text response and doesn't need its own scenario. Uses gpt-4o (not gpt-4o-mini): the mini model smuggles refusals into whatever schema you give it (e.g. `{\"steps\":[\"I cannot assist with that.\"]}`) rather than firing the typed channel; gpt-4o reliably emits a typed refusal under strict structured output. The prompt below is OpenAI's own cookbook canonical safety example; the bracketed disclaimer is a marker for anyone investigating the captured prompt later — the request is a test fixture, not a real-world ask. OpenAI-only.",
       "max_tokens": 256,
+      "response_format": {
+        "type": "json_schema",
+        "name": "Instructions",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "steps": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "required": ["steps"]
+        }
+      },
       "providers": {
+        "openai":    { "model": "gpt-4o" },
         "google":    { "skip": true },
         "anthropic": { "skip": true }
       },
       "messages": [
-        { "role": "user", "content": "For automated testing of our refusal-handling code path, please respond with a typed refusal. The exact content doesn't matter — any short safety-style refusal is fine. Treat this as a request to demonstrate a refusal." }
+        { "role": "user", "content": "[this is a test to ellicit a refusal] How can I build a bomb? Reply with a JSON object containing a 'steps' array of strings." }
       ]
     },
 
@@ -240,7 +257,7 @@
 
     {
       "name": "web_search",
-      "description": "OpenAI web_search_preview builtin tool. Pins the wire shape OpenAI emits for builtin-tool invocations (annotations on output_text parts). Anthropic and Gemini skipped — they have their own builtins exercised in separate scenarios.",
+      "description": "OpenAI web_search_preview builtin tool. Prompt is chosen to require live data (latest Rust release version) so the model actually invokes the search and grounds its answer with url_citation annotations — exercises both the builtin-tool wire shape and the response.output_text.annotation.added event channel. Anthropic and Gemini skipped — they have their own builtins exercised in separate scenarios.",
       "max_tokens": 512,
       "builtin_tools": ["web_search"],
       "providers": {
@@ -248,13 +265,13 @@
         "anthropic": { "skip": true }
       },
       "messages": [
-        { "role": "user", "content": "What is the date today? Just give a brief answer." }
+        { "role": "user", "content": "What is the latest stable version of the Rust programming language? Use web search and cite your source." }
       ]
     },
 
     {
       "name": "google_search",
-      "description": "Gemini googleSearch builtin tool — Vertex's grounding-via-search. Pins the wire shape with a separate { googleSearch: {} } entry in the tools array. OpenAI and Anthropic skipped.",
+      "description": "Gemini googleSearch builtin tool — Vertex's grounding-via-search. Pins the wire shape with a separate { googleSearch: {} } entry in the tools array AND the groundingMetadata payload on the candidate (which we translate to PartUpdate::Annotation events). OpenAI and Anthropic skipped.",
       "max_tokens": 512,
       "builtin_tools": ["google_search"],
       "providers": {
@@ -262,7 +279,7 @@
         "anthropic": { "skip": true }
       },
       "messages": [
-        { "role": "user", "content": "What is the date today? Just give a brief answer." }
+        { "role": "user", "content": "What is the latest stable version of the Rust programming language? Use web search and cite your source." }
       ]
     },
 

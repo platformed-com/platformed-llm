@@ -1,6 +1,8 @@
 use super::{create_weather_tool, ProviderConfig, ProviderTestSetup};
 use crate::cross_provider::scripted::{load_fixture, ScriptedTransport, ScriptedTurn};
-use platformed_llm::{LLMProvider, OpenAIProvider, Transport};
+use platformed_llm::providers::OpenAIProvider;
+use platformed_llm::transport::Transport;
+use platformed_llm::Provider;
 use serde_json::json;
 use std::pin::Pin;
 
@@ -14,7 +16,7 @@ impl ProviderTestSetup for OpenAITestSetup {
         }
     }
 
-    fn build_provider() -> Pin<Box<dyn LLMProvider>> {
+    fn build_provider() -> Pin<Box<dyn Provider>> {
         let weather_tool = create_weather_tool();
         let initial = json!({
             "model": "gpt-4o-mini",
@@ -44,30 +46,19 @@ impl ProviderTestSetup for OpenAITestSetup {
             "store": false
         });
 
+        // The first turn's `response.completed` carries
+        // `"id":"resp_1"`. The lib lifts that into a
+        // `ProviderContinuation::OpenAI` on the CompleteResponse;
+        // `with_response()` folds it into the conversation as an
+        // `InputItem::Continuation`. The follow-up request therefore
+        // sends ONLY the tool result + `previous_response_id` —
+        // server-side state covers the elided prefix. (Prior to this
+        // wiring, the lib silently dropped the continuation and re-
+        // sent the full history, which is the bug this fixture now
+        // pins against.)
         let followup = json!({
             "model": "gpt-4o-mini",
             "input": [
-                {
-                    "type": "message",
-                    "role": "system",
-                    "content": "You have access to weather data. Use the get_weather function when asked about weather."
-                },
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": "What's the weather like in Paris?"
-                },
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": "I'll help you get the weather for Paris."
-                },
-                {
-                    "type": "function_call",
-                    "call_id": "call_abc123def456",
-                    "name": "get_weather",
-                    "arguments": "{\"location\": \"Paris\"}"
-                },
                 {
                     "type": "function_call_output",
                     "call_id": "call_abc123def456",
@@ -76,6 +67,7 @@ impl ProviderTestSetup for OpenAITestSetup {
             ],
             "temperature": 0.7,
             "max_output_tokens": 150,
+            "previous_response_id": "resp_1",
             "stream": true,
             "store": false
         });

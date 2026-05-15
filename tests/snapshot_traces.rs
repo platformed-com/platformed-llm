@@ -1,3 +1,4 @@
+#![cfg(all(feature = "openai", feature = "google", feature = "anthropic"))]
 //! Snapshot the unified `StreamEvent` sequence produced by replaying each
 //! captured wire trace.
 //!
@@ -21,11 +22,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use platformed_llm::accumulator::ResponseAccumulator;
-use platformed_llm::{
-    AnthropicViaVertexProvider, CompleteResponse, Error, GoogleProvider, LLMProvider, LLMRequest,
-    OpenAIProvider, OutputItem, Prompt, StreamEvent, Transport, TransportImpl, TransportRequest,
-    TransportResponse, VertexEndpoint,
+use platformed_llm::providers::{
+    AnthropicViaVertexProvider, GoogleProvider, OpenAIProvider, VertexEndpoint,
 };
+use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
+use platformed_llm::Provider as _;
+use platformed_llm::{CompleteResponse, Config, Error, Prompt, StreamEvent};
 use serde_json::Value;
 
 /// Test-only `TransportImpl` that always returns a fixed status + body,
@@ -157,7 +159,8 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
         status: 200,
         body: trace.response_sse.clone(),
     });
-    let req = LLMRequest::from_prompt(trace.request_model.clone(), &Prompt::user("replay"));
+    let prompt = Prompt::user("replay");
+    let cfg = Config::new(trace.request_model.as_str());
     let response = match trace.provider {
         Provider::OpenAI => {
             let p = OpenAIProvider::with_transport(
@@ -165,7 +168,7 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
                 "http://placeholder".to_string(),
                 transport,
             );
-            p.generate(&req).await.unwrap()
+            p.generate(&prompt, &cfg).await.unwrap()
         }
         Provider::Google => {
             let endpoint = VertexEndpoint::with_access_token(
@@ -174,7 +177,7 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
                 "tok".to_string(),
             );
             GoogleProvider::with_transport(endpoint, transport)
-                .generate(&req)
+                .generate(&prompt, &cfg)
                 .await
                 .unwrap()
         }
@@ -185,7 +188,7 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
                 "tok".to_string(),
             );
             AnthropicViaVertexProvider::with_transport(endpoint, transport)
-                .generate(&req)
+                .generate(&prompt, &cfg)
                 .await
                 .unwrap()
         }
@@ -222,11 +225,7 @@ impl IdMasker {
             return String::from("\"\"");
         }
         let next = format!("<id-{}>", self.map.len() + 1);
-        let placeholder = self
-            .map
-            .entry(id.to_string())
-            .or_insert(next)
-            .clone();
+        let placeholder = self.map.entry(id.to_string()).or_insert(next).clone();
         format!("{placeholder:?}")
     }
 }
@@ -253,6 +252,20 @@ fn format_events(events: &[StreamEvent]) -> String {
                         "PartStart[{index}] tool_call call_id={masked} name={name:?}\n"
                     ));
                 }
+                PartKind::BuiltinToolCall { kind } => out.push_str(&format!(
+                    "PartStart[{index}] builtin_tool_call kind={kind:?}\n"
+                )),
+                PartKind::Continuation(c) => {
+                    // Mask the concrete id so re-captures don't churn
+                    // the snapshot.
+                    let kind = match c {
+                        platformed_llm::ProviderContinuation::OpenAI { .. } => "OpenAI",
+                        platformed_llm::ProviderContinuation::Gemini { .. } => "Gemini",
+                    };
+                    out.push_str(&format!(
+                        "PartStart[{index}] continuation kind={kind} id=<n>\n"
+                    ));
+                }
             },
             StreamEvent::Delta { index, delta } => {
                 out.push_str(&format!("Delta[{index}] {delta:?}\n"));
@@ -263,8 +276,11 @@ fn format_events(events: &[StreamEvent]) -> String {
                     s.len()
                 )),
                 PartUpdate::Annotation(a) => out.push_str(&format!(
-                    "PartUpdate[{index}] annotation kind={:?} source={:?}\n",
-                    a.kind, a.source
+                    "PartUpdate[{index}] annotation kind={:?} start={} end={} source={:?} title={:?}\n",
+                    a.kind, a.start, a.end, a.source, a.title
+                )),
+                PartUpdate::BuiltinToolResult(r) => out.push_str(&format!(
+                    "PartUpdate[{index}] builtin_tool_result {r:?}\n"
                 )),
             },
             StreamEvent::PartEnd { index } => {
@@ -290,38 +306,48 @@ fn format_complete(complete: &CompleteResponse) -> String {
     use platformed_llm::AssistantPart;
     let mut out = String::new();
     out.push_str(&format!("finish={:?}\n", complete.finish_reason));
-    for (i, item) in complete.output.iter().enumerate() {
-        match item {
-            OutputItem::Assistant { content } => {
-                for (j, part) in content.iter().enumerate() {
-                    match part {
-                        AssistantPart::Text { content, annotations } => out.push_str(&format!(
-                            "output[{i}].part[{j}] text {content:?} annotations={}\n",
-                            annotations.len()
-                        )),
-                        AssistantPart::Reasoning { content, signature } => {
-                            let sig_len = signature.as_ref().map(|s| s.len()).unwrap_or(0);
-                            out.push_str(&format!(
-                                "output[{i}].part[{j}] reasoning len={} signature_len={sig_len}\n",
-                                content.len()
-                            ));
-                        }
-                        AssistantPart::RedactedReasoning { data } => out.push_str(&format!(
-                            "output[{i}].part[{j}] redacted_reasoning len={}\n",
-                            data.len()
-                        )),
-                        AssistantPart::Refusal(s) => out.push_str(&format!(
-                            "output[{i}].part[{j}] refusal {s:?}\n"
-                        )),
-                        AssistantPart::ToolCall(call) => out.push_str(&format!(
-                            "output[{i}].part[{j}] tool_call name={:?} arguments={:?}\n",
-                            call.name, call.arguments
-                        )),
-                        AssistantPart::CacheBreakpoint => out.push_str(&format!(
-                            "output[{i}].part[{j}] cache_breakpoint\n"
-                        )),
-                    }
-                }
+    for (j, part) in complete.content.iter().enumerate() {
+        match part {
+            AssistantPart::Text { content, annotations } => out.push_str(&format!(
+                "part[{j}] text {content:?} annotations={}\n",
+                annotations.len()
+            )),
+            AssistantPart::Reasoning { content, signature } => {
+                let sig_len = signature.as_ref().map(|s| s.len()).unwrap_or(0);
+                out.push_str(&format!(
+                    "part[{j}] reasoning len={} signature_len={sig_len}\n",
+                    content.len()
+                ));
+            }
+            AssistantPart::RedactedReasoning { data } => out.push_str(&format!(
+                "part[{j}] redacted_reasoning len={}\n",
+                data.len()
+            )),
+            AssistantPart::Refusal(s) => {
+                out.push_str(&format!("part[{j}] refusal {s:?}\n"))
+            }
+            AssistantPart::ToolCall(call) => out.push_str(&format!(
+                "part[{j}] tool_call name={:?} arguments={:?}\n",
+                call.name, call.arguments
+            )),
+            AssistantPart::BuiltinToolCall {
+                kind,
+                arguments,
+                result,
+            } => out.push_str(&format!(
+                "part[{j}] builtin_tool_call kind={kind:?} arguments={arguments:?} result={result:?}\n"
+            )),
+            AssistantPart::Continuation(c) => {
+                let kind = match c {
+                    platformed_llm::ProviderContinuation::OpenAI { .. } => "OpenAI",
+                    platformed_llm::ProviderContinuation::Gemini { .. } => "Gemini",
+                };
+                out.push_str(&format!(
+                    "part[{j}] continuation kind={kind} id=<n>\n"
+                ));
+            }
+            AssistantPart::CacheBreakpoint => {
+                out.push_str(&format!("part[{j}] cache_breakpoint\n"))
             }
         }
     }
@@ -335,8 +361,10 @@ fn format_complete(complete: &CompleteResponse) -> String {
 /// Also catches "usage parsing silently broke" — the snapshot masks
 /// usage numeric values to keep re-captures stable, so without this
 /// check a parser regression that zeroed out token counts would slip
-/// through.
-fn validate_event_sequence(events: &[StreamEvent]) -> Result<(), String> {
+/// through. Scenario-specific checks (e.g. reasoning_tokens > 0 on
+/// `reasoning_request`) live here too so per-feature regressions don't
+/// hide behind the mask.
+fn validate_event_sequence(events: &[StreamEvent], scenario: &str) -> Result<(), String> {
     let dones: Vec<&StreamEvent> = events
         .iter()
         .filter(|e| matches!(e, StreamEvent::Done { .. }))
@@ -357,6 +385,116 @@ fn validate_event_sequence(events: &[StreamEvent]) -> Result<(), String> {
                 "Done.usage.input_tokens is 0 — usage block was probably not parsed".to_string(),
             );
         }
+        // The model must have generated at least one token somewhere
+        // (output or reasoning). Both being zero almost always means
+        // the usage block didn't parse — except a hypothetical
+        // entirely-empty response, which the lib treats as an error
+        // upstream. Counting reasoning lets length-limit scenarios
+        // pass when the budget went to thinking.
+        if usage.output_tokens == 0 && usage.reasoning_tokens.unwrap_or(0) == 0 {
+            return Err(format!(
+                "Done.usage produced no output or reasoning tokens — usage block \
+                 was probably not parsed (output_tokens={}, reasoning_tokens={:?})",
+                usage.output_tokens, usage.reasoning_tokens,
+            ));
+        }
+        // The reasoning_request scenario is the only one in the suite
+        // that should produce non-zero reasoning tokens. Pin it so a
+        // regression in the OpenAI usage-details parser (or the
+        // Gemini `thoughtsTokenCount` mapping) fails this test
+        // instead of silently going to zero.
+        if scenario == "reasoning_request" {
+            match usage.reasoning_tokens {
+                Some(t) if t > 0 => {}
+                other => {
+                    return Err(format!(
+                        "reasoning_request: expected non-zero reasoning_tokens, got {other:?}",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-scenario behavioural assertions on the buffered
+/// [`CompleteResponse`]. Snapshot diffs catch overall wire-shape
+/// drift, but they get regenerated wholesale via `UPDATE_SNAPSHOTS=1`,
+/// so a subtle semantic regression (e.g. parallel tool calls
+/// deduplicated, citations lost) can survive the bootstrap. Asserting
+/// directly on the public surface prevents that.
+fn validate_complete_response(
+    complete: &CompleteResponse,
+    provider: Provider,
+    scenario: &str,
+) -> Result<(), String> {
+    use platformed_llm::AnnotationKind;
+    match scenario {
+        // OpenAI's parallel_tools capture has three concurrent
+        // function_call items; pin that the lib surfaces all of them
+        // with distinct call_ids. (Gemini doesn't always parallelise
+        // — the model decides whether to fan out — so we only assert
+        // the multi-call shape on OpenAI.)
+        "parallel_tools" if matches!(provider, Provider::OpenAI) => {
+            let calls = complete.function_calls();
+            if calls.len() < 2 {
+                return Err(format!(
+                    "{scenario}: expected >=2 parallel function calls on OpenAI, got {} ({:?})",
+                    calls.len(),
+                    calls.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                ));
+            }
+            let mut ids: Vec<&str> = calls.iter().map(|c| c.call_id.as_str()).collect();
+            ids.sort();
+            let unique = ids.iter().collect::<std::collections::HashSet<_>>().len();
+            if unique != calls.len() {
+                return Err(format!(
+                    "{scenario}: parallel tool calls have duplicate call_ids: {ids:?}",
+                ));
+            }
+        }
+        // Web-search / google_search scenarios are prompted to cite
+        // their sources — at least one url_citation annotation must
+        // attach to the text part.
+        "web_search" | "google_search" => {
+            let mut found = false;
+            for part in &complete.content {
+                if let platformed_llm::AssistantPart::Text { annotations, .. } = part {
+                    if annotations
+                        .iter()
+                        .any(|a| a.kind == AnnotationKind::UrlCitation)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                return Err(format!(
+                    "{scenario}: expected at least one UrlCitation annotation on the response text"
+                ));
+            }
+        }
+        _ => {}
+    }
+    // Provider-specific sanity: every provider that surfaces a
+    // continuation should emit it as an AssistantPart::Continuation
+    // with the right kind. OpenAI guarantees one per response;
+    // Gemini/Anthropic don't surface continuations today.
+    if matches!(provider, Provider::OpenAI) {
+        let has_openai_cont = complete.content.iter().any(|p| {
+            matches!(
+                p,
+                platformed_llm::AssistantPart::Continuation(
+                    platformed_llm::ProviderContinuation::OpenAI { .. },
+                )
+            )
+        });
+        if !has_openai_cont {
+            return Err("OpenAI response missing AssistantPart::Continuation — \
+                 the streaming wiring may have regressed"
+                .to_string());
+        }
     }
     Ok(())
 }
@@ -375,7 +513,7 @@ async fn unified_event_snapshots_match() {
         let label = format!("{}/{}", trace.provider.dir_name(), trace.scenario);
         let events = replay(trace).await;
 
-        if let Err(msg) = validate_event_sequence(&events) {
+        if let Err(msg) = validate_event_sequence(&events, &trace.scenario) {
             failures.push(format!("{label}: {msg}"));
             continue;
         }
@@ -403,6 +541,11 @@ async fn unified_event_snapshots_match() {
                 continue;
             }
         };
+
+        if let Err(msg) = validate_complete_response(&complete, trace.provider, &trace.scenario) {
+            failures.push(format!("{label}: {msg}"));
+            continue;
+        }
 
         let actual = format!(
             "{}\n=== final ===\n{}",

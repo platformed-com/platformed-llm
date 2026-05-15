@@ -1,3 +1,4 @@
+#![cfg(all(feature = "openai", feature = "google"))]
 //! Replay captured 4xx/5xx traces through the matching provider's
 //! `generate()` and assert they map to the right typed [`Error`] variant.
 //!
@@ -17,10 +18,10 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::Stream;
-use platformed_llm::{
-    Error, GoogleProvider, LLMProvider, LLMRequest, OpenAIProvider, Prompt, Transport,
-    TransportImpl, TransportRequest, TransportResponse, VertexEndpoint,
-};
+use platformed_llm::providers::{GoogleProvider, OpenAIProvider, VertexEndpoint};
+use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
+use platformed_llm::Provider as _;
+use platformed_llm::{Config, Error, Prompt};
 use serde_json::Value;
 
 /// Test-only `TransportImpl` returning a fixed status + body. Used here
@@ -134,7 +135,8 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
         status: trace.status,
         body: trace.body.clone(),
     });
-    let req = LLMRequest::from_prompt("model", &Prompt::user("hi"));
+    let prompt = Prompt::user("hi");
+    let cfg = Config::new("model");
     match trace.provider {
         Provider::OpenAI => {
             let p = OpenAIProvider::with_transport(
@@ -142,7 +144,7 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
                 "http://placeholder".to_string(),
                 transport,
             );
-            p.generate(&req)
+            p.generate(&prompt, &cfg)
                 .await
                 .err()
                 .expect("4xx must produce an error")
@@ -154,7 +156,7 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
                 "tok".to_string(),
             );
             GoogleProvider::with_transport(endpoint, transport)
-                .generate(&req)
+                .generate(&prompt, &cfg)
                 .await
                 .err()
                 .expect("4xx must produce an error")
@@ -184,8 +186,20 @@ async fn captured_error_bodies_map_to_typed_errors() {
         let err = replay_error(trace).await;
         let ok = match (trace.provider, trace.status, &err) {
             // 401 → Auth on both providers, now that Vertex maps it.
-            (Provider::OpenAI, 401, Error::Auth { status: Some(401), .. }) => true,
-            (Provider::Google, 401, Error::Auth { status: Some(401), .. }) => true,
+            (
+                Provider::OpenAI,
+                401,
+                Error::Auth {
+                    status: Some(401), ..
+                },
+            ) => true,
+            (
+                Provider::Google,
+                401,
+                Error::Auth {
+                    status: Some(401), ..
+                },
+            ) => true,
             // 429 → RateLimit (OpenAI-side; Vertex doesn't typically 429
             // on the streaming endpoint, but if it does, accept either).
             (_, 429, Error::RateLimit { .. }) => true,

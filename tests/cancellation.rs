@@ -1,3 +1,4 @@
+#![cfg(feature = "openai")]
 //! Verify that dropping a `Response` mid-stream actually closes the
 //! underlying HTTP connection.
 //!
@@ -14,7 +15,8 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use platformed_llm::{LLMProvider, LLMRequest, OpenAIProvider, Prompt, StreamEvent};
+use platformed_llm::providers::OpenAIProvider;
+use platformed_llm::{Config, Prompt, Provider, StreamEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -75,8 +77,12 @@ async fn dropping_response_closes_underlying_connection() {
     });
 
     let provider = OpenAIProvider::new_with_base_url("test-key".to_string(), base_url).unwrap();
-    let req = LLMRequest::from_prompt("gpt-4o-mini", &Prompt::user("hi"));
-    let response = provider.generate(&req).await.expect("generate should succeed");
+    let prompt = Prompt::user("hi");
+    let cfg = Config::new("gpt-4o-mini");
+    let response = provider
+        .generate(&prompt, &cfg)
+        .await
+        .expect("generate should succeed");
     let mut stream = response.stream();
 
     // First event should be PartStart (text). Pull two events to also

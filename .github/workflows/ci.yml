@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clippy
+        run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+      # No default features anymore — exercise everything explicitly.
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
+
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc --no-deps
+        run: cargo doc --no-deps --lib --all-features
+
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build --all-targets --all-features --verbose
+
+  # Feature matrix — confirm that disabling default features and
+  # enabling individual provider features all compile cleanly.
+  feature-matrix:
+    name: lib build (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features openai"
+          - "--no-default-features --features google"
+          - "--no-default-features --features anthropic"
+          - "--no-default-features --features llama-gguf"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --lib ${{ matrix.features }}
+        run: cargo build --lib ${{ matrix.features }}
+
+  # End-to-end smoke test for the local llama-gguf provider. The
+  # `fetch_test_models` example populates `target/test-models/` with
+  # the small (~150MB) public GGUF model the test consumes; results
+  # are cached across runs.
+  llama-gguf-e2e:
+    name: llama-gguf smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache test models
+        uses: actions/cache@v4
+        with:
+          path: target/test-models
+          key: llama-gguf-models-v1-smollm2-135m-q8
+      - name: Fetch test models (cache miss only)
+        run: cargo run --bin fetch-test-models --features fetch-test-models
+      - name: cargo test --features llama-gguf
+        run: cargo test --no-default-features --features llama-gguf --test llama_gguf_e2e -- --nocapture
+      # The llama-gguf cross-provider variant lives inside the
+      # `cross_provider_tests` binary, which is also gated on the
+      # three hosted-provider features. Enable all four so the
+      # binary compiles AND the llama-gguf-specific test runs.
+      - name: cargo test cross_provider --features llama-gguf
+        run: cargo test --no-default-features --features "openai,google,anthropic,llama-gguf" --test cross_provider_tests -- --nocapture
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --all-targets --all-features --verbose
+      # Doctests aren't included in --all-targets — run them separately
+      # so a broken doc snippet still fails CI.
+      - name: cargo test --doc
+        run: cargo test --doc --all-features --verbose

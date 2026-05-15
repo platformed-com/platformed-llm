@@ -1,8 +1,10 @@
 pub mod anthropic;
 pub mod google;
+#[cfg(feature = "llama-gguf")]
+pub mod llama_gguf;
 pub mod openai;
 
-use platformed_llm::{Function, LLMProvider, Tool};
+use platformed_llm::{Function, Provider, Tool};
 use std::pin::Pin;
 
 /// Create a weather function tool for testing
@@ -39,5 +41,5 @@ pub struct ProviderConfig {
 /// (initial tool-emitting call + follow-up after the tool result).
 pub trait ProviderTestSetup {
     fn get_config() -> ProviderConfig;
-    fn build_provider() -> Pin<Box<dyn LLMProvider>>;
+    fn build_provider() -> Pin<Box<dyn Provider>>;
 }

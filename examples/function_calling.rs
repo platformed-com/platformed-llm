@@ -1,9 +1,7 @@
 use futures_util::StreamExt;
 use ijson::IValue;
-use platformed_llm::{
-    Error, Function, InputItem, LLMRequest, Prompt, ProviderFactory, ResponseAccumulator,
-    StreamEvent, Tool, ToolType,
-};
+use platformed_llm::accumulator::ResponseAccumulator;
+use platformed_llm::{Config, Error, Function, Prompt, ProviderFactory, StreamEvent, Tool};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -156,7 +154,7 @@ async fn main() -> Result<(), Error> {
 
     println!("🎯 Using model: {model_name}");
 
-    let request = LLMRequest::from_prompt(&model_name, &conversation)
+    let cfg = Config::new(&model_name)
         .temperature(0.2)
         .max_tokens(300)
         .tools(vec![get_weather.clone(), calculate.clone()]);
@@ -166,7 +164,7 @@ async fn main() -> Result<(), Error> {
 
     // Generate response with function calling
     println!("📡 Making API request...");
-    let response = match provider.generate(&request).await {
+    let response = match provider.generate(&conversation, &cfg).await {
         Ok(response) => {
             println!("✅ API request successful");
             response
@@ -223,10 +221,10 @@ async fn main() -> Result<(), Error> {
         if function_calls.is_empty() {
             // No more function calls, we're done
             println!("✅ No more function calls needed");
-            if !complete_response.content().trim().is_empty()
-                && complete_response.content() != text_output
+            if !complete_response.text().trim().is_empty()
+                && complete_response.text() != text_output
             {
-                println!("🤖 Final AI response: {}", complete_response.content());
+                println!("🤖 Final AI response: {}", complete_response.text());
             }
             break;
         }
@@ -310,12 +308,7 @@ async fn main() -> Result<(), Error> {
         println!();
         println!("🔁 Sending function results back to AI...");
 
-        let next_request = LLMRequest::from_prompt(&model_name, &conversation)
-            .temperature(0.2)
-            .max_tokens(300)
-            .tools(vec![get_weather.clone(), calculate.clone()]);
-
-        current_response = provider.generate(&next_request).await?;
+        current_response = provider.generate(&conversation, &cfg).await?;
     }
 
     println!();
