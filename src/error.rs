@@ -29,7 +29,7 @@ pub enum Error {
 
     /// Provider-side error. Carries HTTP `status` plus a `retryable`
     /// hint: 5xx and 429 are retryable, 4xx generally isn't.
-    #[error("provider error ({provider}{}{}", status_suffix(*status), .message)]
+    #[error("provider error ({provider}{}): {message}", status_suffix(*status))]
     Provider {
         /// Short identifier of the provider that raised the error
         /// (e.g. `"OpenAI"`, `"Google"`, `"Anthropic"`).
@@ -131,10 +131,14 @@ impl Error {
     }
 }
 
+/// Status fragment for the `Provider` Display. Returns only the
+/// `, status NNN` part (or empty) — the surrounding `(…)`: and
+/// message live in the format string itself, so editing this helper
+/// can't silently unbalance the parens.
 fn status_suffix(status: Option<u16>) -> String {
     match status {
-        Some(s) => format!(", status {s}): "),
-        None => "): ".to_string(),
+        Some(s) => format!(", status {s}"),
+        None => String::new(),
     }
 }
 
@@ -164,6 +168,20 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn provider_display_is_exactly_balanced_with_and_without_status() {
+        // Pins the exact rendered string so a future edit to
+        // `status_suffix` can't silently unbalance the parens.
+        assert_eq!(
+            Error::provider("OpenAI", "boom").to_string(),
+            "provider error (OpenAI): boom",
+        );
+        assert_eq!(
+            Error::provider_with_status("Google", 503, "down").to_string(),
+            "provider error (Google, status 503): down",
+        );
     }
 
     #[test]

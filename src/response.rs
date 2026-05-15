@@ -96,8 +96,29 @@ impl Response {
     }
 
     /// Drain the stream and return the buffered [`CompleteResponse`].
+    ///
+    /// Unlike [`Self::collect`] this does not build (and clone every
+    /// event into) an event log it would only discard — it feeds the
+    /// accumulator by value. This is the common path behind
+    /// [`Self::text`].
     pub async fn buffer(self) -> Result<CompleteResponse, Error> {
-        Ok(self.collect().await?.1)
+        use futures_util::StreamExt;
+        let mut accumulator = crate::accumulator::ResponseAccumulator::new();
+        let mut stream = self.stream;
+        while let Some(event_result) = stream.next().await {
+            let event = event_result?;
+            match &event {
+                StreamEvent::Error { error } => {
+                    return Err(Error::streaming(error.clone()));
+                }
+                StreamEvent::Done { .. } => {
+                    accumulator.process_event(event)?;
+                    break;
+                }
+                _ => accumulator.process_event(event)?,
+            }
+        }
+        accumulator.finalize()
     }
 
     /// Drain the stream and return the concatenated text of all text parts.
@@ -106,16 +127,19 @@ impl Response {
         Ok(complete.text())
     }
 
-    /// Drain the entire stream and return the full event log
-    /// alongside the buffered [`CompleteResponse`].
+    /// Drain the stream up to **and including** the terminal `Done`
+    /// and return the event log alongside the buffered
+    /// [`CompleteResponse`]. Any events a transport emits *after*
+    /// `Done` are not collected (the log stops at `Done`, mirroring
+    /// the buffered result).
     ///
     /// Returns *after* the stream completes — the `Vec<StreamEvent>` is
     /// a post-hoc record, not a live feed. Use it for inspection,
-    /// snapshot testing, or audit logging of an exchange you already
-    /// have a buffered result for. If you need live event handling
-    /// while the model streams, consume [`Self::stream`] directly and
-    /// feed events into a [`crate::accumulator::ResponseAccumulator`]
-    /// yourself.
+    /// snapshot testing, or audit logging. For the buffered result
+    /// alone prefer [`Self::buffer`] (no event-log allocation). If you
+    /// need live event handling while the model streams, consume
+    /// [`Self::stream`] directly and feed events into a
+    /// [`crate::accumulator::ResponseAccumulator`] yourself.
     pub async fn collect(self) -> Result<(Vec<StreamEvent>, CompleteResponse), Error> {
         let mut accumulator = crate::accumulator::ResponseAccumulator::new();
         let mut events = Vec::new();

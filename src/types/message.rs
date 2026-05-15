@@ -116,6 +116,11 @@ pub enum UserPart {
     /// Anthropic-only: marks the end of a cacheable prefix in the
     /// surrounding message. Best-effort on OpenAI (derives a stable
     /// `prompt_cache_key`); dropped on Gemini.
+    ///
+    /// Input-only: there is no [`PartKind`](super::PartKind)
+    /// `CacheBreakpoint`, so this is never produced by the streaming
+    /// accumulator. It survives a round-trip only via direct
+    /// `content` construction, not by re-accumulating a stream.
     CacheBreakpoint,
 }
 
@@ -179,7 +184,8 @@ pub enum AssistantPart {
     /// dropped (model-switching contract).
     Continuation(super::config::ProviderContinuation),
     /// Anthropic cache breakpoint marker, same semantics as
-    /// [`UserPart::CacheBreakpoint`].
+    /// [`UserPart::CacheBreakpoint`] — input-only; never produced by
+    /// the streaming accumulator.
     CacheBreakpoint,
 }
 

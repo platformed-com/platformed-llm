@@ -123,18 +123,26 @@ impl ProviderConfig {
     ///   `GOOGLE_CLOUD_REGION` (default `europe-west1`),
     ///   `VERTEX_ACCESS_TOKEN` (optional — uses ADC when absent).
     pub fn from_env() -> Result<Self, Error> {
-        let provider_type = env::var("PROVIDER_TYPE").map_err(|_| {
+        // A var set to an empty/whitespace-only string is as good as
+        // unset — reject it here with a clear config error instead of
+        // deferring to a confusing provider 401.
+        fn required(name: &str) -> Result<String, Error> {
+            match env::var(name) {
+                Ok(v) if !v.trim().is_empty() => Ok(v),
+                _ => Err(Error::config(format!(
+                    "{name} environment variable is required and must be non-empty"
+                ))),
+            }
+        }
+
+        let provider_type = required("PROVIDER_TYPE").map_err(|_| {
             Error::config(
                 "PROVIDER_TYPE environment variable is required (openai, google, or anthropic)",
             )
         })?;
         match provider_type.to_lowercase().as_str() {
             "openai" => {
-                let api_key = env::var("OPENAI_API_KEY").map_err(|_| {
-                    Error::config(
-                        "OPENAI_API_KEY environment variable is required for OpenAI provider",
-                    )
-                })?;
+                let api_key = required("OPENAI_API_KEY")?;
                 Ok(Self::openai(api_key))
             }
             kind @ ("google" | "anthropic") => {
@@ -143,17 +151,22 @@ impl ProviderConfig {
                 } else {
                     ProviderType::Anthropic
                 };
-                let project_id = env::var("GOOGLE_CLOUD_PROJECT").map_err(|_| {
+                let project_id = required("GOOGLE_CLOUD_PROJECT").map_err(|_| {
                     Error::config(format!(
                         "GOOGLE_CLOUD_PROJECT environment variable is required for {kind} provider"
                     ))
                 })?;
-                let location =
-                    env::var("GOOGLE_CLOUD_REGION").unwrap_or_else(|_| "europe-west1".to_string());
-                if let Ok(access_token) = env::var("VERTEX_ACCESS_TOKEN") {
-                    Self::vertex(provider, project_id, location, access_token)
-                } else {
-                    Self::vertex_with_adc(provider, project_id, location)
+                let location = match env::var("GOOGLE_CLOUD_REGION") {
+                    Ok(v) if !v.trim().is_empty() => v,
+                    _ => "europe-west1".to_string(),
+                };
+                // An empty VERTEX_ACCESS_TOKEN is treated as absent
+                // (fall through to ADC) rather than a blank bearer.
+                match env::var("VERTEX_ACCESS_TOKEN") {
+                    Ok(token) if !token.trim().is_empty() => {
+                        Self::vertex(provider, project_id, location, token)
+                    }
+                    _ => Self::vertex_with_adc(provider, project_id, location),
                 }
             }
             other => Err(Error::config(format!(

@@ -22,23 +22,6 @@ pub struct SseEvent {
 }
 
 impl SseEvent {
-    /// Create a new SSE event with just data.
-    pub fn new(data: String) -> Self {
-        Self {
-            data,
-            ..Default::default()
-        }
-    }
-
-    /// Create a new SSE event with event type and data.
-    pub fn with_type(event_type: String, data: String) -> Self {
-        Self {
-            event_type,
-            data,
-            ..Default::default()
-        }
-    }
-
     /// True when every field is empty / unset — used by the parser to
     /// avoid dispatching a zero-content event.
     pub fn is_empty(&self) -> bool {

@@ -147,6 +147,13 @@ impl Transport {
     /// Default `reqwest::Client`-backed transport with a sensible connect
     /// timeout and no whole-request timeout. Most callers want this.
     ///
+    /// **Footgun:** there is no overall or idle-read timeout (a
+    /// streaming response has no fixed duration). A server that
+    /// accepts the connection then stalls will hang `generate()`
+    /// indefinitely. Wrap calls in [`tokio::time::timeout`], or
+    /// supply a custom client via [`Self::reqwest_with_client`] /
+    /// [`Self::new`] with your own idle timeout.
+    ///
     /// Available when any hosted-provider feature
     /// (`openai` / `google` / `anthropic-vertex`) is enabled.
     #[cfg(feature = "reqwest")]
@@ -279,11 +286,18 @@ mod tests {
     /// cloning must not create new underlying resources.
     #[tokio::test]
     async fn transport_clone_shares_underlying_impl() {
-        struct Counting(std::sync::atomic::AtomicUsize);
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // The counter lives in a shared Arc the test also holds, so
+        // we can actually assert both clones routed to the *same*
+        // impl instance (a count of 2), not merely that clone()
+        // compiles.
+        struct Counting(Arc<AtomicUsize>);
         #[async_trait]
         impl TransportImpl for Counting {
             async fn send(&self, _req: TransportRequest) -> Result<TransportResponse, Error> {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(TransportResponse {
                     status: 200,
                     headers: vec![],
@@ -291,8 +305,8 @@ mod tests {
                 })
             }
         }
-        let counting = Counting(std::sync::atomic::AtomicUsize::new(0));
-        let t = Transport::new(counting);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let t = Transport::new(Counting(calls.clone()));
         let t2 = t.clone();
         let req = || TransportRequest {
             url: "http://x".into(),
@@ -301,9 +315,10 @@ mod tests {
         };
         let _ = t.send(req()).await.unwrap();
         let _ = t2.send(req()).await.unwrap();
-        // Both clones routed to the same impl, so we should see 2 calls.
-        // We can't introspect Counting through the trait object without
-        // adding more API; instead, this test mostly exists to lock in
-        // that `clone()` compiles and doesn't allocate a new impl.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both clones must route to the same underlying impl",
+        );
     }
 }

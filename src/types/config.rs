@@ -210,7 +210,17 @@ impl Config {
     }
 
     /// Set the temperature (randomness) parameter.
+    ///
+    /// Must be finite and in `0.0..=2.0`. Passing a value outside
+    /// that range (or NaN/∞) is a caller logic error and panics —
+    /// it's never a valid request. Note providers impose their own
+    /// tighter limits (Anthropic caps at 1.0); those still surface
+    /// server-side.
     pub fn temperature(mut self, temperature: f32) -> Self {
+        assert!(
+            temperature.is_finite() && (0.0..=2.0).contains(&temperature),
+            "temperature must be finite and in 0.0..=2.0, got {temperature}",
+        );
         self.temperature = Some(temperature);
         self
     }
@@ -222,7 +232,14 @@ impl Config {
     }
 
     /// Set the top_p (nucleus sampling) parameter.
+    ///
+    /// Must be finite and in `0.0..=1.0` (it's a probability mass).
+    /// Out-of-range / NaN is a caller logic error and panics.
     pub fn top_p(mut self, top_p: f32) -> Self {
+        assert!(
+            top_p.is_finite() && (0.0..=1.0).contains(&top_p),
+            "top_p must be finite and in 0.0..=1.0, got {top_p}",
+        );
         self.top_p = Some(top_p);
         self
     }
@@ -233,14 +250,26 @@ impl Config {
         self
     }
 
-    /// Set presence penalty.
+    /// Set presence penalty. Must be finite and in `-2.0..=2.0`
+    /// (the widest range any supported provider accepts);
+    /// out-of-range / NaN is a caller logic error and panics.
     pub fn presence_penalty(mut self, presence_penalty: f32) -> Self {
+        assert!(
+            presence_penalty.is_finite() && (-2.0..=2.0).contains(&presence_penalty),
+            "presence_penalty must be finite and in -2.0..=2.0, got {presence_penalty}",
+        );
         self.presence_penalty = Some(presence_penalty);
         self
     }
 
-    /// Set frequency penalty.
+    /// Set frequency penalty. Must be finite and in `-2.0..=2.0`
+    /// (the widest range any supported provider accepts);
+    /// out-of-range / NaN is a caller logic error and panics.
     pub fn frequency_penalty(mut self, frequency_penalty: f32) -> Self {
+        assert!(
+            frequency_penalty.is_finite() && (-2.0..=2.0).contains(&frequency_penalty),
+            "frequency_penalty must be finite and in -2.0..=2.0, got {frequency_penalty}",
+        );
         self.frequency_penalty = Some(frequency_penalty);
         self
     }
@@ -297,5 +326,33 @@ mod tests {
         assert_eq!(cfg.max_tokens, Some(500));
         assert_eq!(cfg.top_p, Some(0.9));
         assert!(cfg.tools.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "temperature must be finite")]
+    fn temperature_out_of_range_panics() {
+        Config::new("m").temperature(5.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "temperature must be finite")]
+    fn temperature_nan_panics() {
+        Config::new("m").temperature(f32::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "top_p must be finite")]
+    fn top_p_out_of_range_panics() {
+        Config::new("m").top_p(1.5);
+    }
+
+    #[test]
+    fn boundary_values_are_accepted() {
+        let cfg = Config::new("m")
+            .temperature(2.0)
+            .top_p(0.0)
+            .presence_penalty(-2.0)
+            .frequency_penalty(2.0);
+        assert_eq!(cfg.temperature, Some(2.0));
     }
 }
