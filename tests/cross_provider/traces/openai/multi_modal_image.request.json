@@ -1,0 +1,22 @@
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "Briefly describe what you see in this image.",
+          "type": "input_text"
+        },
+        {
+          "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
+          "type": "input_image"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 256,
+  "model": "gpt-4o-mini",
+  "store": false,
+  "stream": true
+}

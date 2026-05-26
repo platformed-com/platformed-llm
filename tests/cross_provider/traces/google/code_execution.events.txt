@@ -1,0 +1,14 @@
+PartStart[0] builtin_tool_call kind=CodeExecution
+Delta[0] "{\"code\":\"print(47**5)\\n\",\"language\":\"PYTHON\"}"
+PartUpdate[0] builtin_tool_result "{\"outcome\":\"OUTCOME_OK\",\"output\":\"229345007\\n\"}"
+PartEnd[0]
+PartStart[1] text
+Delta[1] "2"
+Delta[1] "29345007"
+PartEnd[1]
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+part[0] builtin_tool_call kind=CodeExecution arguments="{\"code\":\"print(47**5)\\n\",\"language\":\"PYTHON\"}" result=Some("{\"outcome\":\"OUTCOME_OK\",\"output\":\"229345007\\n\"}")
+part[1] text "229345007" annotations=0

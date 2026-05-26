@@ -1,0 +1,26 @@
+PartStart[0] text
+Delta[0] "###"
+Delta[0] " The"
+Delta[0] " History"
+Delta[0] " of"
+Delta[0] " Clouds"
+Delta[0] ":"
+Delta[0] " An"
+Delta[0] " E"
+Delta[0] "volving"
+Delta[0] " Understanding"
+Delta[0] "\n\n"
+Delta[0] "Cloud"
+Delta[0] "s"
+Delta[0] " have"
+Delta[0] " fascinated"
+Delta[0] " humanity"
+PartEnd[0]
+PartStart[1] continuation kind=OpenAI id=<n>
+PartEnd[1]
+Done finish=Length input=<n> output=<n>
+
+=== final ===
+finish=Length
+part[0] text "### The History of Clouds: An Evolving Understanding\n\nClouds have fascinated humanity" annotations=0
+part[1] continuation kind=OpenAI id=<n>

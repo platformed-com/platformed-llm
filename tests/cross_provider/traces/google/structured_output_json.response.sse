@@ -1,0 +1,4 @@
+data: {"candidates": [{"content": {"role": "model","parts": [{"text": "{\n  \"question\": \"What is"}]}}],"usageMetadata": {"trafficType": "ON_DEMAND"},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T16:32:49.243791Z","responseId": "sacEas_wDp3U9fgP3J_piAw"}
+
+data: {"candidates": [{"content": {"role": "model","parts": [{"text": " 2+2?\",\n  \"answer\": 4\n}"}]},"finishReason": "STOP"}],"usageMetadata": {"promptTokenCount": 33,"candidatesTokenCount": 23,"totalTokenCount": 113,"trafficType": "ON_DEMAND","promptTokensDetails": [{"modality": "TEXT","tokenCount": 33}],"candidatesTokensDetails": [{"modality": "TEXT","tokenCount": 23}],"thoughtsTokenCount": 57},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T16:32:49.243791Z","responseId": "sacEas_wDp3U9fgP3J_piAw"}
+

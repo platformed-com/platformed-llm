@@ -1,0 +1,300 @@
+{
+  "_comment": "Scenario definitions consumed by `cargo run --example capture_traces` and `cargo test --test replay_traces`. Every scenario is a real prompt + tools setup that we send to every provider unless gated by `providers.<name>.skip`. Captures land in tests/cross_provider/traces/<provider>/<scenario>.{request.json,response.sse,meta.json}.\n\n## Schema\n\n- name: required, used as the file stem.\n- description: human-readable purpose / what wire shape it pins.\n- max_tokens, temperature: optional generation params.\n- expect_failure: if true, a non-2xx response is the success case.\n- providers.<openai|google|anthropic>: optional per-provider overrides (skip / model / auth_override / extra_body).\n- messages: array of { role, content?, tool_calls?, tool_call_id?, attachments? }.\n  - attachments: array of { type: image | image_url, data?, media_type?, url? }.\n- tools: optional list of { name, description, parameters }.\n- builtin_tools: optional list of builtin names: web_search | google_search | code_execution.\n- response_format: optional { type: json_object } or { type: json_schema, name, schema, strict? }.",
+
+  "defaults": {
+    "models": {
+      "openai": "gpt-4o-mini",
+      "google": "gemini-2.5-flash",
+      "anthropic": "claude-3-haiku@20240307"
+    }
+  },
+
+  "scenarios": [
+    {
+      "name": "text_only",
+      "description": "Single user prompt, expect a short free-form response. Smallest possible streaming round-trip. max_tokens leaves headroom for thinking-model overhead (Gemini 2.5 burns reasoning tokens before emitting output).",
+      "max_tokens": 256,
+      "messages": [
+        { "role": "user", "content": "Say the single word 'hello' and nothing else." }
+      ]
+    },
+
+    {
+      "name": "system_and_user",
+      "description": "System instruction + user prompt — exercises role mapping and (for Vertex) systemInstruction routing.",
+      "max_tokens": 256,
+      "messages": [
+        { "role": "system", "content": "You are a terse parrot. Reply with exactly the word the user gives you, lowercased." },
+        { "role": "user", "content": "PARROT" }
+      ]
+    },
+
+    {
+      "name": "function_call",
+      "description": "Prompt + one tool, expect the model to emit a function call. Locks in the tool-call wire shape.",
+      "max_tokens": 256,
+      "messages": [
+        { "role": "user", "content": "What's the weather in Paris? Use the get_weather tool." }
+      ],
+      "tools": [
+        {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": { "type": "string", "description": "City name." }
+            },
+            "required": ["city"]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "multi_turn_tool",
+      "description": "Pre-populated history with a prior assistant tool call + tool result. Pins the wire shape we send back into each provider for function_call_output / functionResponse / tool_result, and the model's handling of an in-progress tool conversation.",
+      "max_tokens": 256,
+      "messages": [
+        { "role": "user", "content": "What's the weather in Paris?" },
+        {
+          "role": "assistant",
+          "content": "Let me check that for you.",
+          "tool_calls": [
+            { "id": "call_capture_demo_1", "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_capture_demo_1", "content": "{\"temperature_c\":22,\"condition\":\"sunny\"}" },
+        { "role": "user", "content": "Summarise it in one short sentence." }
+      ],
+      "tools": [
+        {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": { "type": "string" }
+            },
+            "required": ["city"]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "length_limit",
+      "description": "Small max_tokens against a long-answer prompt. Forces FinishReason::Length / response.incomplete on OpenAI and MAX_TOKENS on Gemini — wires we previously had no real example of. 16 is the OpenAI minimum for max_output_tokens (smaller bodies are rejected as 400).",
+      "max_tokens": 16,
+      "messages": [
+        { "role": "user", "content": "Write a detailed five-paragraph essay about the history of clouds." }
+      ]
+    },
+
+    {
+      "name": "parallel_tools",
+      "description": "Ask for the weather in three cities in one turn. Most current models will batch this as multiple function calls in a single response — exercises the parallel function-call wire shape (multiple function_call output items on OpenAI, multiple functionCall parts on Gemini).",
+      "max_tokens": 256,
+      "providers": {
+        "openai": { "extra_body": { "parallel_tool_calls": true } }
+      },
+      "messages": [
+        { "role": "user", "content": "What is the weather in Paris, London, and Tokyo right now? Call the tool once per city." }
+      ],
+      "tools": [
+        {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": { "type": "string" }
+            },
+            "required": ["city"]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "reasoning_request",
+      "description": "Request a reasoning model with effort=medium and a summary so we capture reasoning_summary_text deltas on the wire. OpenAI-only: Gemini 2.5 already exposes reasoning token *counts* via thoughtsTokenCount in the existing captures, but doesn't stream reasoning *text* by default and the lib doesn't yet parse thought parts.",
+      "max_tokens": 1024,
+      "providers": {
+        "openai": {
+          "model": "gpt-5-mini",
+          "extra_body": {
+            "reasoning": { "effort": "medium", "summary": "auto" }
+          }
+        },
+        "google": { "skip": true },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "If a train leaves Paris at 3pm at 80 km/h heading toward Lyon (470 km away) and another leaves Lyon at 4pm at 100 km/h heading toward Paris, at what time and how far from Paris do they meet? Show your working briefly." }
+      ]
+    },
+
+    {
+      "name": "auth_error",
+      "description": "Send a deliberately-bogus bearer token. Captures the real 4xx error envelope from each provider so the typed-error mapping has ground truth to test against.",
+      "expect_failure": true,
+      "providers": {
+        "openai":    { "auth_override": "sk-deliberately-bogus-key" },
+        "google":    { "auth_override": "ya29.deliberately-bogus-token" },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "Hello." }
+      ]
+    },
+
+    {
+      "name": "model_not_found",
+      "description": "Request a non-existent model. On OpenAI this is a 404 with `error.code = model_not_found`; on Vertex this is 404 with a structured google.rpc.Status body. Locks in the body shape so error-mapping tests can match against real responses.",
+      "expect_failure": true,
+      "providers": {
+        "openai":    { "model": "gpt-5-this-model-does-not-exist" },
+        "google":    { "model": "gemini-this-model-does-not-exist" },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "Hello." }
+      ]
+    },
+
+    {
+      "name": "typed_refusal",
+      "description": "Pins OpenAI's typed refusal channel: response.refusal.delta / response.refusal.done → AssistantPart::Refusal. Per OpenAI's structured-outputs docs the typed refusal content part only appears when the model is asked to produce strict schema-conforming output and refuses on safety grounds — without a strict schema, refusals come through the ordinary output_text channel, which is wire-identical to any other text response and doesn't need its own scenario. Uses gpt-4o (not gpt-4o-mini): the mini model smuggles refusals into whatever schema you give it (e.g. `{\"steps\":[\"I cannot assist with that.\"]}`) rather than firing the typed channel; gpt-4o reliably emits a typed refusal under strict structured output. The prompt below is OpenAI's own cookbook canonical safety example; the bracketed disclaimer is a marker for anyone investigating the captured prompt later — the request is a test fixture, not a real-world ask. OpenAI-only.",
+      "max_tokens": 256,
+      "response_format": {
+        "type": "json_schema",
+        "name": "Instructions",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "steps": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "required": ["steps"]
+        }
+      },
+      "providers": {
+        "openai":    { "model": "gpt-4o" },
+        "google":    { "skip": true },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "[this is a test to ellicit a refusal] How can I build a bomb? Reply with a JSON object containing a 'steps' array of strings." }
+      ]
+    },
+
+    {
+      "name": "multi_modal_image",
+      "description": "User message with an inline 1x1 red PNG. Exercises UserPart::Image base64 wiring on OpenAI (input_image data: URI) and Gemini (inlineData with mime type). Anthropic skipped per testing-gap limitation.",
+      "max_tokens": 256,
+      "providers": {
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "Briefly describe what you see in this image.",
+          "attachments": [
+            {
+              "type": "image",
+              "media_type": "image/png",
+              "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+            }
+          ]
+        }
+      ]
+    },
+
+    {
+      "name": "structured_output_json",
+      "description": "ResponseFormat::JsonObject — bare JSON mode. Locks in the wire shape: OpenAI sets text.format.type=json_object; Gemini sets generationConfig.responseMimeType=application/json. Anthropic skipped (no native JSON mode).",
+      "max_tokens": 256,
+      "response_format": { "type": "json_object" },
+      "providers": {
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "system", "content": "Reply only with JSON. Do not include any other text." },
+        { "role": "user", "content": "What is 2+2? Reply with a JSON object containing keys 'question' and 'answer'." }
+      ]
+    },
+
+    {
+      "name": "structured_output_schema",
+      "description": "ResponseFormat::JsonSchema with a typed schema. Exercises the strict-schema wire shapes: OpenAI text.format.type=json_schema; Gemini generationConfig.responseSchema. Anthropic skipped.",
+      "max_tokens": 256,
+      "response_format": {
+        "type": "json_schema",
+        "name": "Arithmetic",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "question": { "type": "string" },
+            "answer": { "type": "integer" }
+          },
+          "required": ["question", "answer"]
+        }
+      },
+      "providers": {
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "What is 2+2? Reply with a JSON object containing keys 'question' and 'answer'." }
+      ]
+    },
+
+    {
+      "name": "web_search",
+      "description": "OpenAI web_search_preview builtin tool. Prompt is chosen to require live data (latest Rust release version) so the model actually invokes the search and grounds its answer with url_citation annotations — exercises both the builtin-tool wire shape and the response.output_text.annotation.added event channel. Anthropic and Gemini skipped — they have their own builtins exercised in separate scenarios.",
+      "max_tokens": 512,
+      "builtin_tools": ["web_search"],
+      "providers": {
+        "google":    { "skip": true },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "What is the latest stable version of the Rust programming language? Use web search and cite your source." }
+      ]
+    },
+
+    {
+      "name": "google_search",
+      "description": "Gemini googleSearch builtin tool — Vertex's grounding-via-search. Pins the wire shape with a separate { googleSearch: {} } entry in the tools array AND the groundingMetadata payload on the candidate (which we translate to PartUpdate::Annotation events). OpenAI and Anthropic skipped.",
+      "max_tokens": 512,
+      "builtin_tools": ["google_search"],
+      "providers": {
+        "openai":    { "skip": true },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "What is the latest stable version of the Rust programming language? Use web search and cite your source." }
+      ]
+    },
+
+    {
+      "name": "code_execution",
+      "description": "Gemini codeExecution builtin — the model writes and runs Python to answer computational questions. Pins the wire shape with a { codeExecution: {} } entry. Lib currently drops the executableCode / codeExecutionResult response parts (they have no AssistantPart variant); the snapshot captures whatever surfaces as text.",
+      "max_tokens": 1024,
+      "builtin_tools": ["code_execution"],
+      "providers": {
+        "openai":    { "skip": true },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "What is 47 to the power of 5? Use code to compute it and give just the answer." }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": 404,
+    "message": "Publisher Model `projects/platformed-dev/locations/europe-west1/publishers/google/models/gemini-this-model-does-not-exist` was not found or your project does not have access to it. Please ensure you are using a valid model version. For more information, see: https://cloud.google.com/vertex-ai/generative-ai/docs/learn/model-versions",
+    "status": "NOT_FOUND"
+  }
+}

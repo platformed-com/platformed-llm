@@ -1,0 +1,17 @@
+{
+  "input": [
+    {
+      "content": "If a train leaves Paris at 3pm at 80 km/h heading toward Lyon (470 km away) and another leaves Lyon at 4pm at 100 km/h heading toward Paris, at what time and how far from Paris do they meet? Show your working briefly.",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 1024,
+  "model": "gpt-5-mini",
+  "reasoning": {
+    "effort": "medium",
+    "summary": "auto"
+  },
+  "store": false,
+  "stream": true
+}

@@ -1,0 +1,18 @@
+{
+  "input": [
+    {
+      "content": "What is the latest stable version of the Rust programming language? Use web search and cite your source.",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 512,
+  "model": "gpt-4o-mini",
+  "store": false,
+  "stream": true,
+  "tools": [
+    {
+      "type": "web_search_preview"
+    }
+  ]
+}

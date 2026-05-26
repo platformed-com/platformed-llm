@@ -1,328 +1,447 @@
 use futures_util::StreamExt;
-use gcp_auth::TokenProvider;
-use reqwest::Client;
-use std::sync::Arc;
-use std::time::Duration;
 
 use super::anthropic_types::*;
-use crate::provider::LLMProvider;
+use super::endpoint::VertexEndpoint;
+use crate::provider::Provider;
 use crate::sse_stream::SseStream;
-use crate::types::{FinishReason, FunctionCall, InputItem, Role};
-use crate::{Error, LLMRequest, Response, StreamEvent};
-
-/// Authentication method for Anthropic provider via Vertex AI.
-#[derive(Debug)]
-pub enum AnthropicViaVertexAuth {
-    /// Use access token (passed as Bearer header)
-    AccessToken(String),
-    /// Use Application Default Credentials (ADC)
-    ApplicationDefault,
-}
+use crate::transport::{Transport, TransportRequest};
+use crate::types::{
+    AssistantPart, FinishReason, InputItem, PartKind, PartUpdate, ReasoningEffort, Usage, UserPart,
+};
+use crate::{Config, Error, Response, StreamEvent};
 
 /// Anthropic Claude provider implementation via Vertex AI.
 pub struct AnthropicViaVertexProvider {
-    client: Client,
-    project_id: String,
-    location: String,
-    auth: AnthropicViaVertexAuth,
-    auth_manager: Option<Arc<dyn TokenProvider>>,
-    base_url: Option<String>,
+    endpoint: VertexEndpoint,
+    transport: Transport,
+    /// Comma-separated `anthropic-beta` header values. Used to opt into
+    /// beta features (computer use, fine-grained tool streaming, etc.).
+    beta: Vec<String>,
 }
 
 impl AnthropicViaVertexProvider {
     /// Create a new Anthropic provider with access token authentication.
     pub fn new(project_id: String, location: String, access_token: String) -> Result<Self, Error> {
-        Self::with_auth(
-            project_id,
-            location,
-            AnthropicViaVertexAuth::AccessToken(access_token),
-        )
+        Ok(Self {
+            endpoint: VertexEndpoint::with_access_token(project_id, location, access_token),
+            transport: Transport::reqwest()?,
+            beta: Vec::new(),
+        })
     }
 
-    /// Create a new Anthropic provider with custom base URL (for testing).
+    /// Create a new Anthropic provider with a custom base URL (for testing).
     pub fn new_with_base_url(
         project_id: String,
         location: String,
         access_token: String,
         base_url: String,
     ) -> Result<Self, Error> {
-        let mut provider = Self::with_auth(
-            project_id,
-            location,
-            AnthropicViaVertexAuth::AccessToken(access_token),
-        )?;
-        provider.base_url = Some(base_url);
-        Ok(provider)
+        Ok(Self {
+            endpoint: VertexEndpoint::with_access_token(project_id, location, access_token)
+                .with_base_url(base_url),
+            transport: Transport::reqwest()?,
+            beta: Vec::new(),
+        })
     }
 
     /// Create a new Anthropic provider with Application Default Credentials.
     pub async fn with_adc(project_id: String, location: String) -> Result<Self, Error> {
-        Self::with_auth_async(
-            project_id,
-            location,
-            AnthropicViaVertexAuth::ApplicationDefault,
-        )
-        .await
-    }
-
-    /// Create a new Anthropic provider with specific authentication method (sync for access tokens).
-    pub fn with_auth(
-        project_id: String,
-        location: String,
-        auth: AnthropicViaVertexAuth,
-    ) -> Result<Self, Error> {
-        match auth {
-            AnthropicViaVertexAuth::AccessToken(_) => {
-                let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
-
-                Ok(Self {
-                    client,
-                    project_id,
-                    location,
-                    auth,
-                    auth_manager: None,
-                    base_url: None,
-                })
-            }
-            AnthropicViaVertexAuth::ApplicationDefault => Err(Error::config(
-                "Use with_auth_async() for Application Default Credentials",
-            )),
-        }
-    }
-
-    /// Create a new Anthropic provider with specific authentication method (async for ADC).
-    pub async fn with_auth_async(
-        project_id: String,
-        location: String,
-        auth: AnthropicViaVertexAuth,
-    ) -> Result<Self, Error> {
-        let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
-
-        let auth_manager = match &auth {
-            AnthropicViaVertexAuth::ApplicationDefault => {
-                Some(gcp_auth::provider().await.map_err(|e| {
-                    Error::provider("Anthropic", format!("Failed to create auth manager: {e}"))
-                })?)
-            }
-            AnthropicViaVertexAuth::AccessToken(_) => None,
-        };
-
         Ok(Self {
-            client,
-            project_id,
-            location,
-            auth,
-            auth_manager,
-            base_url: None,
+            endpoint: VertexEndpoint::with_adc(project_id, location).await?,
+            transport: Transport::reqwest()?,
+            beta: Vec::new(),
         })
     }
 
+    /// Create a new Anthropic provider with a caller-supplied [`Transport`]
+    /// and pre-built [`VertexEndpoint`].
+    pub fn with_transport(endpoint: VertexEndpoint, transport: Transport) -> Self {
+        Self {
+            endpoint,
+            transport,
+            beta: Vec::new(),
+        }
+    }
+
+    /// Swap the static access token before it expires (GCP tokens
+    /// last ~1h). Errors if this provider was built with ADC, which
+    /// refreshes automatically. See [`VertexEndpoint::set_access_token`].
+    pub fn set_access_token(&self, token: impl Into<String>) -> Result<(), Error> {
+        self.endpoint.set_access_token(token)
+    }
+
+    /// Opt into Anthropic beta features. Each `beta_id` (e.g.
+    /// `"computer-use-2025-01-24"`) appears as a comma-separated value
+    /// in the `anthropic-beta` header.
+    pub fn with_beta(mut self, beta_ids: impl IntoIterator<Item = String>) -> Self {
+        self.beta.extend(beta_ids);
+        self
+    }
+
     /// Convert internal request to Anthropic format.
-    fn convert_request(&self, request: &LLMRequest) -> Result<AnthropicRequest, Error> {
+    fn convert_request(
+        &self,
+        prompt: &crate::Prompt,
+        config: &Config,
+    ) -> Result<AnthropicRequest, Error> {
         let mut messages = Vec::new();
         let mut system_message = None;
 
-        for item in &request.messages {
+        for item in prompt.items() {
             match item {
-                InputItem::Message(msg) => {
-                    match msg.role {
-                        Role::System => {
-                            // Anthropic uses separate system field for system messages
-                            system_message = Some(msg.content.clone());
-                        }
-                        Role::User => {
+                InputItem::System(content) => {
+                    system_message = Some(content.clone());
+                }
+                InputItem::User { content } => {
+                    let blocks = build_user_blocks(content)?;
+                    if blocks.is_empty() {
+                        continue;
+                    }
+                    if blocks.len() == 1 {
+                        if let AnthropicContentBlock::Text { text, .. } = &blocks[0] {
                             messages.push(AnthropicMessage {
                                 role: "user".to_string(),
-                                content: AnthropicContent::Text(msg.content.clone()),
+                                content: AnthropicContent::Text(text.clone()),
                             });
+                            continue;
                         }
-                        Role::Assistant => {
+                    }
+                    messages.push(AnthropicMessage {
+                        role: "user".to_string(),
+                        content: AnthropicContent::Blocks(blocks),
+                    });
+                }
+                InputItem::Assistant { content } => {
+                    let blocks = build_assistant_blocks(content)?;
+                    if blocks.is_empty() {
+                        continue;
+                    }
+                    if blocks.len() == 1 {
+                        if let AnthropicContentBlock::Text { text, .. } = &blocks[0] {
                             messages.push(AnthropicMessage {
                                 role: "assistant".to_string(),
-                                content: AnthropicContent::Text(msg.content.clone()),
+                                content: AnthropicContent::Text(text.clone()),
                             });
+                            continue;
                         }
                     }
-                }
-                InputItem::FunctionCall(call) => {
-                    // Add tool use to the last assistant response or create a new one
-                    let tool_use_block = AnthropicContentBlock::ToolUse {
-                        id: call.call_id.clone(),
-                        name: call.name.clone(),
-                        input: serde_json::from_str(&call.arguments).map_err(|e| {
-                            Error::provider("Anthropic", format!("Invalid function arguments: {e}"))
-                        })?,
-                    };
-
-                    if let Some(last_msg) = messages.last_mut() {
-                        if last_msg.role == "assistant" {
-                            // Convert existing content to blocks and add tool use
-                            match &mut last_msg.content {
-                                AnthropicContent::Text(text) => {
-                                    let mut blocks =
-                                        vec![AnthropicContentBlock::Text { text: text.clone() }];
-                                    blocks.push(tool_use_block);
-                                    last_msg.content = AnthropicContent::Blocks(blocks);
-                                }
-                                AnthropicContent::Blocks(blocks) => {
-                                    blocks.push(tool_use_block);
-                                }
-                            }
-                        } else {
-                            // Create new assistant message with tool use
-                            messages.push(AnthropicMessage {
-                                role: "assistant".to_string(),
-                                content: AnthropicContent::Blocks(vec![tool_use_block]),
-                            });
-                        }
-                    } else {
-                        // Create new assistant message with tool use
-                        messages.push(AnthropicMessage {
-                            role: "assistant".to_string(),
-                            content: AnthropicContent::Blocks(vec![tool_use_block]),
-                        });
-                    }
-                }
-                InputItem::FunctionCallOutput { call_id, output } => {
-                    // Add tool result to a user message
-                    let tool_result_block = AnthropicContentBlock::ToolResult {
-                        tool_use_id: call_id.clone(),
-                        content: output.clone(),
-                    };
-
-                    // Check if the last message is already a user message with tool results
-                    let should_append = if let Some(last_msg) = messages.last() {
-                        last_msg.role == "user"
-                            && match &last_msg.content {
-                                AnthropicContent::Blocks(blocks) => blocks
-                                    .iter()
-                                    .any(|b| matches!(b, AnthropicContentBlock::ToolResult { .. })),
-                                _ => false,
-                            }
-                    } else {
-                        false
-                    };
-
-                    if should_append {
-                        // Add to existing user message with tool results
-                        if let Some(last_msg) = messages.last_mut() {
-                            if let AnthropicContent::Blocks(blocks) = &mut last_msg.content {
-                                blocks.push(tool_result_block);
-                            }
-                        }
-                    } else {
-                        // Create new user message with tool result
-                        messages.push(AnthropicMessage {
-                            role: "user".to_string(),
-                            content: AnthropicContent::Blocks(vec![tool_result_block]),
-                        });
-                    }
+                    messages.push(AnthropicMessage {
+                        role: "assistant".to_string(),
+                        content: AnthropicContent::Blocks(blocks),
+                    });
                 }
             }
         }
 
-        let tools = request.tools.as_ref().map(|tools| {
-            tools
+        let tools = config.tools.as_ref().and_then(|tools| {
+            use crate::types::{ProviderBuiltin, Tool};
+            let converted: Vec<AnthropicTool> = tools
                 .iter()
-                .map(|tool| AnthropicTool {
-                    name: tool.function.name.clone(),
-                    description: tool.function.description.clone(),
-                    input_schema: tool.function.parameters.clone(),
+                .filter_map(|tool| match tool {
+                    Tool::Function(f) => Some(AnthropicTool::Function {
+                        name: f.name.clone(),
+                        description: f.description.clone().unwrap_or_default(),
+                        input_schema: f.parameters.clone(),
+                    }),
+                    Tool::Builtin(ProviderBuiltin::WebSearch) => Some(AnthropicTool::Builtin {
+                        r#type: "web_search_20250305",
+                        name: "web_search",
+                    }),
+                    Tool::Builtin(ProviderBuiltin::ComputerUse(cfg)) => {
+                        Some(AnthropicTool::Computer {
+                            r#type: "computer_20250124",
+                            name: "computer",
+                            display_width_px: cfg.display_width,
+                            display_height_px: cfg.display_height,
+                        })
+                    }
+                    Tool::Builtin(b) => {
+                        tracing::debug!(?b, "Anthropic provider dropping unsupported builtin");
+                        None
+                    }
                 })
-                .collect()
+                .collect();
+            if converted.is_empty() {
+                None
+            } else {
+                Some(converted)
+            }
+        });
+
+        // Map our unified ReasoningConfig onto Anthropic's `thinking` field.
+        // We derive budget_tokens from `effort` with sensible defaults;
+        // callers needing precise control can construct providers directly.
+        let thinking = config.reasoning.as_ref().map(|cfg| {
+            let budget_tokens = match cfg.effort.unwrap_or(ReasoningEffort::Medium) {
+                ReasoningEffort::Low => 2048,
+                ReasoningEffort::Medium => 8192,
+                ReasoningEffort::High => 16384,
+            };
+            AnthropicThinking::Enabled { budget_tokens }
+        });
+
+        // Anthropic requires temperature == 1 when thinking is enabled.
+        // Override with a warning rather than erroring; better DX.
+        let temperature = if thinking.is_some() {
+            if matches!(config.temperature, Some(t) if (t - 1.0).abs() > f32::EPSILON) {
+                tracing::warn!(
+                    requested = ?config.temperature,
+                    "Anthropic requires temperature=1 when extended thinking is enabled; \
+                     overriding"
+                );
+            }
+            Some(1.0)
+        } else {
+            config.temperature
+        };
+
+        let tool_choice = config.tool_choice.as_ref().map(|choice| match choice {
+            crate::types::ToolChoice::Auto => AnthropicToolChoice::Auto,
+            crate::types::ToolChoice::None => AnthropicToolChoice::None,
+            crate::types::ToolChoice::Required => AnthropicToolChoice::Any,
+            crate::types::ToolChoice::Function { name } => {
+                AnthropicToolChoice::Tool { name: name.clone() }
+            }
         });
 
         let anthropic_request = AnthropicRequest {
             messages,
-            max_tokens: request.max_tokens.unwrap_or(1024),
-            anthropic_version: "vertex-2023-10-16".to_string(),
+            max_tokens: config.max_tokens.unwrap_or(1024),
+            anthropic_version: "vertex-2023-10-16",
             system: system_message,
-            temperature: request.temperature,
-            top_p: request.top_p,
+            temperature,
+            top_p: config.top_p,
             tools,
             stream: Some(true), // Enable streaming for SSE responses
+            thinking,
+            stop_sequences: config.stop.clone(),
+            tool_choice,
         };
+
+        if config.presence_penalty.is_some() || config.frequency_penalty.is_some() {
+            tracing::debug!(
+                "Anthropic provider does not support presence/frequency penalty; dropping"
+            );
+        }
+        if matches!(
+            config.response_format,
+            Some(
+                crate::types::ResponseFormat::JsonObject
+                    | crate::types::ResponseFormat::JsonSchema { .. }
+            )
+        ) {
+            tracing::debug!(
+                "Anthropic has no native JSON mode; response_format dropped — use a function \
+                 tool with the schema for tool-use coercion instead"
+            );
+        }
 
         Ok(anthropic_request)
     }
+}
 
-    /// Get the API endpoint for the Anthropic model.
-    fn get_endpoint(&self, stream: bool, model: &str) -> String {
-        let method = if stream {
-            "streamRawPredict"
-        } else {
-            "rawPredict"
-        };
-        let sse_param = if stream { "?alt=sse" } else { "" };
-
-        if let Some(base_url) = &self.base_url {
-            // Use custom base URL for testing
-            format!(
-                "{}/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:{}{}",
-                base_url.trim_end_matches('/'),
-                self.project_id,
-                self.location,
-                model,
-                method,
-                sse_param
-            )
-        } else {
-            // Use default Vertex AI endpoint
-            format!(
-                "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:{}{}",
-                self.location, self.project_id, self.location, model, method, sse_param
-            )
+/// Translate user-side parts into Anthropic content blocks. A
+/// `CacheBreakpoint` attaches `cache_control: {type: "ephemeral"}` to
+/// the most recently emitted block.
+fn build_user_blocks(parts: &[UserPart]) -> Result<Vec<AnthropicContentBlock>, Error> {
+    let mut blocks = Vec::new();
+    for part in parts {
+        match part {
+            UserPart::Text(s) => blocks.push(AnthropicContentBlock::Text {
+                text: s.clone(),
+                cache_control: None,
+            }),
+            UserPart::Image(src) => {
+                let source = match src {
+                    crate::types::ImageSource::Url(u) => ijson::ijson!({
+                        "type": "url",
+                        "url": u.clone(),
+                    }),
+                    crate::types::ImageSource::Base64 { data, media_type } => ijson::ijson!({
+                        "type": "base64",
+                        "media_type": media_type.clone(),
+                        "data": data.clone(),
+                    }),
+                };
+                blocks.push(AnthropicContentBlock::Image {
+                    source,
+                    cache_control: None,
+                });
+            }
+            UserPart::ToolResult { call_id, content } => {
+                let text = flatten_user_parts_to_text(content);
+                blocks.push(AnthropicContentBlock::ToolResult {
+                    tool_use_id: call_id.clone(),
+                    content: AnthropicToolResultContent::Text(text),
+                    is_error: None,
+                });
+            }
+            UserPart::Audio(_) => {
+                tracing::debug!("Anthropic provider does not support audio input; dropping");
+            }
+            UserPart::Document(src) => {
+                let source = match src {
+                    crate::types::DocumentSource::Url(u) => ijson::ijson!({
+                        "type": "url",
+                        "url": u.clone(),
+                    }),
+                    crate::types::DocumentSource::Base64 { data, media_type } => ijson::ijson!({
+                        "type": "base64",
+                        "media_type": media_type.clone(),
+                        "data": data.clone(),
+                    }),
+                };
+                blocks.push(AnthropicContentBlock::Document {
+                    source,
+                    cache_control: None,
+                });
+            }
+            UserPart::CacheBreakpoint => attach_cache_control(blocks.last_mut()),
         }
+    }
+    Ok(blocks)
+}
+
+/// Attach a `cache_control: {type: "ephemeral"}` hint to the most-
+/// recently-emitted block (the one immediately before the
+/// CacheBreakpoint in source order). Anthropic recognises this on
+/// text, tool_use, and image blocks; other variants silently ignore
+/// because the wire shape doesn't model the hint there.
+fn attach_cache_control(last: Option<&mut AnthropicContentBlock>) {
+    if let Some(block) = last {
+        let hint = AnthropicCacheControl {
+            r#type: "ephemeral".to_string(),
+        };
+        match block {
+            AnthropicContentBlock::Text { cache_control, .. } => {
+                *cache_control = Some(hint);
+            }
+            AnthropicContentBlock::ToolUse { cache_control, .. } => {
+                *cache_control = Some(hint);
+            }
+            AnthropicContentBlock::Image { cache_control, .. } => {
+                *cache_control = Some(hint);
+            }
+            AnthropicContentBlock::Document { cache_control, .. } => {
+                *cache_control = Some(hint);
+            }
+            _ => {
+                tracing::debug!(
+                    "CacheBreakpoint preceded by a block type that doesn't accept cache_control; ignoring"
+                );
+            }
+        }
+    } else {
+        tracing::debug!("CacheBreakpoint with no preceding block; ignoring");
     }
 }
 
-#[async_trait::async_trait]
-impl LLMProvider for AnthropicViaVertexProvider {
-    async fn generate(&self, request: &LLMRequest) -> Result<Response, Error> {
-        let anthropic_request = self.convert_request(request)?;
-
-        let endpoint = self.get_endpoint(true, &request.model);
-
-        let mut request_builder = self
-            .client
-            .post(&endpoint)
-            .header("Content-Type", "application/json")
-            .json(&anthropic_request);
-
-        // Add authentication based on the method
-        request_builder = match &self.auth {
-            AnthropicViaVertexAuth::AccessToken(token) => {
-                request_builder.header("Authorization", format!("Bearer {token}"))
+/// Translate assistant-side parts into Anthropic content blocks. Text +
+/// reasoning + tool_use are all expressed as blocks; reasoning carries
+/// its signature when present.
+fn build_assistant_blocks(parts: &[AssistantPart]) -> Result<Vec<AnthropicContentBlock>, Error> {
+    let mut blocks = Vec::new();
+    for part in parts {
+        match part {
+            AssistantPart::Text { content, .. } => {
+                blocks.push(AnthropicContentBlock::Text {
+                    text: content.clone(),
+                    cache_control: None,
+                });
             }
-            AnthropicViaVertexAuth::ApplicationDefault => {
-                let auth_manager = self.auth_manager.as_ref().ok_or_else(|| {
-                    Error::provider("Anthropic", "Auth manager not initialized for ADC")
+            AssistantPart::Reasoning { content, signature } => {
+                blocks.push(AnthropicContentBlock::Thinking {
+                    thinking: content.clone(),
+                    signature: signature.clone(),
+                });
+            }
+            AssistantPart::RedactedReasoning { data } => {
+                blocks.push(AnthropicContentBlock::RedactedThinking { data: data.clone() });
+            }
+            AssistantPart::Refusal(s) => {
+                // Anthropic has no typed refusal channel; surface as text.
+                blocks.push(AnthropicContentBlock::Text {
+                    text: s.clone(),
+                    cache_control: None,
+                });
+            }
+            AssistantPart::ToolCall(call) => {
+                let input = serde_json::from_str(&call.arguments).map_err(|e| {
+                    Error::provider("Anthropic", format!("Invalid function arguments: {e}"))
                 })?;
-
-                let token = auth_manager
-                    .token(&["https://www.googleapis.com/auth/cloud-platform"])
-                    .await
-                    .map_err(|e| {
-                        Error::provider("Anthropic", format!("Failed to get ADC token: {e}"))
-                    })?;
-
-                request_builder.header("Authorization", format!("Bearer {}", token.as_str()))
+                blocks.push(AnthropicContentBlock::ToolUse {
+                    id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    input,
+                    cache_control: None,
+                });
             }
-        };
+            AssistantPart::BuiltinToolCall { .. } => {
+                // Provider-side tool calls don't round-trip through
+                // history on Anthropic; drop them per the
+                // model-switching contract.
+                tracing::debug!("Anthropic provider dropping BuiltinToolCall during request build");
+            }
+            AssistantPart::Continuation(_) => {
+                // Anthropic has no equivalent server-side resumption
+                // surface; drop the continuation marker silently.
+            }
+            AssistantPart::CacheBreakpoint => attach_cache_control(blocks.last_mut()),
+        }
+    }
+    Ok(blocks)
+}
 
-        let response = request_builder.send().await?;
+use crate::providers::flatten_user_parts_to_text;
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(Error::provider(
-                "Anthropic",
-                format!("API error: {error_text}"),
-            ));
+#[async_trait::async_trait]
+impl Provider for AnthropicViaVertexProvider {
+    async fn generate(&self, prompt: &crate::Prompt, config: &Config) -> Result<Response, Error> {
+        let anthropic_request = self.convert_request(prompt, config)?;
+
+        let url = self.endpoint.url(
+            "anthropic",
+            &config.model,
+            "streamRawPredict",
+            Some("alt=sse"),
+        );
+
+        let body = serde_json::to_vec(&anthropic_request)?;
+        let mut headers = vec![
+            self.endpoint.auth_header().await?,
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        if !self.beta.is_empty() {
+            headers.push(("anthropic-beta".to_string(), self.beta.join(",")));
+        }
+        let req = TransportRequest { url, headers, body };
+        let response = self.transport.send(req).await?;
+
+        if !(200..300).contains(&response.status) {
+            let status = response.status;
+            // Read Retry-After before `collect_body` consumes the response.
+            let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
+            let body_bytes = response.collect_body().await.unwrap_or_default();
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            return Err(match status {
+                401 | 403 => {
+                    Error::auth_with_status(status, format!("Anthropic {status}: {body_text}"))
+                }
+                404 => Error::ModelNotAvailable(format!("Anthropic 404: {body_text}")),
+                429 => Error::rate_limit(
+                    retry_after,
+                    format!("Anthropic 429 (rate limited): {body_text}"),
+                ),
+                _ => Error::provider_with_status(
+                    "Anthropic",
+                    status,
+                    format!("API error: {body_text}"),
+                ),
+            });
         }
 
         // Create SSE stream from response
-        let byte_stream = response.bytes_stream();
-        let sse_stream = SseStream::new(byte_stream);
+        let sse_stream = SseStream::new(response.body);
 
         // Create a stateful processor for function call tracking
         let mut state = StreamState::default();
@@ -338,26 +457,22 @@ impl LLMProvider for AnthropicViaVertexProvider {
                             return vec![];
                         }
 
-                        // Parse the SSE data as Anthropic stream event
+                        // Anthropic's wire format only emits JSON event
+                        // payloads (including `{"type":"ping"}` for keep-
+                        // alives). The SSE parser already filters comment
+                        // lines, so anything that fails to parse here is a
+                        // genuine surprise — surface it.
                         match serde_json::from_str::<AnthropicStreamEvent>(data) {
                             Ok(stream_event) => {
-                                match Self::convert_stream_event_stateful(stream_event, &mut state)
-                                {
+                                match convert_stream_event_stateful(stream_event, &mut state) {
                                     Ok(events) => events.into_iter().map(Ok).collect(),
                                     Err(e) => vec![Err(e)],
                                 }
                             }
-                            Err(e) => {
-                                // Skip unparseable events (might be connection keep-alive or other data)
-                                if !data.starts_with('{') {
-                                    vec![]
-                                } else {
-                                    vec![Err(Error::provider(
-                                        "Anthropic",
-                                        format!("Failed to parse SSE event: {e}"),
-                                    ))]
-                                }
-                            }
+                            Err(e) => vec![Err(Error::provider(
+                                "Anthropic",
+                                format!("Failed to parse SSE event: {e}"),
+                            ))],
                         }
                     }
                     Err(e) => vec![Err(e)],
@@ -370,230 +485,311 @@ impl LLMProvider for AnthropicViaVertexProvider {
     }
 }
 
-/// State for tracking in-progress function calls during streaming.
+/// State for tracking streaming progress.
+///
+/// Anthropic delivers `stop_reason` and the cumulative `usage` on
+/// `message_delta` events which fire **before** `message_stop`. We
+/// stash them so the final `Done` event reflects what the model
+/// actually said.
 #[derive(Debug, Default)]
-struct StreamState {
-    /// In-progress function calls indexed by content block index
-    in_progress_calls: std::collections::HashMap<u32, InProgressFunctionCall>,
+pub(crate) struct StreamState {
+    /// Maps Anthropic's content-block index to our lib-side part index.
+    tracker: crate::providers::part_tracker::PartTracker<u32>,
+    /// Cumulative usage merged from `message_start` and `message_delta`.
+    pending_usage: Usage,
+    /// `stop_reason` captured from `message_delta`.
+    pending_stop_reason: Option<String>,
 }
 
-/// A function call that's being built incrementally from streaming events.
-#[derive(Debug)]
-struct InProgressFunctionCall {
-    id: String,
-    name: String,
-    input_buffer: String,    // Accumulates InputJsonDelta events
-    has_initial_input: bool, // Whether we started with complete input
+/// Map an Anthropic `stop_reason` string onto our unified [`FinishReason`].
+///
+/// Until [`FinishReason`] is extended (Phase 5), `stop_sequence` and
+/// `pause_turn` collapse to `Stop` — the closest existing variant.
+pub(crate) fn map_anthropic_stop_reason(reason: Option<&str>) -> FinishReason {
+    match reason {
+        Some("end_turn") => FinishReason::Stop,
+        Some("tool_use") => FinishReason::ToolCalls,
+        Some("max_tokens") => FinishReason::Length,
+        Some("stop_sequence") => FinishReason::Stop,
+        Some("pause_turn") => FinishReason::Stop,
+        Some("refusal") => FinishReason::ContentFilter,
+        Some(other) => {
+            tracing::warn!(stop_reason = other, "unknown Anthropic stop_reason");
+            FinishReason::Stop
+        }
+        None => FinishReason::Stop,
+    }
 }
 
-impl AnthropicViaVertexProvider {
-    /// Convert stream event with state tracking for function calls.
-    fn convert_stream_event_stateful(
-        event: AnthropicStreamEvent,
-        state: &mut StreamState,
-    ) -> Result<Vec<StreamEvent>, Error> {
-        let mut events = Vec::new();
+/// Merge an Anthropic `usage` object into the running [`Usage`] tally.
+///
+/// Anthropic's streaming protocol reports `input_tokens` once on
+/// `message_start` and a cumulative `output_tokens` on the final
+/// `message_delta`. We always overwrite with the latest non-`None` value so
+/// the `Done` event reflects the model's authoritative final counts.
+fn merge_anthropic_usage(target: &mut Usage, src: &AnthropicUsage) {
+    if let Some(t) = src.input_tokens {
+        target.input_tokens = t;
+    }
+    if let Some(t) = src.output_tokens {
+        target.output_tokens = t;
+    }
+    if let Some(t) = src.cache_read_input_tokens {
+        target.cache_read_input_tokens = Some(t);
+    }
+    if let Some(t) = src.cache_creation_input_tokens {
+        target.cache_creation_input_tokens = Some(t);
+    }
+}
 
-        match event {
-            AnthropicStreamEvent::MessageStart { .. } => {
-                // Start of message - no events needed for now
+/// Convert an Anthropic stream event into our unified `StreamEvent`s.
+///
+/// `pub(crate)` so unit tests can drive this directly with synthetic events.
+pub(crate) fn convert_stream_event_stateful(
+    event: AnthropicStreamEvent,
+    state: &mut StreamState,
+) -> Result<Vec<StreamEvent>, Error> {
+    let mut events = Vec::new();
+
+    match event {
+        AnthropicStreamEvent::MessageStart { message } => {
+            if let Some(usage) = &message.usage {
+                merge_anthropic_usage(&mut state.pending_usage, usage);
             }
-            AnthropicStreamEvent::ContentBlockStart {
-                content_block,
-                index,
-            } => {
-                match content_block {
-                    AnthropicContentBlock::ToolUse { id, name, input } => {
-                        // Handle tool use block start
-                        events.push(StreamEvent::OutputItemAdded {
-                            item: crate::types::OutputItemInfo::FunctionCall {
-                                name: name.clone(),
-                                id: id.clone(),
-                            },
-                        });
-
-                        // Start tracking this function call - don't emit FunctionCallComplete yet
-                        // Parameters may be streamed incrementally via InputJsonDelta events
-
-                        // Check if we have initial input or if it will be streamed
-                        let (initial_input, has_initial) = if input.is_null()
-                            || (input.is_object() && input.as_object().unwrap().is_empty())
-                        {
-                            // No initial input, will be streamed via InputJsonDelta
-                            (String::new(), false)
-                        } else {
-                            // We have complete initial input
-                            let json = serde_json::to_string(&input).map_err(|e| {
-                                Error::provider(
-                                    "Anthropic",
-                                    format!("Failed to serialize initial function input: {e}"),
-                                )
-                            })?;
-                            (json, true)
-                        };
-
-                        state.in_progress_calls.insert(
-                            index,
-                            InProgressFunctionCall {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input_buffer: initial_input,
-                                has_initial_input: has_initial,
-                            },
-                        );
-                    }
-                    AnthropicContentBlock::Text { text } => {
-                        events.push(StreamEvent::OutputItemAdded {
-                            item: crate::types::OutputItemInfo::Text,
-                        });
-                        // Handle initial text content if any
-                        if !text.is_empty() {
-                            events.push(StreamEvent::ContentDelta { delta: text });
-                        }
-                    }
-                    AnthropicContentBlock::ToolResult { .. } => {
-                        // Tool results are handled in request construction, not in responses
-                    }
-                }
-            }
-            AnthropicStreamEvent::ContentBlockDelta { delta, index } => {
-                match delta {
-                    AnthropicContentDelta::TextDelta { text } => {
-                        if !text.is_empty() {
-                            events.push(StreamEvent::ContentDelta { delta: text });
-                        }
-                    }
-                    AnthropicContentDelta::InputJsonDelta { partial_json } => {
-                        // Handle function parameter updates
-                        if let Some(in_progress) = state.in_progress_calls.get_mut(&index) {
-                            if in_progress.has_initial_input {
-                                // We already had complete input in ContentBlockStart
-                                // InputJsonDelta is providing the same data again (or updates)
-                                // Replace with the new data
-                                in_progress.input_buffer = partial_json;
-                            } else {
-                                // We're building the input incrementally
-                                // Append the partial JSON
-                                in_progress.input_buffer.push_str(&partial_json);
-                            }
-                        }
-                    }
-                }
-            }
-            AnthropicStreamEvent::ContentBlockStop { index } => {
-                // Content block finished - emit FunctionCallComplete if this was a function call
-                if let Some(in_progress) = state.in_progress_calls.remove(&index) {
-                    let function_call = FunctionCall {
-                        call_id: in_progress.id, // Use the same ID
-                        name: in_progress.name,
-                        arguments: in_progress.input_buffer,
-                    };
-                    events.push(StreamEvent::FunctionCallComplete {
-                        call: function_call,
+        }
+        AnthropicStreamEvent::ContentBlockStart {
+            content_block,
+            index,
+        } => match content_block {
+            AnthropicContentBlock::Text { text, .. } => {
+                let (lib_idx, ev) = state.tracker.open(index, PartKind::Text);
+                events.push(ev);
+                if !text.is_empty() {
+                    events.push(StreamEvent::Delta {
+                        index: lib_idx,
+                        delta: text,
                     });
                 }
             }
-            AnthropicStreamEvent::MessageDelta { delta } => {
-                // Handle usage updates and stop reason
-                if let Some(_usage) = delta.usage {
-                    // Don't emit Done event here, wait for MessageStop
+            AnthropicContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                let (_lib_idx, ev) = state
+                    .tracker
+                    .open(index, PartKind::ToolCall { call_id: id, name });
+                events.push(ev);
+                // Per the streaming protocol the initial `input` is `{}`.
+                // Arguments arrive via input_json_delta.
+                let nonempty = !(input.is_null()
+                    || (input.is_object()
+                        && input.as_object().map(|o| o.is_empty()).unwrap_or(true)));
+                if nonempty {
+                    tracing::warn!(
+                        ?input,
+                        "Anthropic content_block_start carried non-empty `input`; \
+                         ignoring and relying on input_json_delta accumulation"
+                    );
                 }
             }
-            AnthropicStreamEvent::MessageStop => {
-                // Message is complete - emit done event
-                events.push(StreamEvent::Done {
-                    finish_reason: FinishReason::Stop, // TODO: Map actual stop reason
-                    usage: crate::types::Usage::default(), // TODO: Get actual usage from message_delta
-                });
+            AnthropicContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                let (lib_idx, ev) = state.tracker.open(index, PartKind::Reasoning);
+                events.push(ev);
+                if !thinking.is_empty() {
+                    events.push(StreamEvent::Delta {
+                        index: lib_idx,
+                        delta: thinking,
+                    });
+                }
+                if let Some(sig) = signature {
+                    events.push(StreamEvent::PartUpdate {
+                        index: lib_idx,
+                        update: PartUpdate::Signature(sig),
+                    });
+                }
             }
-            AnthropicStreamEvent::Ping => {
-                // Keep-alive event - ignore
+            AnthropicContentBlock::RedactedThinking { data } => {
+                let (_lib_idx, ev) = state
+                    .tracker
+                    .open(index, PartKind::RedactedReasoning { data });
+                events.push(ev);
+            }
+            AnthropicContentBlock::ToolResult { .. }
+            | AnthropicContentBlock::Image { .. }
+            | AnthropicContentBlock::Document { .. } => {
+                // Request-side blocks; not expected on the response stream.
+            }
+        },
+        AnthropicStreamEvent::ContentBlockDelta { delta, index } => {
+            let lib_idx = match state.tracker.index_of(&index) {
+                Some(i) => i,
+                None => {
+                    return Err(Error::streaming(format!(
+                        "Anthropic content_block_delta for unknown index {index}"
+                    )));
+                }
+            };
+            match delta {
+                AnthropicContentDelta::TextDelta { text } => {
+                    if !text.is_empty() {
+                        events.push(StreamEvent::Delta {
+                            index: lib_idx,
+                            delta: text,
+                        });
+                    }
+                }
+                AnthropicContentDelta::InputJsonDelta { partial_json } => {
+                    events.push(StreamEvent::Delta {
+                        index: lib_idx,
+                        delta: partial_json,
+                    });
+                }
+                AnthropicContentDelta::ThinkingDelta { thinking } => {
+                    if !thinking.is_empty() {
+                        events.push(StreamEvent::Delta {
+                            index: lib_idx,
+                            delta: thinking,
+                        });
+                    }
+                }
+                AnthropicContentDelta::SignatureDelta { signature } => {
+                    events.push(StreamEvent::PartUpdate {
+                        index: lib_idx,
+                        update: PartUpdate::Signature(signature),
+                    });
+                }
             }
         }
-
-        Ok(events)
+        AnthropicStreamEvent::ContentBlockStop { index } => {
+            if let Some(ev) = state.tracker.close(&index) {
+                events.push(ev);
+            }
+        }
+        AnthropicStreamEvent::MessageDelta { delta, usage } => {
+            if let Some(reason) = delta.stop_reason {
+                state.pending_stop_reason = Some(reason);
+            }
+            if let Some(usage) = usage {
+                merge_anthropic_usage(&mut state.pending_usage, &usage);
+            }
+        }
+        AnthropicStreamEvent::MessageStop => {
+            let finish_reason = map_anthropic_stop_reason(state.pending_stop_reason.as_deref());
+            let usage = std::mem::take(&mut state.pending_usage);
+            events.push(StreamEvent::Done {
+                finish_reason,
+                usage,
+            });
+        }
+        AnthropicStreamEvent::Ping => {
+            // Keep-alive event - ignore
+        }
+        AnthropicStreamEvent::Error { error } => {
+            return Err(Error::provider(
+                "Anthropic",
+                format!("{}: {}", error.error_type, error.message),
+            ));
+        }
     }
+
+    Ok(events)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::{stream, StreamExt};
+    use crate::{Config, Prompt};
 
-    #[tokio::test]
-    async fn test_streaming_content_parsing() {
-        // Simulate realistic Anthropic streaming response chunks
-        let start_event = r#"{"type":"message_start","message":{"id":"msg_123","model":"claude-sonnet-4","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#;
-        let content_start =
-            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
-        let text_delta1 = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
-        let text_delta2 = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}"#;
-        let content_stop = r#"{"type":"content_block_stop","index":0}"#;
-        let message_stop = r#"{"type":"message_stop"}"#;
+    fn provider() -> AnthropicViaVertexProvider {
+        AnthropicViaVertexProvider::new("p".to_string(), "us-east5".to_string(), "tok".to_string())
+            .unwrap()
+    }
 
-        let byte_chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
-            Ok(bytes::Bytes::from(format!("data: {start_event}\n\n"))),
-            Ok(bytes::Bytes::from(format!("data: {content_start}\n\n"))),
-            Ok(bytes::Bytes::from(format!("data: {text_delta1}\n\n"))),
-            Ok(bytes::Bytes::from(format!("data: {text_delta2}\n\n"))),
-            Ok(bytes::Bytes::from(format!("data: {content_stop}\n\n"))),
-            Ok(bytes::Bytes::from(format!("data: {message_stop}\n\n"))),
-        ];
+    #[test]
+    fn map_anthropic_stop_reason_known_values() {
+        assert_eq!(
+            map_anthropic_stop_reason(Some("end_turn")),
+            FinishReason::Stop
+        );
+        assert_eq!(
+            map_anthropic_stop_reason(Some("tool_use")),
+            FinishReason::ToolCalls
+        );
+        assert_eq!(
+            map_anthropic_stop_reason(Some("max_tokens")),
+            FinishReason::Length
+        );
+        assert_eq!(
+            map_anthropic_stop_reason(Some("refusal")),
+            FinishReason::ContentFilter
+        );
+        assert_eq!(map_anthropic_stop_reason(None), FinishReason::Stop);
+    }
 
-        let byte_stream = stream::iter(byte_chunks);
-        let sse_stream = crate::sse_stream::SseStream::new(byte_stream);
+    #[test]
+    fn convert_simple_text_request() {
+        let prompt = Prompt::user("hi");
+        let cfg = Config::new("claude");
+        let body = provider().convert_request(&prompt, &cfg).unwrap();
+        assert_eq!(body.messages.len(), 1);
+        assert_eq!(body.messages[0].role, "user");
+    }
 
-        // Process events through our Anthropic SSE handler
-        let mut events = Vec::new();
-
-        // Collect all events using StreamExt::next
-        let mut sse_stream = sse_stream;
-        while let Some(sse_result) = sse_stream.next().await {
-            let sse_event = sse_result.expect("SSE should parse correctly");
-            let data = sse_event.data.trim();
-
-            if data.is_empty() {
-                continue;
-            }
-
-            // Parse as AnthropicStreamEvent
-            match serde_json::from_str::<AnthropicStreamEvent>(data) {
-                Ok(stream_event) => {
-                    let mut state = StreamState::default();
-                    match AnthropicViaVertexProvider::convert_stream_event_stateful(
-                        stream_event,
-                        &mut state,
-                    ) {
-                        Ok(stream_events) => {
-                            events.extend(stream_events);
-                        }
-                        Err(e) => panic!("Should parse successfully: {e}"),
-                    }
-                }
-                Err(e) => panic!("Should parse JSON successfully: {e}"),
-            }
+    /// A signature_delta on a thinking block emits PartUpdate::Signature
+    /// pointing at the correct part index.
+    #[test]
+    fn signature_delta_emits_part_update() {
+        let mut state = StreamState::default();
+        let start = AnthropicStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: AnthropicContentBlock::Thinking {
+                thinking: String::new(),
+                signature: None,
+            },
+        };
+        let _ = convert_stream_event_stateful(start, &mut state).unwrap();
+        let sig = AnthropicStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: AnthropicContentDelta::SignatureDelta {
+                signature: "sig_abc".to_string(),
+            },
+        };
+        let events = convert_stream_event_stateful(sig, &mut state).unwrap();
+        match &events[0] {
+            StreamEvent::PartUpdate {
+                index: 0,
+                update: PartUpdate::Signature(s),
+            } => assert_eq!(s, "sig_abc"),
+            other => panic!("expected PartUpdate(Signature), got {other:?}"),
         }
+    }
 
-        // Verify we got the expected events
-        let content_events: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                StreamEvent::ContentDelta { delta } => Some(delta.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(content_events, vec!["Hello", " world"]);
-
-        // Verify we got exactly one Done event at the end
-        let done_events: Vec<_> = events
-            .iter()
-            .filter(|e| matches!(e, StreamEvent::Done { .. }))
-            .collect();
-
-        assert_eq!(done_events.len(), 1);
-
-        // The Done event should be the last event
-        assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    /// A `tool_use` content block opens a `PartKind::ToolCall` part with
+    /// the wire `id` carried as our `call_id`.
+    #[test]
+    fn tool_use_opens_tool_call_part() {
+        let mut state = StreamState::default();
+        let start = AnthropicStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: AnthropicContentBlock::ToolUse {
+                id: "toolu_xyz".to_string(),
+                name: "get_weather".to_string(),
+                input: ijson::ijson!({}),
+                cache_control: None,
+            },
+        };
+        let events = convert_stream_event_stateful(start, &mut state).unwrap();
+        match &events[0] {
+            StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::ToolCall { call_id, name },
+            } => {
+                assert_eq!(call_id, "toolu_xyz");
+                assert_eq!(name, "get_weather");
+            }
+            other => panic!("expected PartStart(ToolCall), got {other:?}"),
+        }
     }
 }

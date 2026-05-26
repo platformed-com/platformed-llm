@@ -1,0 +1,8 @@
+PartStart[0] tool_call call_id="<id-1>" name="get_weather"
+Delta[0] "{\"city\":\"Paris\"}"
+PartEnd[0]
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+part[0] tool_call name="get_weather" arguments="{\"city\":\"Paris\"}"

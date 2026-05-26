@@ -1,0 +1,24 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "What is 2+2? Reply with a JSON object containing keys 'question' and 'answer'."
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 256,
+    "responseMimeType": "application/json"
+  },
+  "systemInstruction": {
+    "parts": [
+      {
+        "text": "Reply only with JSON. Do not include any other text."
+      }
+    ],
+    "role": "system"
+  }
+}

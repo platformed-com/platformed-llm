@@ -1,9 +1,7 @@
 use futures_util::StreamExt;
 use ijson::IValue;
-use platformed_llm::{
-    Error, Function, InputItem, LLMRequest, Prompt, ProviderFactory, ResponseAccumulator,
-    StreamEvent, Tool, ToolType,
-};
+use platformed_llm::accumulator::ResponseAccumulator;
+use platformed_llm::{Config, Error, Function, Prompt, ProviderFactory, StreamEvent, Tool};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -63,13 +61,11 @@ async fn main() -> Result<(), Error> {
     println!();
 
     // Define function tools
-    let get_weather = Tool {
-        r#type: ToolType::Function,
-        function: Function {
-            name: "get_weather".to_string(),
-            description: "Get the current weather for a location".to_string(),
-            parameters: serde_json::from_str(
-                r#"{
+    let get_weather = Tool::Function(Function {
+        name: "get_weather".to_string(),
+        description: Some("Get the current weather for a location".to_string()),
+        parameters: serde_json::from_str(
+            r#"{
                 "type": "object",
                 "properties": {
                     "location": {
@@ -83,19 +79,16 @@ async fn main() -> Result<(), Error> {
                     }
                 },
                 "required": ["location"]
-            })"#,
-            )
-            .unwrap(),
-        },
-    };
+            }"#,
+        )
+        .unwrap(),
+    });
 
-    let calculate = Tool {
-        r#type: ToolType::Function,
-        function: Function {
-            name: "calculate".to_string(),
-            description: "Perform mathematical calculations".to_string(),
-            parameters: serde_json::from_str(
-                r#"{
+    let calculate = Tool::Function(Function {
+        name: "calculate".to_string(),
+        description: Some("Perform mathematical calculations".to_string()),
+        parameters: serde_json::from_str(
+            r#"{
                 "type": "object",
                 "properties": {
                     "expression": {
@@ -105,10 +98,9 @@ async fn main() -> Result<(), Error> {
                 },
                 "required": ["expression"]
             }"#,
-            )
-            .unwrap(),
-        },
-    };
+        )
+        .unwrap(),
+    });
 
     // Start a conversation with function calling
     println!("🛠️ Function Calling Demo");
@@ -162,7 +154,7 @@ async fn main() -> Result<(), Error> {
 
     println!("🎯 Using model: {model_name}");
 
-    let request = LLMRequest::from_prompt(&model_name, &conversation)
+    let cfg = Config::new(&model_name)
         .temperature(0.2)
         .max_tokens(300)
         .tools(vec![get_weather.clone(), calculate.clone()]);
@@ -172,7 +164,7 @@ async fn main() -> Result<(), Error> {
 
     // Generate response with function calling
     println!("📡 Making API request...");
-    let response = match provider.generate(&request).await {
+    let response = match provider.generate(&conversation, &cfg).await {
         Ok(response) => {
             println!("✅ API request successful");
             response
@@ -201,8 +193,9 @@ async fn main() -> Result<(), Error> {
             event_count += 1;
             println!("📥 Event #{event_count}: {event:?}");
 
-            // Track text output
-            if let StreamEvent::ContentDelta { delta } = &event {
+            // Track text output (filter by part kind via accumulator afterwards;
+            // here we just check if it's a text delta by looking at the part).
+            if let StreamEvent::Delta { delta, .. } = &event {
                 text_output.push_str(delta);
             }
 
@@ -228,10 +221,10 @@ async fn main() -> Result<(), Error> {
         if function_calls.is_empty() {
             // No more function calls, we're done
             println!("✅ No more function calls needed");
-            if !complete_response.content().trim().is_empty()
-                && complete_response.content() != text_output
+            if !complete_response.text().trim().is_empty()
+                && complete_response.text() != text_output
             {
-                println!("🤖 Final AI response: {}", complete_response.content());
+                println!("🤖 Final AI response: {}", complete_response.text());
             }
             break;
         }
@@ -308,19 +301,14 @@ async fn main() -> Result<(), Error> {
 
         // Add all function results to the conversation at once
         for (call_id, result) in function_results {
-            conversation = conversation.with_item(InputItem::function_call_output(call_id, result));
+            conversation = conversation.with_tool_result(call_id, result);
         }
 
         // Continue with the next request
         println!();
         println!("🔁 Sending function results back to AI...");
 
-        let next_request = LLMRequest::from_prompt(&model_name, &conversation)
-            .temperature(0.2)
-            .max_tokens(300)
-            .tools(vec![get_weather.clone(), calculate.clone()]);
-
-        current_response = provider.generate(&next_request).await?;
+        current_response = provider.generate(&conversation, &cfg).await?;
     }
 
     println!();

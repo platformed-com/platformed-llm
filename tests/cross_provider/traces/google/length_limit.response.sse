@@ -1,0 +1,2 @@
+data: {"candidates": [{"content": {"role": "model"},"finishReason": "MAX_TOKENS"}],"usageMetadata": {"promptTokenCount": 13,"totalTokenCount": 26,"trafficType": "ON_DEMAND","promptTokensDetails": [{"modality": "TEXT","tokenCount": 13}],"thoughtsTokenCount": 13},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T16:13:11.288691Z","responseId": "F6MEarPPEZ3U9fgP3J_piAw"}
+

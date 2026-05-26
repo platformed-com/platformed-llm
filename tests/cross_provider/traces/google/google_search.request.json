@@ -1,0 +1,20 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "What is the latest stable version of the Rust programming language? Use web search and cite your source."
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 512
+  },
+  "tools": [
+    {
+      "googleSearch": {}
+    }
+  ]
+}

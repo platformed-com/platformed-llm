@@ -1,0 +1,12 @@
+PartStart[0] text
+Delta[0] "Hello"
+Delta[0] "."
+PartEnd[0]
+PartStart[1] continuation kind=OpenAI id=<n>
+PartEnd[1]
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+part[0] text "Hello." annotations=0
+part[1] continuation kind=OpenAI id=<n>

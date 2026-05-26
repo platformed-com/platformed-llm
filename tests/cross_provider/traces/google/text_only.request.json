@@ -1,0 +1,15 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Say the single word 'hello' and nothing else."
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 256
+  }
+}

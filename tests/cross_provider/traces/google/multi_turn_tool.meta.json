@@ -1,0 +1,14 @@
+{
+  "captured_at_unix": 1778688791,
+  "endpoint": "https://europe-west1-aiplatform.googleapis.com/v1/projects/platformed-dev/locations/europe-west1/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+  "expect_failure": false,
+  "headers": {
+    "content-type": "text/event-stream"
+  },
+  "latency_ms": 992,
+  "model": "gemini-2.5-flash",
+  "provider": "google",
+  "response_bytes": 792,
+  "scenario": "multi_turn_tool",
+  "status": 200
+}

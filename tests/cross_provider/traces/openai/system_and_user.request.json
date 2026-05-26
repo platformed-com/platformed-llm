@@ -1,0 +1,18 @@
+{
+  "input": [
+    {
+      "content": "You are a terse parrot. Reply with exactly the word the user gives you, lowercased.",
+      "role": "system",
+      "type": "message"
+    },
+    {
+      "content": "PARROT",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 256,
+  "model": "gpt-4o-mini",
+  "store": false,
+  "stream": true
+}

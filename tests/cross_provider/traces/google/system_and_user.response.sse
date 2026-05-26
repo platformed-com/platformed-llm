@@ -1,0 +1,2 @@
+data: {"candidates": [{"content": {"role": "model","parts": [{"text": "parrot"}]},"finishReason": "STOP"}],"usageMetadata": {"promptTokenCount": 22,"candidatesTokenCount": 1,"totalTokenCount": 43,"trafficType": "ON_DEMAND","promptTokensDetails": [{"modality": "TEXT","tokenCount": 22}],"candidatesTokensDetails": [{"modality": "TEXT","tokenCount": 1}],"thoughtsTokenCount": 20},"modelVersion": "gemini-2.5-flash","createTime": "2026-05-13T16:13:08.408628Z","responseId": "FKMEarT4GOeW9fgPlK_i4Aw"}
+

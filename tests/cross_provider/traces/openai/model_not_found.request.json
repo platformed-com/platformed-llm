@@ -1,0 +1,12 @@
+{
+  "input": [
+    {
+      "content": "Hello.",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "model": "gpt-5-this-model-does-not-exist",
+  "store": false,
+  "stream": true
+}

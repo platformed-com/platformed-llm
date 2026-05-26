@@ -22,23 +22,8 @@ pub struct SseEvent {
 }
 
 impl SseEvent {
-    /// Create a new SSE event with just data.
-    pub fn new(data: String) -> Self {
-        Self {
-            data,
-            ..Default::default()
-        }
-    }
-
-    /// Create a new SSE event with event type and data.
-    pub fn with_type(event_type: String, data: String) -> Self {
-        Self {
-            event_type,
-            data,
-            ..Default::default()
-        }
-    }
-
+    /// True when every field is empty / unset — used by the parser to
+    /// avoid dispatching a zero-content event.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
             && self.event_type.is_empty()
@@ -100,7 +85,12 @@ impl EventBuffer {
             .map_err(|e| Error::streaming(format!("Invalid UTF-8 in SSE event: {e}")))?;
 
         if line.is_empty() {
+            // A blank line terminates the in-flight event. Crucially, return
+            // here — falling through into the field/value parsing below was
+            // harmless (the empty `field` hit the comment branch) but
+            // fragile.
             self.dispatch_event();
+            return Ok(());
         }
 
         let (field, mut value) = line.split_once(':').unwrap_or((line, ""));
@@ -196,20 +186,21 @@ where
             {
                 self.parse_buffer(&chunk)?;
             } else {
+                // EOF. Per the SSE spec, dispatch any in-flight event
+                // rather than erroring. Some servers omit the final
+                // `\n\n` after their last frame; previous code surfaced
+                // that as an "Incomplete event at end of stream" error
+                // which masked the real payload.
                 if !self.line_buffer.is_empty() {
-                    return Poll::Ready(Some(Err(Error::streaming(format!(
-                        "Incomplete line buffer at end of stream: {}",
-                        String::from_utf8_lossy(&self.line_buffer)
-                    )))));
+                    let line = std::mem::take(&mut self.line_buffer);
+                    self.events.process_line(&line)?;
                 }
-
                 if !self.events.current_event.is_empty() {
-                    return Poll::Ready(Some(Err(Error::streaming(format!(
-                        "Incomplete event at end of stream: {:?}",
-                        self.events.current_event
-                    )))));
+                    self.events.dispatch_event();
                 }
-
+                if let Some(event) = self.events.pop() {
+                    return Poll::Ready(Some(Ok(event)));
+                }
                 return Poll::Ready(None);
             };
         }
@@ -482,6 +473,54 @@ mod tests {
         assert!(sse_stream2.next().await.is_none());
     }
 
+    /// Per the SSE spec, lines starting with `:` are comments and must
+    /// produce no event. The comment-only event must NOT be dispatched as
+    /// a phantom message.
+    #[tokio::test]
+    async fn comments_do_not_dispatch_events() {
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![Ok(bytes::Bytes::from(
+            ":keep-alive\n\n: another comment\n\ndata: hello\n\n",
+        ))];
+        let mut stream = stream::iter(chunks).sse_events();
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            event.data, "hello",
+            "comments should be skipped and only data: hello should fire",
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    /// A keep-alive comment followed by data on the same conceptual event
+    /// should still dispatch the data event correctly.
+    #[tokio::test]
+    async fn comment_inside_event_does_not_break_parsing() {
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+            vec![Ok(bytes::Bytes::from(":heartbeat\nevent: m\ndata: x\n\n"))];
+        let mut stream = stream::iter(chunks).sse_events();
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.event_type, "m");
+        assert_eq!(event.data, "x");
+    }
+
+    /// Per the SSE spec, EOF should dispatch any in-flight event rather
+    /// than producing an error. Some servers omit the final `\n\n` after
+    /// the last data line; the previous code surfaced that as an
+    /// "Incomplete event at end of stream" error which masked the real
+    /// payload.
+    #[tokio::test]
+    async fn eof_without_blank_line_dispatches_pending_event() {
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+            vec![Ok(bytes::Bytes::from("data: final"))];
+        let mut stream = stream::iter(chunks).sse_events();
+        let event = stream
+            .next()
+            .await
+            .expect("should yield the in-flight event")
+            .expect("not error");
+        assert_eq!(event.data, "final");
+        assert!(stream.next().await.is_none());
+    }
+
     #[tokio::test]
     async fn test_incomplete_crlf_sequences() {
         // Test the key edge cases for the state machine
@@ -530,5 +569,163 @@ mod tests {
         assert_eq!(event3.data, "event3");
 
         assert!(sse_stream3.next().await.is_none());
+    }
+
+    /// Drive `bytes` through `SseStream` split into the given byte-size
+    /// runs. Returns the parsed event sequence.
+    async fn parse_with_chunks(bytes: &[u8], runs: &[usize]) -> Vec<SseEvent> {
+        let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> = Vec::new();
+        let mut i = 0usize;
+        for &run in runs {
+            if i >= bytes.len() {
+                break;
+            }
+            let end = (i + run.max(1)).min(bytes.len());
+            chunks.push(Ok(bytes::Bytes::copy_from_slice(&bytes[i..end])));
+            i = end;
+        }
+        if i < bytes.len() {
+            chunks.push(Ok(bytes::Bytes::copy_from_slice(&bytes[i..])));
+        }
+        let mut s = stream::iter(chunks).sse_events();
+        let mut out = Vec::new();
+        while let Some(ev) = s.next().await {
+            out.push(ev.expect("unexpected parse error"));
+        }
+        out
+    }
+
+    /// Tiny seeded LCG so we don't pull in `rand` as a dev-dep just for
+    /// property testing. Good enough for shuffling chunk sizes.
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_add(0x9E3779B97F4A7C15))
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn range(&mut self, max: usize) -> usize {
+            (self.next_u64() % max as u64) as usize
+        }
+    }
+
+    /// The parsed event sequence must be invariant under chunk
+    /// boundaries: any byte stream that yields events `E` when delivered
+    /// in one chunk must yield the same `E` when delivered byte-by-byte
+    /// or in arbitrary intermediate splits.
+    ///
+    /// This is the property the buffering state machine in `parse_buffer`
+    /// is supposed to uphold; previously it was only spot-checked at a
+    /// few hand-picked split points.
+    #[tokio::test]
+    async fn chunk_boundaries_do_not_change_event_sequence() {
+        let corpus: &[&[u8]] = &[
+            // Plain LF.
+            b"data: one\n\ndata: two\n\n",
+            // CRLF.
+            b"data: one\r\n\r\ndata: two\r\n\r\n",
+            // Mixed CR / LF / CRLF terminators.
+            b"data: a\n\ndata: b\r\rdata: c\r\n\r\n",
+            // Multi-line data field (joined with \n inside one event).
+            b"data: line one\ndata: line two\n\n",
+            // Comments mixed with real events.
+            b":heartbeat\n\ndata: real\n\n: another comment\ndata: with-comment\n\n",
+            // event:/id:/retry: fields.
+            b"event: m\nid: 42\nretry: 1500\ndata: x\n\n",
+            // UTF-8 multibyte char (Euro = 3 bytes).
+            "data: price: \u{20AC}100\n\ndata: ok\n\n".as_bytes(),
+            // Trailing partial event (EOF dispatches).
+            b"data: pending",
+            // No final blank line (EOF flush path).
+            b"data: a\n\ndata: b",
+        ];
+
+        for input in corpus {
+            // Baseline: single chunk = single delivery.
+            let baseline = parse_with_chunks(input, &[input.len().max(1)]).await;
+
+            // Exhaustive: every single-byte chunking.
+            let by_one = parse_with_chunks(input, &vec![1; input.len()]).await;
+            assert_eq!(
+                by_one,
+                baseline,
+                "byte-by-byte parsing diverged from baseline for input: {:?}",
+                std::str::from_utf8(input).unwrap_or("<non-utf8>")
+            );
+
+            // Fixed-stride chunkings.
+            for stride in [2usize, 3, 5, 7, 13, 17, 23, 64] {
+                let runs = vec![stride; input.len().div_ceil(stride).max(1)];
+                let got = parse_with_chunks(input, &runs).await;
+                assert_eq!(
+                    got,
+                    baseline,
+                    "stride={stride} diverged from baseline for input: {:?}",
+                    std::str::from_utf8(input).unwrap_or("<non-utf8>")
+                );
+            }
+
+            // Randomized splittings under a fixed seed for reproducibility.
+            for seed in 0u64..16 {
+                let mut rng = Lcg::new(seed);
+                let mut runs = Vec::new();
+                let mut consumed = 0usize;
+                while consumed < input.len() {
+                    let max = (input.len() - consumed).min(8) + 1;
+                    let r = rng.range(max).max(1);
+                    runs.push(r);
+                    consumed += r;
+                }
+                let got = parse_with_chunks(input, &runs).await;
+                assert_eq!(
+                    got,
+                    baseline,
+                    "seed={seed} runs={runs:?} diverged from baseline for input: {:?}",
+                    std::str::from_utf8(input).unwrap_or("<non-utf8>")
+                );
+            }
+        }
+    }
+
+    /// Property: the same invariant must hold on a real provider trace.
+    /// This catches buffering bugs that only manifest on production
+    /// payload shapes (large data fields, OpenAI event prefixes, etc.).
+    #[tokio::test]
+    async fn chunk_boundaries_invariant_on_real_capture() {
+        let path =
+            std::path::Path::new("tests/cross_provider/traces/openai/text_only.response.sse");
+        if !path.exists() {
+            // The capture may not have been generated yet; the dedicated
+            // `replay_traces` test no-ops in that case too.
+            eprintln!("skipping: {} not found", path.display());
+            return;
+        }
+        let bytes = std::fs::read(path).expect("read capture");
+        let baseline = parse_with_chunks(&bytes, &[bytes.len()]).await;
+        assert!(!baseline.is_empty(), "captured trace produced zero events");
+
+        // Sample a handful of randomized splittings — full byte-by-byte
+        // would work but is wasteful on a multi-KB capture.
+        for seed in 0u64..8 {
+            let mut rng = Lcg::new(seed);
+            let mut runs = Vec::new();
+            let mut consumed = 0usize;
+            while consumed < bytes.len() {
+                let max = (bytes.len() - consumed).min(256) + 1;
+                let r = rng.range(max).max(1);
+                runs.push(r);
+                consumed += r;
+            }
+            let got = parse_with_chunks(&bytes, &runs).await;
+            assert_eq!(got.len(), baseline.len(), "event count drift, seed={seed}");
+            for (a, b) in got.iter().zip(baseline.iter()) {
+                assert_eq!(a, b, "event drift at seed={seed}");
+            }
+        }
     }
 }

@@ -1,87 +1,91 @@
 //! Response handling for LLM generations.
 
-use crate::{Error, FinishReason, FunctionCall, StreamEvent, Usage};
+use crate::types::{
+    AssistantPart, FinishReason, FunctionCall, InputItem, ProviderContinuation, Usage,
+};
+use crate::{Error, StreamEvent};
 use futures_util::stream::Stream;
 use std::pin::Pin;
 
-/// A complete response from an LLM provider.
+/// A complete (buffered) response from an LLM provider — a single
+/// assistant turn's worth of [`AssistantPart`]s plus terminal
+/// metadata.
+///
+/// Fields are public; the lib doesn't maintain hidden invariants on
+/// this struct. The accessor methods ([`Self::text`],
+/// [`Self::function_calls`], [`Self::continuation`], [`Self::to_items`])
+/// are convenience views over `content` — readers can pick whichever
+/// is more ergonomic. Callers that need to mutate the response should
+/// edit `content` directly.
 #[derive(Debug, Clone)]
 pub struct CompleteResponse {
-    /// Ordered sequence of output items (text, function calls, etc.)
-    pub output: Vec<OutputItem>,
+    /// The assistant's emitted parts in order: text, reasoning, tool
+    /// calls, continuation marker, etc.
+    pub content: Vec<AssistantPart>,
+    /// Why the model stopped generating.
     pub finish_reason: FinishReason,
+    /// Token accounting for the turn.
     pub usage: Usage,
 }
 
-/// An item in the LLM response output.
-#[derive(Debug, Clone)]
-pub enum OutputItem {
-    /// Text content
-    Text { content: String },
-    /// Function call
-    FunctionCall { call: FunctionCall },
-}
+impl CompleteResponse {
+    /// Concatenated text of all `AssistantPart::Text` parts.
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|part| match part {
+                AssistantPart::Text { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 
-impl OutputItem {
-    /// Convert this output item to a message.
-    /// Text items become assistant messages, function calls become function call messages.
-    pub fn to_input_item(&self) -> crate::types::InputItem {
-        match self {
-            OutputItem::Text { content } => {
-                crate::types::InputItem::Message(crate::types::Message {
-                    role: crate::types::Role::Assistant,
-                    content: content.clone(),
-                })
-            }
-            OutputItem::FunctionCall { call } => {
-                crate::types::InputItem::FunctionCall(call.clone())
-            }
+    /// All tool calls emitted by the assistant, in emit order.
+    pub fn function_calls(&self) -> Vec<&FunctionCall> {
+        self.content
+            .iter()
+            .filter_map(|part| match part {
+                AssistantPart::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The provider's resumption hint for the next conversation turn,
+    /// if any. Surfaces the latest [`AssistantPart::Continuation`] in
+    /// the assistant content. Always optional, always safe to ignore.
+    pub fn continuation(&self) -> Option<&ProviderContinuation> {
+        self.content.iter().rev().find_map(|part| match part {
+            AssistantPart::Continuation(c) => Some(c),
+            _ => None,
+        })
+    }
+
+    /// Convert the response into a list of input items suitable for
+    /// appending to the next [`crate::Prompt`]. Returns a single
+    /// `InputItem::Assistant { content }`; any
+    /// [`AssistantPart::Continuation`] inside is automatically picked
+    /// up by the next same-provider request and elides prior history.
+    pub fn to_items(&self) -> Vec<InputItem> {
+        if self.content.is_empty() {
+            Vec::new()
+        } else {
+            vec![InputItem::Assistant {
+                content: self.content.clone(),
+            }]
         }
     }
 }
 
-impl CompleteResponse {
-    /// Get all text content concatenated together.
-    pub fn content(&self) -> String {
-        self.output
-            .iter()
-            .filter_map(|item| match item {
-                OutputItem::Text { content } => Some(content.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    /// Get all function calls in order.
-    pub fn function_calls(&self) -> Vec<&FunctionCall> {
-        self.output
-            .iter()
-            .filter_map(|item| match item {
-                OutputItem::FunctionCall { call } => Some(call),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Convert this response to a sequence of input items.
-    /// This preserves the ordering of text and function calls.
-    pub fn to_items(&self) -> Vec<crate::types::InputItem> {
-        self.output
-            .iter()
-            .map(|item| item.to_input_item())
-            .collect()
-    }
-}
-
-/// Response from an LLM generation that can be streamed or buffered.
-/// All responses are internally streaming.
+/// A streaming response.
 pub struct Response {
     stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>>,
 }
 
 impl Response {
-    /// Create a new response from a stream of events.
+    /// Wrap an arbitrary stream of [`StreamEvent`]s as a [`Response`].
+    /// Mainly useful for tests and for callers that drive their own
+    /// transport.
     pub fn from_stream<S>(stream: S) -> Self
     where
         S: Stream<Item = Result<StreamEvent, Error>> + Send + 'static,
@@ -91,35 +95,62 @@ impl Response {
         }
     }
 
-    /// Buffer the entire response by consuming the stream.
+    /// Drain the stream and return the buffered [`CompleteResponse`].
+    ///
+    /// Unlike [`Self::collect`] this does not build (and clone every
+    /// event into) an event log it would only discard — it feeds the
+    /// accumulator by value. This is the common path behind
+    /// [`Self::text`].
     pub async fn buffer(self) -> Result<CompleteResponse, Error> {
-        Self::buffer_stream(self.stream).await
-    }
-
-    /// Get just the text content (convenience method).
-    pub async fn text(self) -> Result<String, Error> {
-        let complete = self.buffer().await?;
-        Ok(complete.content())
-    }
-
-    /// Stream the response events.
-    pub fn stream(self) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>> {
-        self.stream
-    }
-
-    /// Buffer a streaming response by consuming all events.
-    async fn buffer_stream(
-        mut stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>>,
-    ) -> Result<CompleteResponse, Error> {
         use futures_util::StreamExt;
-
         let mut accumulator = crate::accumulator::ResponseAccumulator::new();
-
+        let mut stream = self.stream;
         while let Some(event_result) = stream.next().await {
             let event = event_result?;
+            match &event {
+                StreamEvent::Error { error } => {
+                    return Err(Error::streaming(error.clone()));
+                }
+                StreamEvent::Done { .. } => {
+                    accumulator.process_event(event)?;
+                    break;
+                }
+                _ => accumulator.process_event(event)?,
+            }
+        }
+        accumulator.finalize()
+    }
 
+    /// Drain the stream and return the concatenated text of all text parts.
+    pub async fn text(self) -> Result<String, Error> {
+        let complete = self.buffer().await?;
+        Ok(complete.text())
+    }
+
+    /// Drain the stream up to **and including** the terminal `Done`
+    /// and return the event log alongside the buffered
+    /// [`CompleteResponse`]. Any events a transport emits *after*
+    /// `Done` are not collected (the log stops at `Done`, mirroring
+    /// the buffered result).
+    ///
+    /// Returns *after* the stream completes — the `Vec<StreamEvent>` is
+    /// a post-hoc record, not a live feed. Use it for inspection,
+    /// snapshot testing, or audit logging. For the buffered result
+    /// alone prefer [`Self::buffer`] (no event-log allocation). If you
+    /// need live event handling while the model streams, consume
+    /// [`Self::stream`] directly and feed events into a
+    /// [`crate::accumulator::ResponseAccumulator`] yourself.
+    pub async fn collect(self) -> Result<(Vec<StreamEvent>, CompleteResponse), Error> {
+        let mut accumulator = crate::accumulator::ResponseAccumulator::new();
+        let mut events = Vec::new();
+
+        use futures_util::StreamExt;
+        let mut stream = self.stream;
+        while let Some(event_result) = stream.next().await {
+            let event = event_result?;
             match &event {
                 StreamEvent::Done { .. } => {
+                    events.push(event.clone());
                     accumulator.process_event(event)?;
                     break;
                 }
@@ -127,224 +158,204 @@ impl Response {
                     return Err(Error::streaming(error.clone()));
                 }
                 _ => {
+                    events.push(event.clone());
                     accumulator.process_event(event)?;
                 }
             }
         }
 
-        accumulator.finalize()
+        let response = accumulator.finalize()?;
+        Ok((events, response))
+    }
+
+    /// Unwrap to the raw event stream for direct consumption.
+    pub fn stream(self) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>> {
+        self.stream
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{FunctionCall, PartKind, Usage};
 
-    #[test]
-    fn test_complete_response_creation() {
-        let response = CompleteResponse {
-            output: vec![OutputItem::Text {
-                content: "Hello, world!".to_string(),
-            }],
-            finish_reason: FinishReason::Stop,
-            usage: Usage::default(),
-        };
-
-        assert_eq!(response.content(), "Hello, world!");
-        assert!(response.function_calls().is_empty());
+    #[tokio::test]
+    async fn buffers_a_text_only_response() {
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::Text,
+            }),
+            Ok(StreamEvent::Delta {
+                index: 0,
+                delta: "Test response".to_string(),
+            }),
+            Ok(StreamEvent::PartEnd { index: 0 }),
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ];
+        let stream = futures_util::stream::iter(events);
+        let text = Response::from_stream(stream).text().await.unwrap();
+        assert_eq!(text, "Test response");
     }
 
     #[tokio::test]
-    async fn test_response_buffering() {
-        // Create a mock stream that represents a complete response
-        let events = vec![
-            Ok(StreamEvent::OutputItemAdded {
-                item: crate::types::OutputItemInfo::Text,
+    async fn buffer_propagates_mid_stream_error() {
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::Text,
             }),
-            Ok(StreamEvent::ContentDelta {
-                delta: "Test response".to_string(),
+            Ok(StreamEvent::Delta {
+                index: 0,
+                delta: "partial".to_string(),
+            }),
+            Err(Error::streaming("connection reset mid-stream")),
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ];
+        let stream = futures_util::stream::iter(events);
+        let err = Response::from_stream(stream).buffer().await.expect_err("");
+        assert!(matches!(err, Error::Streaming(_)));
+        assert!(err.to_string().contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn buffer_propagates_stream_error_event() {
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::Text,
+            }),
+            Ok(StreamEvent::Delta {
+                index: 0,
+                delta: "partial".to_string(),
+            }),
+            Ok(StreamEvent::Error {
+                error: "model internal error".to_string(),
             }),
             Ok(StreamEvent::Done {
                 finish_reason: FinishReason::Stop,
                 usage: Usage::default(),
             }),
         ];
-
         let stream = futures_util::stream::iter(events);
-        let response = Response::from_stream(stream);
-        let text = response.text().await.unwrap();
-        assert_eq!(text, "Test response");
+        let err = Response::from_stream(stream).buffer().await.expect_err("");
+        assert!(err.to_string().contains("model internal error"));
     }
 
     #[test]
-    fn test_mixed_output_ordering() {
-        use crate::types::FunctionCall;
-
-        // Test that ordering is preserved: text -> function call -> more text
+    fn text_concatenates_across_parts() {
         let response = CompleteResponse {
-            output: vec![
-                OutputItem::Text {
-                    content: "I'll help you with that. ".to_string(),
+            content: vec![
+                AssistantPart::Text {
+                    content: "Hello, ".to_string(),
+                    annotations: Vec::new(),
                 },
-                OutputItem::FunctionCall {
-                    call: FunctionCall {
-                        call_id: "call_123".to_string(),
-                        name: "get_weather".to_string(),
-                        arguments: "{\"location\":\"Paris\"}".to_string(),
-                    },
-                },
-                OutputItem::Text {
-                    content: " Let me also check something else.".to_string(),
+                AssistantPart::Text {
+                    content: "world!".to_string(),
+                    annotations: Vec::new(),
                 },
             ],
             finish_reason: FinishReason::Stop,
             usage: Usage::default(),
         };
-
-        // Test content concatenation
-        assert_eq!(
-            response.content(),
-            "I'll help you with that.  Let me also check something else."
-        );
-
-        // Test function calls extraction
-        let calls = response.function_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "get_weather");
-
-        // Test output items preserve order
-        assert_eq!(response.output.len(), 3);
-        match &response.output[0] {
-            OutputItem::Text { content } => assert_eq!(content, "I'll help you with that. "),
-            _ => panic!("Expected text item"),
-        }
-        match &response.output[1] {
-            OutputItem::FunctionCall { call } => assert_eq!(call.name, "get_weather"),
-            _ => panic!("Expected function call item"),
-        }
-        match &response.output[2] {
-            OutputItem::Text { content } => {
-                assert_eq!(content, " Let me also check something else.")
-            }
-            _ => panic!("Expected text item"),
-        }
+        assert_eq!(response.text(), "Hello, world!");
     }
 
-    #[test]
-    fn test_to_items() {
-        use crate::types::{FunctionCall, Role};
+    #[tokio::test]
+    async fn collect_returns_both_events_and_buffered_response() {
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::Text,
+            }),
+            Ok(StreamEvent::Delta {
+                index: 0,
+                delta: "hello".to_string(),
+            }),
+            Ok(StreamEvent::PartEnd { index: 0 }),
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ];
+        let stream = futures_util::stream::iter(events);
+        let (events, complete) = Response::from_stream(stream).collect().await.unwrap();
+        // Stream events include both lifecycle and content events.
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], StreamEvent::PartStart { .. }));
+        // Buffered response has the accumulated text.
+        assert_eq!(complete.text(), "hello");
+    }
 
-        // Test text-only response
-        let text_response = CompleteResponse {
-            output: vec![OutputItem::Text {
-                content: "Hello, world!".to_string(),
-            }],
+    /// `to_items()` wraps the response's content in a single
+    /// `InputItem::Assistant`, preserving any `Continuation` part so
+    /// the next same-provider request picks it up and elides prior
+    /// history.
+    #[test]
+    fn to_items_includes_continuation_marker() {
+        use crate::types::{InputItem, ProviderContinuation};
+        let response = CompleteResponse {
+            content: vec![
+                AssistantPart::Text {
+                    content: "hi".into(),
+                    annotations: Vec::new(),
+                },
+                AssistantPart::Continuation(ProviderContinuation::OpenAI {
+                    response_id: "resp_42".into(),
+                }),
+            ],
             finish_reason: FinishReason::Stop,
             usage: Usage::default(),
         };
-
-        let items = text_response.to_items();
+        let items = response.to_items();
         assert_eq!(items.len(), 1);
         match &items[0] {
-            crate::types::InputItem::Message(msg) => {
-                assert_eq!(msg.role(), Role::Assistant);
-                assert_eq!(msg.content(), Some("Hello, world!".to_string()));
+            InputItem::Assistant { content } => {
+                assert_eq!(content.len(), 2);
+                assert!(matches!(&content[0], AssistantPart::Text { .. }));
+                match &content[1] {
+                    AssistantPart::Continuation(ProviderContinuation::OpenAI { response_id }) => {
+                        assert_eq!(response_id, "resp_42");
+                    }
+                    other => panic!("expected continuation part, got {other:?}"),
+                }
             }
-            _ => panic!("Expected message"),
+            other => panic!("expected assistant item, got {other:?}"),
         }
-
-        // Test response with function calls
-        let mixed_response = CompleteResponse {
-            output: vec![
-                OutputItem::Text {
-                    content: "I'll help you with that. ".to_string(),
-                },
-                OutputItem::FunctionCall {
-                    call: FunctionCall {
-                        call_id: "call_123".to_string(),
-                        name: "get_weather".to_string(),
-                        arguments: "{\"location\":\"Paris\"}".to_string(),
-                    },
-                },
-            ],
-            finish_reason: FinishReason::ToolCalls,
-            usage: Usage::default(),
-        };
-
-        let items = mixed_response.to_items();
-        assert_eq!(items.len(), 2); // One text message, one function call
-
-        // First item should be text
-        match &items[0] {
-            crate::types::InputItem::Message(msg) => {
-                assert_eq!(msg.role(), Role::Assistant);
-                assert_eq!(msg.content(), Some("I'll help you with that. ".to_string()));
-            }
-            _ => panic!("Expected message"),
-        }
-
-        // Second item should be function call
-        match &items[1] {
-            crate::types::InputItem::FunctionCall(call) => {
-                assert_eq!(call.name, "get_weather");
-            }
-            _ => panic!("Expected function call"),
-        }
+        // And the accessor matches.
+        assert!(matches!(
+            response.continuation(),
+            Some(ProviderContinuation::OpenAI { response_id }) if response_id == "resp_42"
+        ));
     }
 
     #[test]
-    fn test_to_items_mixed() {
-        use crate::types::{FunctionCall, Role};
-
-        // Test response with mixed content
-        let mixed_response = CompleteResponse {
-            output: vec![
-                OutputItem::Text {
-                    content: "I'll help you with that. ".to_string(),
-                },
-                OutputItem::FunctionCall {
-                    call: FunctionCall {
-                        call_id: "call_123".to_string(),
-                        name: "get_weather".to_string(),
-                        arguments: "{\"location\":\"Paris\"}".to_string(),
-                    },
-                },
-                OutputItem::Text {
-                    content: "Let me check that for you.".to_string(),
-                },
+    fn function_calls_iter_returns_in_order() {
+        let response = CompleteResponse {
+            content: vec![
+                AssistantPart::ToolCall(FunctionCall {
+                    call_id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: "{}".to_string(),
+                }),
+                AssistantPart::ToolCall(FunctionCall {
+                    call_id: "call_2".to_string(),
+                    name: "get_news".to_string(),
+                    arguments: "{}".to_string(),
+                }),
             ],
             finish_reason: FinishReason::ToolCalls,
             usage: Usage::default(),
         };
-
-        let items = mixed_response.to_items();
-        assert_eq!(items.len(), 3);
-
-        // Check content types
-        match &items[0] {
-            crate::types::InputItem::Message(msg) => {
-                assert_eq!(msg.role(), Role::Assistant);
-                assert_eq!(msg.content(), Some("I'll help you with that. ".to_string()));
-            }
-            _ => panic!("Expected message"),
-        }
-
-        match &items[1] {
-            crate::types::InputItem::FunctionCall(call) => {
-                assert_eq!(call.name, "get_weather");
-            }
-            _ => panic!("Expected function call"),
-        }
-
-        match &items[2] {
-            crate::types::InputItem::Message(msg) => {
-                assert_eq!(msg.role(), Role::Assistant);
-                assert_eq!(
-                    msg.content(),
-                    Some("Let me check that for you.".to_string())
-                );
-            }
-            _ => panic!("Expected message"),
-        }
+        let calls = response.function_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[1].name, "get_news");
     }
 }

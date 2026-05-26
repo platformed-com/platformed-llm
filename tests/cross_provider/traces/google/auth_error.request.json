@@ -1,0 +1,13 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Hello."
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {}
+}

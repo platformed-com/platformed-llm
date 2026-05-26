@@ -1,63 +1,56 @@
-//! Delta accumulation logic for streaming responses.
+//! Delta accumulation for streaming responses.
+//!
+//! Every event names its target part by index. Reconstruction is a
+//! straight-line dispatch — no implicit "currently-active part" state.
 
-use crate::types::{FinishReason, FunctionCall, StreamEvent, Usage};
+use crate::response::CompleteResponse;
+use crate::types::{
+    AssistantPart, FinishReason, FunctionCall, PartKind, PartUpdate, StreamEvent, Usage,
+};
 use crate::Error;
-use crate::{CompleteResponse, OutputItem};
 
-/// Accumulates streaming deltas into a complete response.
+/// Reassembles a sequence of [`StreamEvent`]s into a [`CompleteResponse`].
+///
+/// Useful when you want to consume a stream incrementally but also produce
+/// the final buffered response at the end.
 #[derive(Debug, Default)]
 pub struct ResponseAccumulator {
-    /// Ordered output items (text, function calls, etc.)
-    output_items: Vec<OutputItem>,
-    /// Final finish reason (if received).
+    parts: Vec<AssistantPart>,
     finish_reason: Option<FinishReason>,
-    /// Final usage statistics (if received).
     usage: Option<Usage>,
 }
 
-// Removed PartialFunctionCallBuilder - no longer needed since we handle complete calls only
-
 impl ResponseAccumulator {
-    /// Create a new response accumulator.
+    /// Create an empty accumulator.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Process a stream event and update the accumulation.
+    /// Apply a single stream event. Returns an error if the event references
+    /// a part index that wasn't opened by a preceding `PartStart`, or if the
+    /// stream itself reported an error.
     pub fn process_event(&mut self, event: StreamEvent) -> Result<(), Error> {
         match event {
-            StreamEvent::ContentDelta { delta } => {
-                // Append text to the most recent text output item
-                match self.output_items.last_mut() {
-                    Some(OutputItem::Text { content }) => {
-                        // Append to existing text item
-                        content.push_str(&delta);
-                    }
-                    _ => {
-                        // No text item to append to - this shouldn't happen if OutputItemAdded events are properly sent
-                        // But for robustness, create a new text item
-                        self.output_items.push(OutputItem::Text { content: delta });
-                    }
+            StreamEvent::PartStart { index, kind } => {
+                if index as usize != self.parts.len() {
+                    return Err(Error::streaming(format!(
+                        "PartStart out of order: index={index}, parts.len()={}",
+                        self.parts.len()
+                    )));
                 }
+                self.parts.push(open_part(kind));
             }
-            StreamEvent::OutputItemAdded { item } => {
-                // When a new output item is added, create the appropriate empty item
-                match item {
-                    crate::types::OutputItemInfo::Text => {
-                        // Add an empty text item that will be filled by subsequent ContentDelta events
-                        self.output_items.push(OutputItem::Text {
-                            content: String::new(),
-                        });
-                    }
-                    crate::types::OutputItemInfo::FunctionCall { .. } => {
-                        // Function call items will be replaced when FunctionCallComplete arrives
-                        // We don't add a placeholder here since we handle it in FunctionCallComplete
-                    }
-                }
+            StreamEvent::Delta { index, delta } => {
+                let part = self.part_mut(index)?;
+                append_delta(part, &delta);
             }
-            StreamEvent::FunctionCallComplete { call } => {
-                // Add the complete function call as an output item
-                self.output_items.push(OutputItem::FunctionCall { call });
+            StreamEvent::PartUpdate { index, update } => {
+                let part = self.part_mut(index)?;
+                apply_update(part, update);
+            }
+            StreamEvent::PartEnd { index } => {
+                let part = self.part_mut(index)?;
+                finalize_part(part);
             }
             StreamEvent::Done {
                 finish_reason,
@@ -66,48 +59,126 @@ impl ResponseAccumulator {
                 self.finish_reason = Some(finish_reason);
                 self.usage = Some(usage);
             }
-            StreamEvent::Error { .. } => {
-                // Handle error events if needed
+            StreamEvent::Error { error } => {
+                return Err(Error::streaming(error));
             }
         }
-
         Ok(())
     }
 
-    /// Finalize and return the complete response.
+    fn part_mut(&mut self, index: u32) -> Result<&mut AssistantPart, Error> {
+        let len = self.parts.len();
+        self.parts.get_mut(index as usize).ok_or_else(|| {
+            Error::streaming(format!(
+                "stream event references unknown part index {index} (have {len} parts)",
+            ))
+        })
+    }
+
+    /// Consume the accumulator and produce the final response. If a
+    /// `Done` event was never observed (truncated / cancelled stream),
+    /// the finish reason is [`FinishReason::Incomplete`] — *not*
+    /// `Stop` — so callers can distinguish a clean finish from a cut
+    /// off one; usage falls back to zeros.
     pub fn finalize(self) -> Result<CompleteResponse, Error> {
         Ok(CompleteResponse {
-            output: self.output_items,
-            finish_reason: self.finish_reason.unwrap_or(FinishReason::Stop),
+            content: self.parts,
+            finish_reason: self.finish_reason.unwrap_or(FinishReason::Incomplete),
             usage: self.usage.unwrap_or_default(),
         })
     }
 
-    /// Get the current accumulated content (concatenated text only).
-    /// This is a convenience method for accessing content during streaming.
+    /// Concatenation of all accumulated text-part content so far. Intended
+    /// for live previews while streaming is still in flight.
     pub fn current_content(&self) -> String {
-        let mut content = String::new();
-
-        // Add text from all text output items
-        for item in &self.output_items {
-            if let OutputItem::Text { content: text } = item {
-                content.push_str(text);
-            }
-        }
-
-        content
-    }
-
-    /// Get the completed function calls so far.
-    /// This is a convenience method for accessing function calls during streaming.
-    pub fn completed_function_calls(&self) -> Vec<FunctionCall> {
-        self.output_items
+        self.parts
             .iter()
-            .filter_map(|item| match item {
-                OutputItem::FunctionCall { call } => Some(call.clone()),
+            .filter_map(|p| match p {
+                AssistantPart::Text { content, .. } => Some(content.as_str()),
                 _ => None,
             })
             .collect()
+    }
+
+    /// All function-call parts seen so far, cloned out. Note that the
+    /// `arguments` JSON is only guaranteed to be complete once the
+    /// corresponding `PartEnd` event has been processed.
+    pub fn completed_function_calls(&self) -> Vec<FunctionCall> {
+        self.parts
+            .iter()
+            .filter_map(|p| match p {
+                AssistantPart::ToolCall(call) => Some(call.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+fn open_part(kind: PartKind) -> AssistantPart {
+    match kind {
+        PartKind::Text => AssistantPart::Text {
+            content: String::new(),
+            annotations: Vec::new(),
+        },
+        PartKind::Reasoning => AssistantPart::Reasoning {
+            content: String::new(),
+            signature: None,
+        },
+        PartKind::RedactedReasoning { data } => AssistantPart::RedactedReasoning { data },
+        PartKind::Refusal => AssistantPart::Refusal(String::new()),
+        PartKind::ToolCall { call_id, name } => AssistantPart::ToolCall(FunctionCall {
+            call_id,
+            name,
+            arguments: String::new(),
+        }),
+        PartKind::BuiltinToolCall { kind } => AssistantPart::BuiltinToolCall {
+            kind,
+            arguments: String::new(),
+            result: None,
+        },
+        PartKind::Continuation(c) => AssistantPart::Continuation(c),
+    }
+}
+
+fn append_delta(part: &mut AssistantPart, delta: &str) {
+    match part {
+        AssistantPart::Text { content, .. } => content.push_str(delta),
+        AssistantPart::Reasoning { content, .. } => content.push_str(delta),
+        AssistantPart::Refusal(content) => content.push_str(delta),
+        AssistantPart::ToolCall(call) => call.arguments.push_str(delta),
+        AssistantPart::BuiltinToolCall { arguments, .. } => arguments.push_str(delta),
+        AssistantPart::RedactedReasoning { .. }
+        | AssistantPart::Continuation(_)
+        | AssistantPart::CacheBreakpoint => {}
+    }
+}
+
+fn apply_update(part: &mut AssistantPart, update: PartUpdate) {
+    match (part, update) {
+        (AssistantPart::Reasoning { signature, .. }, PartUpdate::Signature(sig)) => {
+            *signature = Some(sig);
+        }
+        (AssistantPart::Text { annotations, .. }, PartUpdate::Annotation(ann)) => {
+            annotations.push(ann);
+        }
+        (AssistantPart::BuiltinToolCall { result, .. }, PartUpdate::BuiltinToolResult(r)) => {
+            *result = Some(r);
+        }
+        _ => {}
+    }
+}
+
+fn finalize_part(part: &mut AssistantPart) {
+    if let AssistantPart::ToolCall(call) = part {
+        if !call.arguments.is_empty() {
+            if let Err(e) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                tracing::debug!(
+                    call_id = %call.call_id,
+                    error = %e,
+                    "tool call arguments did not parse as JSON; passing through verbatim",
+                );
+            }
+        }
     }
 }
 
@@ -116,135 +187,160 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_content_accumulation() {
-        let mut accumulator = ResponseAccumulator::new();
-
-        // Without OutputItemAdded, content should still work (for backward compatibility)
-        let event1 = StreamEvent::ContentDelta {
-            delta: "Hello ".to_string(),
-        };
-        accumulator.process_event(event1).unwrap();
-        assert_eq!(accumulator.current_content(), "Hello ");
-
-        let event2 = StreamEvent::ContentDelta {
-            delta: "world!".to_string(),
-        };
-        accumulator.process_event(event2).unwrap();
-        assert_eq!(accumulator.current_content(), "Hello world!");
+    fn accumulates_text_part() {
+        let mut acc = ResponseAccumulator::new();
+        acc.process_event(StreamEvent::PartStart {
+            index: 0,
+            kind: PartKind::Text,
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::Delta {
+            index: 0,
+            delta: "Hello, ".into(),
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::Delta {
+            index: 0,
+            delta: "world!".into(),
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::PartEnd { index: 0 })
+            .unwrap();
+        assert_eq!(acc.current_content(), "Hello, world!");
     }
 
     #[test]
-    fn test_output_item_based_accumulation() {
-        let mut accumulator = ResponseAccumulator::new();
-
-        // Add first text output item
-        let add_text1 = StreamEvent::OutputItemAdded {
-            item: crate::types::OutputItemInfo::Text,
-        };
-        accumulator.process_event(add_text1).unwrap();
-
-        // Add content to first text item
-        let delta1 = StreamEvent::ContentDelta {
-            delta: "First item. ".to_string(),
-        };
-        accumulator.process_event(delta1).unwrap();
-        assert_eq!(accumulator.current_content(), "First item. ");
-
-        // Add function call output item
-        let add_func = StreamEvent::OutputItemAdded {
-            item: crate::types::OutputItemInfo::FunctionCall {
-                name: "test_func".to_string(),
-                id: "fc_123".to_string(),
+    fn accumulates_tool_call_arguments_via_deltas() {
+        let mut acc = ResponseAccumulator::new();
+        acc.process_event(StreamEvent::PartStart {
+            index: 0,
+            kind: PartKind::ToolCall {
+                call_id: "call_1".into(),
+                name: "get_weather".into(),
             },
-        };
-        accumulator.process_event(add_func).unwrap();
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::Delta {
+            index: 0,
+            delta: r#"{"city":"#.into(),
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::Delta {
+            index: 0,
+            delta: r#" "Paris"}"#.into(),
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::PartEnd { index: 0 })
+            .unwrap();
 
-        // Complete the function call
-        let func_complete = StreamEvent::FunctionCallComplete {
-            call: FunctionCall {
-                call_id: "call_123".to_string(),
-                name: "test_func".to_string(),
-                arguments: "{}".to_string(),
-            },
-        };
-        accumulator.process_event(func_complete).unwrap();
+        let calls = acc.completed_function_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, r#"{"city": "Paris"}"#);
+    }
 
-        // Add second text output item
-        let add_text2 = StreamEvent::OutputItemAdded {
-            item: crate::types::OutputItemInfo::Text,
-        };
-        accumulator.process_event(add_text2).unwrap();
+    #[test]
+    fn accumulates_reasoning_with_signature() {
+        let mut acc = ResponseAccumulator::new();
+        acc.process_event(StreamEvent::PartStart {
+            index: 0,
+            kind: PartKind::Reasoning,
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::Delta {
+            index: 0,
+            delta: "Thinking...".into(),
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::PartUpdate {
+            index: 0,
+            update: PartUpdate::Signature("sig_abc".into()),
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::PartEnd { index: 0 })
+            .unwrap();
 
-        // Add content to second text item
-        let delta2 = StreamEvent::ContentDelta {
-            delta: "Second item.".to_string(),
-        };
-        accumulator.process_event(delta2).unwrap();
-
-        // Verify content accumulation
-        assert_eq!(accumulator.current_content(), "First item. Second item.");
-
-        // Verify output structure
-        let response = accumulator.finalize().unwrap();
-        assert_eq!(response.output.len(), 3);
-
-        match &response.output[0] {
-            OutputItem::Text { content } => assert_eq!(content, "First item. "),
-            _ => panic!("Expected text item"),
-        }
-
-        match &response.output[1] {
-            OutputItem::FunctionCall { call } => assert_eq!(call.name, "test_func"),
-            _ => panic!("Expected function call"),
-        }
-
-        match &response.output[2] {
-            OutputItem::Text { content } => assert_eq!(content, "Second item."),
-            _ => panic!("Expected text item"),
+        let response = acc.finalize().unwrap();
+        match &response.content[0] {
+            AssistantPart::Reasoning { signature, content } => {
+                assert_eq!(content, "Thinking...");
+                assert_eq!(signature.as_deref(), Some("sig_abc"));
+            }
+            _ => panic!("wrong part"),
         }
     }
 
     #[test]
-    fn test_function_call_accumulation() {
-        let mut accumulator = ResponseAccumulator::new();
-
-        // Complete function call
-        let complete_event = StreamEvent::FunctionCallComplete {
-            call: FunctionCall {
-                call_id: "call_123".to_string(),
-                name: "get_weather".to_string(),
-                arguments: "{\"location\": \"Paris\"}".to_string(),
-            },
-        };
-        accumulator.process_event(complete_event).unwrap();
-
-        assert_eq!(accumulator.completed_function_calls().len(), 1);
-        assert_eq!(
-            accumulator.completed_function_calls()[0].name,
-            "get_weather"
-        );
+    fn part_start_must_be_in_order() {
+        let mut acc = ResponseAccumulator::new();
+        let err = acc
+            .process_event(StreamEvent::PartStart {
+                index: 1,
+                kind: PartKind::Text,
+            })
+            .expect_err("");
+        assert!(err.to_string().contains("out of order"));
     }
 
     #[test]
-    fn test_finalization() {
-        let mut accumulator = ResponseAccumulator::new();
+    fn delta_to_unknown_index_errors() {
+        let mut acc = ResponseAccumulator::new();
+        let err = acc
+            .process_event(StreamEvent::Delta {
+                index: 0,
+                delta: "hi".into(),
+            })
+            .expect_err("");
+        assert!(err.to_string().contains("unknown part index"));
+    }
 
-        // Add some content
-        let content_event = StreamEvent::ContentDelta {
-            delta: "Test response".to_string(),
-        };
-        accumulator.process_event(content_event).unwrap();
+    #[test]
+    fn redacted_reasoning_one_shot() {
+        let mut acc = ResponseAccumulator::new();
+        acc.process_event(StreamEvent::PartStart {
+            index: 0,
+            kind: PartKind::RedactedReasoning {
+                data: "opaque-blob".into(),
+            },
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::PartEnd { index: 0 })
+            .unwrap();
 
-        // Add done event
-        let done_event = StreamEvent::Done {
-            finish_reason: FinishReason::Stop,
+        let response = acc.finalize().unwrap();
+        match &response.content[0] {
+            AssistantPart::RedactedReasoning { data } => assert_eq!(data, "opaque-blob"),
+            _ => panic!("wrong"),
+        }
+    }
+
+    #[test]
+    fn finalize_without_done_is_incomplete_not_stop() {
+        // A stream that ends without a terminal `Done` (truncated /
+        // cancelled) must NOT be reported as a clean Stop.
+        let mut acc = ResponseAccumulator::new();
+        acc.process_event(StreamEvent::PartStart {
+            index: 0,
+            kind: PartKind::Text,
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::Delta {
+            index: 0,
+            delta: "partial".into(),
+        })
+        .unwrap();
+        // No PartEnd, no Done — stream just stopped.
+        let response = acc.finalize().unwrap();
+        assert_eq!(response.finish_reason, FinishReason::Incomplete);
+    }
+
+    #[test]
+    fn finalize_with_done_keeps_reported_reason() {
+        let mut acc = ResponseAccumulator::new();
+        acc.process_event(StreamEvent::Done {
+            finish_reason: FinishReason::Length,
             usage: Usage::default(),
-        };
-        accumulator.process_event(done_event).unwrap();
-
-        // Finalize
-        let complete = accumulator.finalize().unwrap();
-        assert_eq!(complete.content(), "Test response");
-        assert_eq!(complete.finish_reason, FinishReason::Stop);
+        })
+        .unwrap();
+        assert_eq!(acc.finalize().unwrap().finish_reason, FinishReason::Length);
     }
 }

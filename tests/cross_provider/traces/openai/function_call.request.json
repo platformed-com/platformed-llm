@@ -1,0 +1,32 @@
+{
+  "input": [
+    {
+      "content": "What's the weather in Paris? Use the get_weather tool.",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 256,
+  "model": "gpt-4o-mini",
+  "store": false,
+  "stream": true,
+  "tools": [
+    {
+      "description": "Get the current weather for a city.",
+      "name": "get_weather",
+      "parameters": {
+        "properties": {
+          "city": {
+            "description": "City name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ]
+}
