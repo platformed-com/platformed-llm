@@ -78,9 +78,9 @@ async fn dropping_response_closes_underlying_connection() {
 
     let provider = OpenAIProvider::new_with_base_url("test-key".to_string(), base_url).unwrap();
     let prompt = Prompt::user("hi");
-    let cfg = Config::new("gpt-4o-mini");
+    let cfg = Config::new("gpt-4o-mini").build();
     let response = provider
-        .generate(&prompt, &cfg)
+        .generate(&prompt, cfg.raw())
         .await
         .expect("generate should succeed");
     let mut stream = response.stream();

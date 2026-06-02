@@ -34,12 +34,13 @@ async fn main() -> Result<(), Error> {
     let conversation = Prompt::user("Please just say 'Hello world!' - nothing else.");
     let cfg = Config::new("claude-3-5-sonnet-v2@20241022")
         .temperature(0.0)
-        .max_tokens(20);
+        .max_tokens(20)
+        .build();
 
     println!("📤 Making simple request...");
 
     // Generate response
-    let response = provider.generate(&conversation, &cfg).await?;
+    let response = provider.generate(&conversation, cfg.raw()).await?;
     let mut stream = response.stream();
 
     println!("📥 Processing stream:");

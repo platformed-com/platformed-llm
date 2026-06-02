@@ -130,8 +130,8 @@ async fn consumer_gets_events_as_bytes_arrive_not_bulk() {
         transport,
     );
     let prompt = Prompt::user("hi");
-    let cfg = Config::new("gpt-4o-mini");
-    let response = provider.generate(&prompt, &cfg).await.unwrap();
+    let cfg = Config::new("gpt-4o-mini").build();
+    let response = provider.generate(&prompt, cfg.raw()).await.unwrap();
     let mut stream = response.stream();
 
     // Read events as they come. After each event we assert the source

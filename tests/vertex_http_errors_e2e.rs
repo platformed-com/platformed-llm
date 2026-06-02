@@ -57,8 +57,9 @@ fn transport(status: u16, headers: Vec<(String, String)>, body: &str) -> Transpo
 
 async fn google_err(status: u16, headers: Vec<(String, String)>, body: &str) -> Error {
     let provider = GoogleProvider::with_transport(endpoint(), transport(status, headers, body));
+    let cfg = Config::new("gemini-2.5-flash").build();
     provider
-        .generate(&Prompt::user("hi"), &Config::new("gemini-2.5-flash"))
+        .generate(&Prompt::user("hi"), cfg.raw())
         .await
         .map(|_| ())
         .expect_err("non-2xx should error")
@@ -67,8 +68,9 @@ async fn google_err(status: u16, headers: Vec<(String, String)>, body: &str) -> 
 async fn anthropic_err(status: u16, headers: Vec<(String, String)>, body: &str) -> Error {
     let provider =
         AnthropicViaVertexProvider::with_transport(endpoint(), transport(status, headers, body));
+    let cfg = Config::new("claude-sonnet-4").build();
     provider
-        .generate(&Prompt::user("hi"), &Config::new("claude-sonnet-4"))
+        .generate(&Prompt::user("hi"), cfg.raw())
         .await
         .map(|_| ())
         .expect_err("non-2xx should error")

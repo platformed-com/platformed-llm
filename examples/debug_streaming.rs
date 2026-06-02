@@ -34,17 +34,20 @@ async fn main() -> Result<(), Error> {
 
     // Simple request
     let conversation = Prompt::user("Say 'Hello World' exactly.");
-    let cfg = Config::new("gpt-4o-mini").temperature(0.0).max_tokens(10);
+    let cfg = Config::new("gpt-4o-mini")
+        .temperature(0.0)
+        .max_tokens(10)
+        .build();
 
     println!("📡 Making request...");
 
     // Generate response
-    match provider.generate(&conversation, &cfg).await {
+    match provider.generate(&conversation, cfg.raw()).await {
         Ok(response) => {
             println!("✅ Request succeeded");
 
             // Test direct text method
-            let response_clone = provider.generate(&conversation, &cfg).await?;
+            let response_clone = provider.generate(&conversation, cfg.raw()).await?;
             let text = response_clone.text().await?;
             println!("📄 Direct text result: '{text}'");
             println!("📄 Text length: {}", text.len());

@@ -160,7 +160,7 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
         body: trace.response_sse.clone(),
     });
     let prompt = Prompt::user("replay");
-    let cfg = Config::new(trace.request_model.as_str());
+    let cfg = Config::new(trace.request_model.as_str()).build();
     let response = match trace.provider {
         Provider::OpenAI => {
             let p = OpenAIProvider::with_transport(
@@ -168,7 +168,7 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
                 "http://placeholder".to_string(),
                 transport,
             );
-            p.generate(&prompt, &cfg).await.unwrap()
+            p.generate(&prompt, cfg.raw()).await.unwrap()
         }
         Provider::Google => {
             let endpoint = VertexEndpoint::with_access_token(
@@ -177,7 +177,7 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
                 "tok".to_string(),
             );
             GoogleProvider::with_transport(endpoint, transport)
-                .generate(&prompt, &cfg)
+                .generate(&prompt, cfg.raw())
                 .await
                 .unwrap()
         }
@@ -188,7 +188,7 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
                 "tok".to_string(),
             );
             AnthropicViaVertexProvider::with_transport(endpoint, transport)
-                .generate(&prompt, &cfg)
+                .generate(&prompt, cfg.raw())
                 .await
                 .unwrap()
         }

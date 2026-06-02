@@ -34,7 +34,10 @@ async fn budget_exhausted_reports_length() {
     // 3 chunks emitted, max_tokens 2 → budget exhausted → Length.
     let p = provider(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())]);
     let resp = p
-        .generate(&Prompt::user("hi"), &Config::new("m").max_tokens(2))
+        .generate(
+            &Prompt::user("hi"),
+            Config::new("m").max_tokens(2).build().raw(),
+        )
         .await
         .unwrap();
     let complete = resp.buffer().await.unwrap();
@@ -45,7 +48,10 @@ async fn budget_exhausted_reports_length() {
 async fn natural_stop_reports_stop() {
     let p = provider(vec![Ok("hello".into())]);
     let resp = p
-        .generate(&Prompt::user("hi"), &Config::new("m").max_tokens(100))
+        .generate(
+            &Prompt::user("hi"),
+            Config::new("m").max_tokens(100).build().raw(),
+        )
         .await
         .unwrap();
     let complete = resp.buffer().await.unwrap();
@@ -56,7 +62,10 @@ async fn natural_stop_reports_stop() {
 async fn engine_error_propagates_and_suppresses_done() {
     let p = provider(vec![Ok("partial".into()), Err("boom".into())]);
     let resp = p
-        .generate(&Prompt::user("hi"), &Config::new("m").max_tokens(100))
+        .generate(
+            &Prompt::user("hi"),
+            Config::new("m").max_tokens(100).build().raw(),
+        )
         .await
         .unwrap();
     // The mid-stream engine error must surface as a stream error

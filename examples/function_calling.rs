@@ -157,14 +157,15 @@ async fn main() -> Result<(), Error> {
     let cfg = Config::new(&model_name)
         .temperature(0.2)
         .max_tokens(300)
-        .tools(vec![get_weather.clone(), calculate.clone()]);
+        .tools(vec![get_weather.clone(), calculate.clone()])
+        .build();
 
     println!("👤 User: What's the weather like in Tokyo? Also, what's 15 multiplied by 23?");
     println!();
 
     // Generate response with function calling
     println!("📡 Making API request...");
-    let response = match provider.generate(&conversation, &cfg).await {
+    let response = match provider.generate(&conversation, cfg.raw()).await {
         Ok(response) => {
             println!("✅ API request successful");
             response
@@ -308,7 +309,7 @@ async fn main() -> Result<(), Error> {
         println!();
         println!("🔁 Sending function results back to AI...");
 
-        current_response = provider.generate(&conversation, &cfg).await?;
+        current_response = provider.generate(&conversation, cfg.raw()).await?;
     }
 
     println!();

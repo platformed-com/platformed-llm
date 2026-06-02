@@ -174,9 +174,9 @@ async fn send_to_openai(prompt: &Prompt) -> Value {
         "http://placeholder".into(),
         Transport::new(transport),
     );
-    let cfg = Config::new("gpt-4");
+    let cfg = Config::new("gpt-4").build();
     let _ = provider
-        .generate(prompt, &cfg)
+        .generate(prompt, cfg.raw())
         .await
         .expect("generate succeeded");
     let bytes = body.lock().unwrap().clone().expect("body captured");
@@ -187,9 +187,9 @@ async fn send_to_gemini(prompt: &Prompt) -> Value {
     let (transport, body) = CapturingTransport::new(GEMINI_TRIVIAL_RESPONSE);
     let endpoint = VertexEndpoint::with_access_token("p".into(), "us-east1".into(), "tok".into());
     let provider = GoogleProvider::with_transport(endpoint, Transport::new(transport));
-    let cfg = Config::new("gemini");
+    let cfg = Config::new("gemini").build();
     let _ = provider
-        .generate(prompt, &cfg)
+        .generate(prompt, cfg.raw())
         .await
         .expect("generate succeeded");
     let bytes = body.lock().unwrap().clone().expect("body captured");
@@ -200,9 +200,9 @@ async fn send_to_anthropic(prompt: &Prompt) -> Value {
     let (transport, body) = CapturingTransport::new(ANTHROPIC_TRIVIAL_RESPONSE);
     let endpoint = VertexEndpoint::with_access_token("p".into(), "us-east1".into(), "tok".into());
     let provider = AnthropicViaVertexProvider::with_transport(endpoint, Transport::new(transport));
-    let cfg = Config::new("claude-3");
+    let cfg = Config::new("claude-3").build();
     let _ = provider
-        .generate(prompt, &cfg)
+        .generate(prompt, cfg.raw())
         .await
         .expect("generate succeeded");
     let bytes = body.lock().unwrap().clone().expect("body captured");

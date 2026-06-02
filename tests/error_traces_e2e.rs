@@ -136,7 +136,7 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
         body: trace.body.clone(),
     });
     let prompt = Prompt::user("hi");
-    let cfg = Config::new("model");
+    let cfg = Config::new("model").build();
     match trace.provider {
         Provider::OpenAI => {
             let p = OpenAIProvider::with_transport(
@@ -144,7 +144,7 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
                 "http://placeholder".to_string(),
                 transport,
             );
-            p.generate(&prompt, &cfg)
+            p.generate(&prompt, cfg.raw())
                 .await
                 .err()
                 .expect("4xx must produce an error")
@@ -156,7 +156,7 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
                 "tok".to_string(),
             );
             GoogleProvider::with_transport(endpoint, transport)
-                .generate(&prompt, &cfg)
+                .generate(&prompt, cfg.raw())
                 .await
                 .err()
                 .expect("4xx must produce an error")

@@ -428,7 +428,7 @@ fn scenario_to_llm_request(
         }
     }
 
-    Ok((prompt, cfg))
+    Ok((prompt, cfg.build()))
 }
 
 fn parse_reasoning(v: &Value) -> Result<ReasoningConfig, String> {
@@ -731,7 +731,7 @@ async fn run_provider<P: platformed_llm::Provider + ?Sized>(
     prompt: &Prompt,
     config: &Config,
 ) -> Result<(), Error> {
-    let response = provider.generate(prompt, config).await?;
+    let response = provider.generate(prompt, config.raw()).await?;
     let mut stream = response.stream();
     while let Some(ev) = stream.next().await {
         // A streaming-level error becomes our error too.

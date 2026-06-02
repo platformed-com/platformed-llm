@@ -52,9 +52,9 @@ async fn local_generation_smoke_test() {
     };
 
     let prompt = Prompt::user("Say hello in one word.");
-    let cfg = Config::new("smollm2-135m-instruct").max_tokens(16);
+    let cfg = Config::new("smollm2-135m-instruct").max_tokens(16).build();
     let response = provider
-        .generate(&prompt, &cfg)
+        .generate(&prompt, cfg.raw())
         .await
         .expect("generate succeeded");
     let text = response.text().await.expect("buffered text");
