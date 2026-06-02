@@ -69,6 +69,10 @@ required-features = ["vertex"]
 name = "capture_traces"
 required-features = ["openai", "google", "anthropic-vertex"]
 
+[[example]]
+name = "mock_provider"
+required-features = ["mock"]
+
 [dev-dependencies]
 tokio = { version = "1.40", features = ["macros", "rt", "rt-multi-thread", "process"] }
 # Lib leaves TLS to the downstream consumer; tests/examples need to make
@@ -101,6 +105,11 @@ anthropic-vertex = ["vertex"]
 # Enables `tokio/rt` so we can shuttle synchronous inference onto
 # `spawn_blocking`; `async-stream` powers the token-decode pipeline.
 llama-gguf = ["dep:llama-gguf", "dep:async-stream", "tokio/rt", "tokio/sync"]
+
+# In-process mock provider returning canned responses, for testing
+# downstream code without network or credentials. Pure core types — no
+# extra dependencies. Enable it under `[dev-dependencies]`.
+mock = []
 
 # Internal: gate for the `fetch-test-models` binary. Pulls in
 # `rustls-tls` + a multi-thread Tokio runtime so the bin can make

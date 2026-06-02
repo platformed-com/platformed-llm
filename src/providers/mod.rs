@@ -8,9 +8,12 @@
 //! - `anthropic-vertex` — Anthropic Claude via Vertex AI
 //!   (`AnthropicViaVertexProvider`).
 //! - `llama-gguf` — Local GGUF inference (`LlamaGgufProvider`).
+//! - `mock` — In-process canned responses for testing (`MockProvider`).
 //!
 //! No features are enabled by default — opt in per provider.
 
+#[cfg(feature = "mock")]
+pub mod mock;
 #[cfg(feature = "openai")]
 mod openai;
 #[cfg(any(feature = "openai", feature = "google", feature = "anthropic-vertex"))]
@@ -32,6 +35,9 @@ pub use vertex::VertexEndpoint;
 
 #[cfg(feature = "llama-gguf")]
 pub use local::LlamaGgufProvider;
+
+#[cfg(feature = "mock")]
+pub use mock::{CallLog, Chunking, MockProvider, MockProviderBuilder, MockResponse, RecordedCall};
 
 /// Best-effort flatten of a tool-result content array into a single
 /// string. Tool-result wire shapes accept only plain text on OpenAI's
