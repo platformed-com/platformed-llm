@@ -7,9 +7,10 @@
 //!   [`Capabilities`]. If over the threshold, summarize-and-rebuild
 //!   before the next user message.
 //! - If a turn fails with [`Error::ContextWindowExceeded`] (the
-//!   single message itself overflowed the window), drop the live
-//!   user message, compact the prior history with the live message
-//!   held out as the tail, and retry once.
+//!   single message itself overflowed the window), compact the prior
+//!   history, then re-attach the live user message and retry once.
+//!   `Compactor::compact` returns `[system, assistant-memo]`; the
+//!   caller appends the next turn — see `send_with_recovery` below.
 //!
 //! The compaction prompt itself lives in the library
 //! ([`DEFAULT_SUMMARIZATION_INSTRUCTION`]), informed by aider's
@@ -107,9 +108,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 "  [compacting at {:.1}% context…]",
                 caps.context_usage_fraction(&response.usage) * 100.0,
             );
-            conversation = compactor
-                .compact(&*provider, &config, conversation, None)
-                .await?;
+            conversation = compactor.compact(&*provider, &config, conversation).await?;
             println!("  [done; conversation rebuilt from summary]\n");
         }
     }
@@ -122,8 +121,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 ///
 /// Recovers from `Error::ContextWindowExceeded` once: the live user
 /// message couldn't fit alongside the existing history, so we
-/// compact the prior history (holding `user_msg` out as the tail
-/// turn), then retry. Subsequent failures propagate.
+/// compact the prior history, append the live message on top of the
+/// rebuilt prompt, and retry. Subsequent failures propagate.
 async fn send_with_recovery(
     provider: &dyn Provider,
     config: &Config,
@@ -150,17 +149,16 @@ async fn send_with_recovery(
         Err(Error::ContextWindowExceeded { message, .. }) => {
             eprintln!("  [context window exceeded mid-turn: {message}]");
             eprintln!("  [compacting prior history and retrying…]");
-            // Compact the prior history. `tail_user_msg` re-attaches
-            // the live message at the end of the rebuilt prompt, so
-            // we send the rebuilt prompt as-is on the retry rather
-            // than reconstructing it.
-            let rebuilt = compactor
-                .compact(provider, config, conversation, Some(user_msg))
-                .await?;
-            let response = generate(provider, &rebuilt, config).await?.buffer().await?;
-            // `rebuilt` already includes the tail user message; commit
-            // the response on top.
-            let next = rebuilt.with_response(&response);
+            // Compact returns `[system, assistant-memo]`; we attach
+            // the live user message on top and retry. This is the
+            // same shape as the happy path's
+            // `conversation.with_user(user_msg)` — the only
+            // difference is `conversation` is now the compacted
+            // rebuild rather than the bloated original.
+            let rebuilt = compactor.compact(provider, config, conversation).await?;
+            let retry = rebuilt.clone().with_user(user_msg);
+            let response = generate(provider, &retry, config).await?.buffer().await?;
+            let next = rebuilt.with_user(user_msg).with_response(&response);
             Ok((response, next))
         }
         Err(e) => Err(e),

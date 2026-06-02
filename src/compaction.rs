@@ -172,16 +172,27 @@ impl Compactor {
 
     /// Rewrite `history` as a compacted prompt: ask the model to
     /// summarize the conversation so far into a dense memo, then
-    /// rebuild as `[original system, synthetic assistant memo,
-    /// optional tail user turn]`.
+    /// rebuild as `[original system, synthetic assistant memo]`.
     ///
-    /// `tail_user_msg` is held out of the summary and re-attached as
-    /// the final user turn of the returned prompt. Use it when
-    /// retrying a turn that itself overflowed the context window —
-    /// the live question continues to look like a fresh user request
-    /// rather than getting absorbed into the summary's framing.
-    /// Pass `None` for the proactive case (compact after a successful
-    /// turn, before the next user input arrives).
+    /// The returned prompt is *ready to continue from* — callers
+    /// append whatever the next turn looks like (a fresh user
+    /// message, a multipart user turn with attachments, a
+    /// tool-result, etc.) using the normal `Prompt` builder methods.
+    /// The library doesn't take an opinion on what that next turn
+    /// is, because user turns aren't always plain strings (they may
+    /// carry images, tool results, cache breakpoints) and callers
+    /// already own that construction.
+    ///
+    /// The recovery pattern after a mid-turn
+    /// [`Error::ContextWindowExceeded`]:
+    ///
+    /// ```ignore
+    /// let rebuilt = compactor
+    ///     .compact(&*provider, &config, history)
+    ///     .await?
+    ///     .with_user(live_user_msg); // the request that failed
+    /// let response = generate(&*provider, &rebuilt, &config).await?.buffer().await?;
+    /// ```
     ///
     /// The summarization request itself goes through the same
     /// `provider` + `config` (so it'll honor the active middleware
@@ -194,7 +205,6 @@ impl Compactor {
         provider: &dyn Provider,
         config: &Config,
         history: Prompt,
-        tail_user_msg: Option<&str>,
     ) -> Result<Prompt, Error> {
         let original_system = extract_first_system(&history);
 
@@ -205,15 +215,11 @@ impl Compactor {
             .await?;
         let summary = summary_response.text();
 
-        let mut rebuilt = match original_system {
+        let rebuilt = match original_system {
             Some(s) => Prompt::system(s),
             None => Prompt::new(),
         };
-        rebuilt = rebuilt.with_assistant(format!("{}{}", self.memo_prefix, summary.trim()));
-        if let Some(msg) = tail_user_msg {
-            rebuilt = rebuilt.with_user(msg);
-        }
-        Ok(rebuilt)
+        Ok(rebuilt.with_assistant(format!("{}{}", self.memo_prefix, summary.trim())))
     }
 }
 
@@ -285,7 +291,7 @@ mod tests {
             .with_assistant("Sunny.");
 
         let compacted = Compactor::new()
-            .compact(&provider, &config, history, None)
+            .compact(&provider, &config, history)
             .await
             .unwrap();
         let items = compacted.items();
@@ -307,8 +313,11 @@ mod tests {
         }
     }
 
+    /// `compact()` returns just `[system, assistant-memo]` — the
+    /// caller appends the next turn themselves. This test pins that
+    /// shape and demonstrates the standard caller-side append.
     #[tokio::test]
-    async fn compact_with_tail_appends_held_out_user_message() {
+    async fn caller_attaches_next_turn_after_compaction() {
         let provider = MockProvider::builder()
             .reply(MockResponse::text("memo"))
             .build();
@@ -316,17 +325,24 @@ mod tests {
         let history = Prompt::system("sys").with_user("earlier");
 
         let compacted = Compactor::new()
-            .compact(&provider, &config, history, Some("what should I do next?"))
+            .compact(&provider, &config, history)
             .await
             .unwrap();
-        let items = compacted.items();
-        // [system, assistant(memo), user(tail)].
-        assert_eq!(items.len(), 3);
-        match &items[2] {
-            InputItem::User { content } => match &content[0] {
-                UserPart::Text(t) => assert_eq!(t, "what should I do next?"),
-                other => panic!("expected text user part, got {other:?}"),
-            },
+        // Rebuilt prompt is exactly [system, assistant-memo].
+        assert_eq!(compacted.items().len(), 2);
+
+        // Callers attach whatever the next turn looks like — here a
+        // multipart user message demonstrates that the lib doesn't
+        // need a string-shaped hook.
+        let with_next = compacted.with_item(InputItem::User {
+            content: vec![
+                UserPart::Text("what should I do next?".into()),
+                UserPart::Text(" (with structure)".into()),
+            ],
+        });
+        assert_eq!(with_next.items().len(), 3);
+        match with_next.items().last().unwrap() {
+            InputItem::User { content } => assert_eq!(content.len(), 2),
             other => panic!("expected user turn, got {other:?}"),
         }
     }
@@ -341,7 +357,7 @@ mod tests {
         let history = Prompt::user("hi").with_assistant("hello");
 
         let compacted = Compactor::new()
-            .compact(&provider, &config, history, None)
+            .compact(&provider, &config, history)
             .await
             .unwrap();
         // First item is the assistant-memo (no system was preserved).
@@ -362,7 +378,7 @@ mod tests {
         let config = Config::builder("test-model").build();
         let history = Prompt::system("sys").with_user("ask").with_assistant("ans");
         let _ = Compactor::new()
-            .compact(&provider, &config, history, None)
+            .compact(&provider, &config, history)
             .await
             .unwrap();
         let calls = log.calls();
