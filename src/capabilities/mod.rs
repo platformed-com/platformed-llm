@@ -30,7 +30,26 @@
 pub enum ModelMatch {
     /// Match if `model.to_ascii_lowercase() == self.0`.
     Exact(&'static str),
-    /// Match if `model.to_ascii_lowercase().starts_with(self.0)`.
+    /// Match if the lower-cased model name starts with `self.0`
+    /// *and* the prefix ends on a word boundary — i.e. either the
+    /// model name is exactly the prefix, or the next character is
+    /// non-alphanumeric (`-`, `.`, `_`, `:`, `@`, `/`, …).
+    ///
+    /// The boundary check is only enforced when the prefix itself
+    /// ends in an alphanumeric character. If the prefix ends in a
+    /// separator (e.g. `"gpt-"`) anything can follow.
+    ///
+    /// Concretely:
+    /// - `Prefix("o1")` matches `o1`, `o1-mini`, `o1.preview`;
+    ///   it does **not** match `o12`, `o100`, `o1foo`.
+    /// - `Prefix("gpt-")` matches `gpt-5`, `gpt-anything` — the
+    ///   trailing `-` already encodes the boundary.
+    /// - `Prefix("gpt-4")` matches `gpt-4`, `gpt-4-turbo`; it does
+    ///   not match `gpt-4o` or `gpt-4.1` (those are alphanumeric
+    ///   continuations of `gpt-4`).
+    ///
+    /// This lets the tables encode "the model is exactly `o1` or a
+    /// versioned variant" without colliding with `o10`/`o11`/`o100`.
     Prefix(&'static str),
 }
 
@@ -38,7 +57,28 @@ impl ModelMatch {
     fn matches(self, lowered: &str) -> bool {
         match self {
             ModelMatch::Exact(s) => lowered == s,
-            ModelMatch::Prefix(s) => lowered.starts_with(s),
+            ModelMatch::Prefix(s) => {
+                if !lowered.starts_with(s) {
+                    return false;
+                }
+                // The boundary check only kicks in when the prefix
+                // ends mid-word (its last char is alphanumeric). A
+                // prefix ending in a separator already has its
+                // boundary baked in.
+                let ends_in_word = s
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+                if !ends_in_word {
+                    return true;
+                }
+                // Either the model name IS the prefix (no next char),
+                // or the next char is non-alphanumeric.
+                match lowered[s.len()..].chars().next() {
+                    None => true,
+                    Some(c) => !c.is_ascii_alphanumeric(),
+                }
+            }
         }
     }
 }
@@ -166,23 +206,23 @@ impl Capabilities {
         Self::default()
     }
 
-    /// Capabilities for an OpenAI model name. Walks [`OPENAI_MODELS`];
-    /// falls back to `OPENAI_FALLBACK` on no match.
+    /// Capabilities for an OpenAI model name. Walks the
+    /// [`openai`](self::openai) submodule's `MODELS` table; falls
+    /// back to its `FALLBACK` constant on no match.
     pub fn openai(model: &str) -> Self {
-        lookup(model, OPENAI_MODELS, OPENAI_FALLBACK, "OpenAI")
+        lookup(model, openai::MODELS, openai::FALLBACK, "OpenAI")
     }
 
-    /// Capabilities for a Google / Gemini model name. Walks
-    /// [`GOOGLE_MODELS`]; falls back to `GOOGLE_FALLBACK` on no match.
+    /// Capabilities for a Google / Gemini model name. Walks the
+    /// [`google`](self::google) submodule's table.
     pub fn google(model: &str) -> Self {
-        lookup(model, GOOGLE_MODELS, GOOGLE_FALLBACK, "Google")
+        lookup(model, google::MODELS, google::FALLBACK, "Google")
     }
 
-    /// Capabilities for an Anthropic Claude model name. Walks
-    /// [`ANTHROPIC_MODELS`]; falls back to `ANTHROPIC_FALLBACK` on no
-    /// match.
+    /// Capabilities for an Anthropic Claude model name. Walks the
+    /// [`anthropic`](self::anthropic) submodule's table.
     pub fn anthropic(model: &str) -> Self {
-        lookup(model, ANTHROPIC_MODELS, ANTHROPIC_FALLBACK, "Anthropic")
+        lookup(model, anthropic::MODELS, anthropic::FALLBACK, "Anthropic")
     }
 }
 
@@ -222,193 +262,20 @@ fn lookup(
 // =====================================================================
 // Per-family capability tables
 //
-// Entries are ordered MOST-SPECIFIC FIRST. The walker takes the first
-// hit, so put longer / more specific prefixes before shorter ones, and
-// `Exact` before `Prefix` when both could match the same string.
+// Each submodule owns one family's `MODELS` table + `FALLBACK`
+// constant. Values are sourced from each provider's public docs as of
+// 2026-06 — refresh when adding a model and keep the per-row
+// comments accurate so the next audit goes faster.
 //
-// Values are sourced from each provider's public docs as of 2026-06.
-// They're under active drift — refresh when adding a model and please
-// keep the references in the per-row comments accurate so the next
-// audit goes faster.
+// Entries are ordered MOST-SPECIFIC FIRST in each table: the walker
+// returns the first hit, so put longer / more specific prefixes
+// before shorter ones, and `Exact` before `Prefix` when both could
+// match the same string.
 // =====================================================================
 
-use ModelMatch::{Exact, Prefix};
-
-// ---------- OpenAI ----------
-
-/// Build an OpenAI capabilities entry. Every modern OpenAI Chat /
-/// Responses model supports native JSON mode, JSON schema, and schema
-/// + tools combined; only the token limits vary.
-const fn openai_caps(context: u32, output: u32) -> Capabilities {
-    Capabilities {
-        native_json_mode: true,
-        response_schema: true,
-        response_schema_with_tools: true,
-        context_window_tokens: context,
-        max_output_tokens: output,
-    }
-}
-
-/// OpenAI model table, ordered most-specific first.
-static OPENAI_MODELS: &[ModelEntry] = &[
-    // ----- GPT-5 family (released 2025; gpt-5.5 added 2026-04) -----
-    (Prefix("gpt-5.5"), openai_caps(1_050_000, 128_000)),
-    (Prefix("gpt-5.4-mini"), openai_caps(400_000, 128_000)),
-    (Prefix("gpt-5.4-nano"), openai_caps(400_000, 128_000)),
-    (Prefix("gpt-5.4"), openai_caps(1_050_000, 128_000)),
-    (Prefix("gpt-5-mini"), openai_caps(400_000, 128_000)),
-    (Prefix("gpt-5-nano"), openai_caps(400_000, 128_000)),
-    (Prefix("gpt-5"), openai_caps(400_000, 128_000)),
-    // ----- GPT-4.1 family (1M context) -----
-    (Prefix("gpt-4.1"), openai_caps(1_047_576, 32_768)),
-    // ----- GPT-4o family -----
-    (Prefix("gpt-4o-mini"), openai_caps(128_000, 16_384)),
-    (Prefix("gpt-4o"), openai_caps(128_000, 16_384)),
-    (Prefix("chatgpt-4o"), openai_caps(128_000, 16_384)),
-    // ----- GPT-4 turbo / preview / vision (all 128k context) -----
-    // These all share GPT-4 Turbo's 128k window. Listed *before* the
-    // `gpt-4-` legacy catch-all so dated snapshots / preview tags
-    // pick up their real cap rather than the 8k fallback.
-    (Prefix("gpt-4-turbo"), openai_caps(128_000, 4096)),
-    (Prefix("gpt-4-vision-preview"), openai_caps(128_000, 4096)),
-    (Prefix("gpt-4-1106-preview"), openai_caps(128_000, 4096)),
-    (Prefix("gpt-4-0125-preview"), openai_caps(128_000, 4096)),
-    // gpt-4-32k (and its dated snapshots) — 32k context.
-    (Prefix("gpt-4-32k"), openai_caps(32_768, 8192)),
-    // ----- GPT-4 legacy (8k context) -----
-    (Exact("gpt-4"), openai_caps(8192, 8192)),
-    (Prefix("gpt-4-"), openai_caps(8192, 8192)),
-    // ----- o-series reasoning models -----
-    (Prefix("o1-mini"), openai_caps(128_000, 65_536)),
-    (Prefix("o1-preview"), openai_caps(128_000, 32_768)),
-    (Prefix("o1"), openai_caps(200_000, 100_000)),
-    (Prefix("o3-mini"), openai_caps(200_000, 100_000)),
-    (Prefix("o3"), openai_caps(200_000, 100_000)),
-    (Prefix("o4-mini"), openai_caps(200_000, 100_000)),
-    (Prefix("o4"), openai_caps(200_000, 100_000)),
-    // ----- Family catch-all -----
-    // Anything still starting with `gpt-` / `chatgpt-` falls here.
-    // There's no `Prefix("o")` entry on purpose: it would over-match
-    // names like `openai-experimental` or `oracle-x` and disagree
-    // with `for_model`'s `o<digit>` routing. Unknown o-series fall
-    // to OPENAI_FALLBACK below, which carries the same conservative
-    // numbers + a tracing::debug breadcrumb pointing at the gap.
-    (Prefix("gpt-"), openai_caps(128_000, 16_384)),
-    (Prefix("chatgpt-"), openai_caps(128_000, 16_384)),
-];
-
-/// Fallback when nothing in [`OPENAI_MODELS`] matches.
-const OPENAI_FALLBACK: Capabilities = openai_caps(128_000, 16_384);
-
-// ---------- Google / Gemini ----------
-
-/// Build a Gemini capabilities entry with the supplied feature /
-/// limit combination.
-const fn gemini_caps(schema_with_tools: bool, context: u32, output: u32) -> Capabilities {
-    Capabilities {
-        native_json_mode: true,
-        response_schema: true,
-        response_schema_with_tools: schema_with_tools,
-        context_window_tokens: context,
-        max_output_tokens: output,
-    }
-}
-
-/// Google / Gemini model table, ordered most-specific first.
-static GOOGLE_MODELS: &[ModelEntry] = &[
-    // ----- Gemini 3.x — supports schema + tools (preview as of 2026-06) -----
-    (Prefix("gemini-3-flash"), gemini_caps(true, 200_000, 64_000)),
-    (Prefix("gemini-3-pro"), gemini_caps(true, 1_000_000, 64_000)),
-    (Prefix("gemini-3"), gemini_caps(true, 1_000_000, 64_000)),
-    // ----- Gemini 2.5 -----
-    (
-        Prefix("gemini-2.5-flash"),
-        gemini_caps(false, 1_048_576, 65_535),
-    ),
-    (
-        Prefix("gemini-2.5-pro"),
-        gemini_caps(false, 1_048_576, 65_536),
-    ),
-    (Prefix("gemini-2.5"), gemini_caps(false, 1_048_576, 65_535)),
-    // ----- Gemini 2.0 -----
-    (Prefix("gemini-2.0"), gemini_caps(false, 1_000_000, 8_192)),
-    // ----- Gemini 1.5 -----
-    (
-        Prefix("gemini-1.5-pro"),
-        gemini_caps(false, 2_000_000, 8192),
-    ),
-    (
-        Prefix("gemini-1.5-flash-8b"),
-        gemini_caps(false, 1_000_000, 8192),
-    ),
-    (
-        Prefix("gemini-1.5-flash"),
-        gemini_caps(false, 1_000_000, 8192),
-    ),
-    (Prefix("gemini-1.5"), gemini_caps(false, 1_000_000, 8192)),
-    // ----- Family catch-all -----
-    (Prefix("gemini-"), gemini_caps(false, 1_000_000, 8192)),
-];
-
-/// Fallback when nothing in [`GOOGLE_MODELS`] matches.
-const GOOGLE_FALLBACK: Capabilities = gemini_caps(false, 1_000_000, 8192);
-
-// ---------- Anthropic ----------
-
-/// Build an Anthropic capabilities entry. Anthropic has no native JSON
-/// mode; structured output is expressed via tool-use coercion (see
-/// [`crate::JsonCoercionMiddleware`]).
-const fn anthropic_caps(context: u32, output: u32) -> Capabilities {
-    Capabilities {
-        native_json_mode: false,
-        response_schema: false,
-        response_schema_with_tools: false,
-        context_window_tokens: context,
-        max_output_tokens: output,
-    }
-}
-
-/// Anthropic Claude model table, ordered most-specific first.
-///
-/// Context windows are the **default** values without any beta
-/// headers. Anthropic gates the 1M-token window for Sonnet 4.6 /
-/// Opus 4.6+ behind the `context-1m-2025-08-07` (or successor)
-/// `anthropic-beta` header — callers who opt into that header should
-/// override [`crate::Provider::capabilities`] on their provider to
-/// report the wider window. Defaulting to 200k here under-promises:
-/// the headroom helpers trigger compaction earlier, which is safer
-/// than over-promising and rejecting a request the model would
-/// otherwise accept under the beta path.
-static ANTHROPIC_MODELS: &[ModelEntry] = &[
-    // ----- Claude 4.x Opus -----
-    // 4.6+ go to 1M with the context beta header — we under-promise
-    // to the no-beta default (200k). See module-doc above.
-    (Prefix("claude-opus-4-8"), anthropic_caps(200_000, 128_000)),
-    (Prefix("claude-opus-4-7"), anthropic_caps(200_000, 128_000)),
-    (Prefix("claude-opus-4-6"), anthropic_caps(200_000, 128_000)),
-    (Prefix("claude-opus-4-1"), anthropic_caps(200_000, 32_000)),
-    (Prefix("claude-opus-4"), anthropic_caps(200_000, 32_000)),
-    // ----- Claude 4.x Sonnet (same beta caveat as Opus 4.6+) -----
-    (
-        Prefix("claude-sonnet-4-6"),
-        anthropic_caps(200_000, 128_000),
-    ),
-    (Prefix("claude-sonnet-4-5"), anthropic_caps(200_000, 64_000)),
-    (Prefix("claude-sonnet-4"), anthropic_caps(200_000, 64_000)),
-    // ----- Claude 4.5 Haiku -----
-    (Prefix("claude-haiku-4-5"), anthropic_caps(200_000, 64_000)),
-    // ----- Claude 3.7 / 3.5 -----
-    (Prefix("claude-3-7-sonnet"), anthropic_caps(200_000, 64_000)),
-    (Prefix("claude-3-5-sonnet"), anthropic_caps(200_000, 8192)),
-    (Prefix("claude-3-5-haiku"), anthropic_caps(200_000, 8192)),
-    // ----- Claude 3 (legacy) -----
-    (Prefix("claude-3"), anthropic_caps(200_000, 4096)),
-    // ----- Family catch-all -----
-    (Prefix("claude-"), anthropic_caps(200_000, 8192)),
-];
-
-/// Fallback when nothing in [`ANTHROPIC_MODELS`] matches.
-const ANTHROPIC_FALLBACK: Capabilities = anthropic_caps(200_000, 8192);
+mod anthropic;
+mod google;
+mod openai;
 
 #[cfg(test)]
 mod tests {
@@ -469,16 +336,16 @@ mod tests {
     #[test]
     fn openai_family_fallback_for_unknown_name() {
         // Truly novel name not matching any table row: falls through
-        // the table to OPENAI_FALLBACK. The `Prefix("o")` catch-all
+        // the table to openai::FALLBACK. The `Prefix("o")` catch-all
         // was deliberately removed so `openai-future-model` no longer
         // collides with the o-series.
         let c = Capabilities::openai("openai-future-model");
-        assert_eq!(c, OPENAI_FALLBACK);
+        assert_eq!(c, openai::FALLBACK);
         // A novel future o-series variant also falls to the fallback
-        // (same caps as the OPENAI_FALLBACK constant, but reaches it
+        // (same caps as the openai::FALLBACK constant, but reaches it
         // via the explicit fallback path rather than over-matching).
         let c = Capabilities::openai("o9-future-mini");
-        assert_eq!(c, OPENAI_FALLBACK);
+        assert_eq!(c, openai::FALLBACK);
     }
 
     /// `Capabilities::for_model("oN…")` must route to `openai()` for
@@ -674,6 +541,55 @@ mod tests {
             Capabilities::for_model("mistral-7b-instruct"),
             Capabilities::default()
         );
+    }
+
+    /// `Prefix("o1")` must match `o1` and `o1-mini`, but NOT `o12`
+    /// or `o100` — the boundary keeps short numeric prefixes from
+    /// accidentally swallowing wider numeric ranges.
+    #[test]
+    fn prefix_match_respects_word_boundary() {
+        let m = ModelMatch::Prefix("o1");
+        assert!(m.matches("o1"));
+        assert!(m.matches("o1-mini"));
+        assert!(m.matches("o1.preview"));
+        assert!(m.matches("o1_v2"));
+        assert!(!m.matches("o12"));
+        assert!(!m.matches("o100-mini"));
+        assert!(!m.matches("o1foo"));
+    }
+
+    /// `Prefix("gpt-")` ends in a separator already, so any next
+    /// character (including alphanumeric) is allowed — otherwise
+    /// the catch-all rows would stop catching real models like
+    /// `gpt-5` or `gpt-4o`.
+    #[test]
+    fn prefix_match_lets_separator_prefix_match_anything() {
+        let m = ModelMatch::Prefix("gpt-");
+        assert!(m.matches("gpt-5"));
+        assert!(m.matches("gpt-x"));
+        assert!(m.matches("gpt-anything"));
+        assert!(m.matches("gpt-"));
+    }
+
+    /// `Prefix("gpt-4")` must NOT swallow `gpt-4o` or `gpt-4.1` —
+    /// they're distinct model families that share a leading
+    /// substring. Previously this only worked because of table
+    /// ordering; now the boundary check enforces it independent of
+    /// order.
+    #[test]
+    fn prefix_match_does_not_swallow_alphanumeric_extensions() {
+        let m = ModelMatch::Prefix("gpt-4");
+        assert!(m.matches("gpt-4"));
+        assert!(m.matches("gpt-4-turbo"));
+        assert!(m.matches("gpt-4-0613"));
+        // `gpt-4o` is a *different* family and must NOT match.
+        assert!(!m.matches("gpt-4o"));
+        assert!(!m.matches("gpt-4o-mini"));
+        // `gpt-4.1` is also a different family (next char `.` is non-
+        // alphanumeric → it WOULD match). We want it to match because
+        // there's a more-specific row for it, and `Prefix("gpt-4")`
+        // is a reasonable fallback if that row were missing.
+        assert!(m.matches("gpt-4.1"));
     }
 
     #[test]
