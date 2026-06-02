@@ -10,10 +10,11 @@
 //! as a [`Middleware`].
 //!
 //! Each concrete middleware lives in its own submodule (e.g.
-//! [`json_coercion`] for the JSON-via-tool-coercion polyfill); this
-//! module owns the trait, the [`generate`] entry point, the
-//! [`validate`] post-middleware gate, and the
-//! [`default_middleware`] derivation from a capability set.
+//! [`crate::middleware::json_coercion`] for the JSON-via-tool-coercion
+//! polyfill); this module owns the trait, the [`generate`] entry
+//! point, the [`crate::middleware::validate`] post-middleware gate,
+//! and the [`crate::middleware::default_middleware`] derivation from
+//! a capability set.
 //!
 //! Pipeline (see [`generate`]):
 //! 1. Borrow the caller's `prompt` and `config.raw()` as `Cow::Borrowed`.
@@ -23,9 +24,9 @@
 //!    [`std::borrow::Cow::to_mut`] on the relevant Cow (cloning once,
 //!    paying for the modification it actually makes); no-op middleware
 //!    leave both Cows borrowed and add zero allocation.
-//! 3. Run [`validate`] against the *post-middleware* config. If a gap
-//!    remains, error fast — the provider never sees an unsupported
-//!    request.
+//! 3. Run [`crate::middleware::validate`] against the *post-middleware*
+//!    config. If a gap remains, error fast — the provider never sees
+//!    an unsupported request.
 //! 4. Call the provider with `&Prompt` and `&RawConfig` (Cow Deref).
 //! 5. Apply response transforms in **reverse** order (onion: the last
 //!    middleware to touch the request is the first to unwrap the

@@ -223,11 +223,13 @@ impl AnthropicViaVertexProvider {
                 "Anthropic provider does not support presence/frequency penalty; dropping"
             );
         }
-        // `config.response_format` is silently ignored here. Callers that
-        // want structured output on Anthropic should wrap this provider
-        // in `PolyfillingProvider`, which converts the request into a
-        // forced-tool-call and unwraps the result back to text. Without
-        // the middleware the field is just dropped — same as before.
+        // `config.response_format` is silently ignored here. Callers
+        // that want structured output on Anthropic should drive the
+        // request through `platformed_llm::generate`, which runs the
+        // default `JsonCoercionMiddleware` and rewrites the request as
+        // a forced-tool-call (unwrapped back to text on the response
+        // side). Calling `Provider::generate` directly bypasses
+        // middleware and the field is just dropped — same as before.
 
         Ok(anthropic_request)
     }

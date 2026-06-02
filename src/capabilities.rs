@@ -5,15 +5,18 @@
 //! tools but Gemini 2.5 cannot; Anthropic has no native JSON mode at
 //! all. [`Capabilities`] is the factual answer to *"what does this
 //! model support?"*; what to *do* about the answer (drop the field,
-//! warn, polyfill via tool-coercion, …) is the policy decision applied
-//! by [`crate::PolyfillingProvider`] above the provider layer.
+//! warn, polyfill via tool-coercion, …) is the policy decision
+//! applied by [`crate::middleware`] above the provider layer.
 //!
-//! Resolution order at request time:
-//! 1. If the caller set [`crate::Config::with_capabilities`] the override
-//!    wins.
-//! 2. Otherwise [`Capabilities::for_model`] dispatches by name prefix —
-//!    `gpt-*`/`o*`/`chatgpt-*` → OpenAI, `gemini-*` → Google,
-//!    `claude-*` → Anthropic.
+//! Resolution: at [`crate::generate`] time the active
+//! [`crate::Provider`] is asked via
+//! [`crate::Provider::capabilities`]. Hosted providers inherit the
+//! default impl which delegates to [`Capabilities::for_model`] —
+//! prefix-routed by name (`gpt-*`/`o*`/`chatgpt-*` → OpenAI,
+//! `gemini-*` → Google, `claude-*` → Anthropic). Providers whose
+//! models don't follow such a namespace (local inference, custom
+//! fine-tunes) override the trait method to report whatever they
+//! actually support.
 //!
 //! Matchers use prefix matching from most-recent to oldest family, with
 //! a final "unknown" fallback that returns the most-restrictive caps
@@ -63,8 +66,8 @@ impl Capabilities {
     ///
     /// In practice these namespaces don't collide across providers, so
     /// prefix routing is reliable; callers using a fine-tune or a model
-    /// the table doesn't recognize should set
-    /// [`crate::Config::with_capabilities`] explicitly.
+    /// the table doesn't recognize should override
+    /// [`crate::Provider::capabilities`] on their provider instead.
     pub fn for_model(model: &str) -> Self {
         let m = model.to_ascii_lowercase();
         if m.starts_with("gpt-")
