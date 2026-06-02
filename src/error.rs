@@ -64,6 +64,26 @@ pub enum Error {
     /// Model not available (typically a 404 on the model name).
     #[error("model not available: {0}")]
     ModelNotAvailable(String),
+
+    /// Request rejected because the prompt exceeded the model's
+    /// context window. Distinct from a generic
+    /// [`Self::Provider`] error so callers running long-lived
+    /// conversations can detect it cheaply and trigger compaction.
+    ///
+    /// Detection is best-effort: OpenAI reports this reliably via
+    /// `code: "context_length_exceeded"`; Anthropic and Google are
+    /// detected via message-string matching (their schemas don't
+    /// expose a stable typed code), so some context-exceeded errors
+    /// may still arrive as [`Self::Provider`] when the upstream
+    /// wording changes.
+    #[error("context window exceeded ({provider}): {message}")]
+    ContextWindowExceeded {
+        /// Short identifier of the provider that raised the error
+        /// (e.g. `"OpenAI"`, `"Anthropic"`, `"Google"`).
+        provider: &'static str,
+        /// Provider-supplied error description.
+        message: String,
+    },
 }
 
 impl Error {
@@ -126,6 +146,15 @@ impl Error {
     pub fn rate_limit(retry_after_seconds: Option<u64>, message: impl Into<String>) -> Self {
         Error::RateLimit {
             retry_after: retry_after_seconds.map(Duration::from_secs),
+            message: message.into(),
+        }
+    }
+
+    /// Build a context-window-exceeded error. Use this when a provider
+    /// 400 carries an unambiguous "too many tokens" signal.
+    pub fn context_window_exceeded(provider: &'static str, message: impl Into<String>) -> Self {
+        Error::ContextWindowExceeded {
+            provider,
             message: message.into(),
         }
     }

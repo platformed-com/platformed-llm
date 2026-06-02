@@ -362,6 +362,14 @@ pub(crate) fn parse_openai_error(
     let kind = parsed.as_ref().and_then(|e| e.kind).unwrap_or("");
     let code = parsed.as_ref().and_then(|e| e.code).unwrap_or("");
 
+    // Context-window detection: OpenAI reliably sets
+    // `code: "context_length_exceeded"` for this case; surface as a
+    // typed variant so callers driving long conversations can trigger
+    // compaction without parsing strings.
+    if code == "context_length_exceeded" {
+        return Error::context_window_exceeded("OpenAI", format!("HTTP {status}: {message}"));
+    }
+
     match status {
         401 => Error::auth_with_status(401, format!("OpenAI 401 ({kind} {code}): {message}")),
         429 => Error::rate_limit(
@@ -1121,6 +1129,23 @@ mod tests {
                 assert!(message.contains("rate_limit_error"));
             }
             other => panic!("expected RateLimit, got {other:?}"),
+        }
+    }
+
+    /// OpenAI reliably sets `code: "context_length_exceeded"` for
+    /// over-budget prompts — surface that as the typed
+    /// [`Error::ContextWindowExceeded`] so long-conversation callers
+    /// can branch without parsing strings.
+    #[test]
+    fn http_400_context_length_exceeded_is_typed() {
+        let body = r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        let err = parse_openai_error(400, None, body);
+        match err {
+            Error::ContextWindowExceeded { provider, message } => {
+                assert_eq!(provider, "OpenAI");
+                assert!(message.contains("maximum context length"));
+            }
+            other => panic!("expected ContextWindowExceeded, got {other:?}"),
         }
     }
 

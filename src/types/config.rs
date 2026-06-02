@@ -27,6 +27,17 @@ pub struct Usage {
     pub reasoning_tokens: Option<u32>,
 }
 
+impl Usage {
+    /// `input_tokens + output_tokens` — the total tokens charged for
+    /// this turn. Cache-read / cache-creation / reasoning fields are
+    /// already counted inside input / output respectively, so this
+    /// gives the right number for "how much of the context window did
+    /// this turn touch?".
+    pub fn total_tokens(&self) -> u32 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
 /// Reasoning configuration for models that support chain-of-thought
 /// (gpt-5 / o-series, Claude extended thinking, Gemini thinking).
 ///

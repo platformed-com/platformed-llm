@@ -28,9 +28,9 @@
 
 /// Feature support flags for a specific model.
 ///
-/// Fields default to the most-restrictive value (`false`) so a default
-/// [`Capabilities`] is safe to use anywhere — features must be
-/// explicitly opted into per model.
+/// Fields default to the most-restrictive value (`false` / `None`) so
+/// a default [`Capabilities`] is safe to use anywhere — features must
+/// be explicitly opted into per model.
 ///
 /// Marked `#[non_exhaustive]` so the library can add new capability
 /// flags in a minor release without breaking external callers'
@@ -55,6 +55,45 @@ pub struct Capabilities {
     /// tools in the same request. Gemini's documented sharp edge: only
     /// the 3.x family supports this combination.
     pub response_schema_with_tools: bool,
+    /// Total context-window size (input + output combined) in tokens,
+    /// or `None` when unknown. Used by compaction heuristics — see
+    /// [`Self::context_usage_fraction`] and
+    /// [`Self::would_exceed_context`]. Family defaults from the
+    /// matchers are conservative; callers that know the precise model
+    /// should override via [`crate::Provider::capabilities`].
+    pub context_window_tokens: Option<u32>,
+    /// Hard cap on output tokens in a single response, or `None` when
+    /// unknown or not separately specified. Most providers cap output
+    /// well below the full context window; setting `max_tokens` higher
+    /// than this is a caller error that will surface server-side.
+    pub max_output_tokens: Option<u32>,
+}
+
+impl Capabilities {
+    /// Fraction of the context window consumed by `usage.input_tokens
+    /// + usage.output_tokens` on the most recent turn.
+    ///
+    /// A value approaching 1.0 means the *next* turn — which has to
+    /// re-send this turn's history plus the assistant's response — is
+    /// at risk of either being truncated or rejected for exceeding
+    /// the context window. Typical compaction trigger is
+    /// `fraction > 0.7` or so.
+    ///
+    /// Returns `None` when [`Self::context_window_tokens`] is unknown.
+    pub fn context_usage_fraction(&self, usage: &crate::Usage) -> Option<f32> {
+        let window = self.context_window_tokens?;
+        if window == 0 {
+            return None;
+        }
+        Some(usage.total_tokens() as f32 / window as f32)
+    }
+
+    /// `true` if `tokens` strictly exceeds the model's
+    /// [`Self::context_window_tokens`]. Returns `None` when the window
+    /// is unknown — callers can't make a determination then.
+    pub fn would_exceed_context(&self, tokens: u32) -> Option<bool> {
+        Some(tokens > self.context_window_tokens?)
+    }
 }
 
 impl Capabilities {
@@ -92,6 +131,11 @@ impl Capabilities {
     /// mode, schema-constrained output, and combining schema with
     /// tools. The matcher is permissive: unknown `gpt-*` / `o*` /
     /// `chatgpt-*` IDs fall back to the full feature set.
+    ///
+    /// Context / output limits are conservative family-wide defaults
+    /// (`128k` context, `16k` output) — accurate for `gpt-4o` and most
+    /// `o*` variants but understates `gpt-5` / `gpt-4.1` and older
+    /// `gpt-4`'s 4k cap. Callers with precise needs should override.
     pub fn openai(model: &str) -> Self {
         let m = model.to_ascii_lowercase();
         if m.starts_with("gpt-") || is_openai_o_series(&m) || m.starts_with("chatgpt-") {
@@ -99,6 +143,8 @@ impl Capabilities {
                 native_json_mode: true,
                 response_schema: true,
                 response_schema_with_tools: true,
+                context_window_tokens: Some(128_000),
+                max_output_tokens: Some(16_000),
             };
         }
         tracing::debug!(
@@ -109,6 +155,8 @@ impl Capabilities {
             native_json_mode: true,
             response_schema: true,
             response_schema_with_tools: true,
+            context_window_tokens: Some(128_000),
+            max_output_tokens: Some(16_000),
         }
     }
 
@@ -120,6 +168,12 @@ impl Capabilities {
     /// in combination with tools. Unknown Gemini IDs fall back to the
     /// 2.5 baseline (the most-restrictive *currently shipping* family)
     /// with a `tracing::debug!`.
+    ///
+    /// Context / output limits are conservative family-wide defaults
+    /// (`1M` context, `8k` output) — matches `gemini-1.5-pro`,
+    /// `gemini-2.5-flash`, `gemini-2.5-pro`. Some sub-variants
+    /// (`gemini-1.5-flash-8b`) have smaller windows; override when it
+    /// matters.
     pub fn google(model: &str) -> Self {
         let m = model.to_ascii_lowercase();
         if m.starts_with("gemini-3") {
@@ -127,6 +181,8 @@ impl Capabilities {
                 native_json_mode: true,
                 response_schema: true,
                 response_schema_with_tools: true,
+                context_window_tokens: Some(1_000_000),
+                max_output_tokens: Some(8_000),
             };
         }
         if m.starts_with("gemini-2") || m.starts_with("gemini-1.5") {
@@ -134,6 +190,8 @@ impl Capabilities {
                 native_json_mode: true,
                 response_schema: true,
                 response_schema_with_tools: false,
+                context_window_tokens: Some(1_000_000),
+                max_output_tokens: Some(8_000),
             };
         }
         tracing::debug!(
@@ -144,6 +202,8 @@ impl Capabilities {
             native_json_mode: true,
             response_schema: true,
             response_schema_with_tools: false,
+            context_window_tokens: Some(1_000_000),
+            max_output_tokens: Some(8_000),
         }
     }
 
@@ -155,6 +215,11 @@ impl Capabilities {
     /// a function tool whose `input_schema` is the target shape. Every
     /// known Claude model therefore reports all JSON-related capabilities
     /// as `false`.
+    ///
+    /// Context / output limits: 200k context, 8k output — accurate for
+    /// `claude-3-5-sonnet` through `claude-sonnet-4-5` / `claude-opus-4-7`.
+    /// Some 4.x variants advertise 1M context in beta; override when
+    /// it matters.
     pub fn anthropic(model: &str) -> Self {
         let m = model.to_ascii_lowercase();
         if !(m.starts_with("claude-") || m.contains("claude")) {
@@ -163,7 +228,11 @@ impl Capabilities {
                 "unknown Anthropic model; falling back to baseline capabilities"
             );
         }
-        Self::default()
+        Self {
+            context_window_tokens: Some(200_000),
+            max_output_tokens: Some(8_000),
+            ..Self::default()
+        }
     }
 }
 
@@ -190,6 +259,58 @@ mod tests {
         assert!(!c.native_json_mode);
         assert!(!c.response_schema);
         assert!(!c.response_schema_with_tools);
+        assert_eq!(c.context_window_tokens, None);
+        assert_eq!(c.max_output_tokens, None);
+    }
+
+    #[test]
+    fn known_families_populate_token_limits() {
+        let openai = Capabilities::openai("gpt-4o");
+        assert_eq!(openai.context_window_tokens, Some(128_000));
+        assert_eq!(openai.max_output_tokens, Some(16_000));
+
+        let google = Capabilities::google("gemini-2.5-pro");
+        assert_eq!(google.context_window_tokens, Some(1_000_000));
+        assert_eq!(google.max_output_tokens, Some(8_000));
+
+        let anthropic = Capabilities::anthropic("claude-sonnet-4-5");
+        assert_eq!(anthropic.context_window_tokens, Some(200_000));
+        assert_eq!(anthropic.max_output_tokens, Some(8_000));
+    }
+
+    #[test]
+    fn context_usage_fraction_computes_against_window() {
+        use crate::Usage;
+        let caps = Capabilities::openai("gpt-4o"); // 128k window
+        let usage = Usage {
+            input_tokens: 96_000,
+            output_tokens: 16_000,
+            ..Usage::default()
+        };
+        let frac = caps.context_usage_fraction(&usage).unwrap();
+        assert!((frac - 0.875).abs() < 0.001, "got {frac}");
+    }
+
+    #[test]
+    fn context_usage_fraction_none_when_window_unknown() {
+        use crate::Usage;
+        let caps = Capabilities::default();
+        let usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 100,
+            ..Usage::default()
+        };
+        assert_eq!(caps.context_usage_fraction(&usage), None);
+    }
+
+    #[test]
+    fn would_exceed_context_compares_to_window() {
+        let caps = Capabilities::anthropic("claude-sonnet-4-5"); // 200k
+        assert_eq!(caps.would_exceed_context(150_000), Some(false));
+        assert_eq!(caps.would_exceed_context(200_001), Some(true));
+        assert_eq!(caps.would_exceed_context(200_000), Some(false));
+        // Unknown window → None
+        assert_eq!(Capabilities::default().would_exceed_context(1), None);
     }
 
     #[test]

@@ -40,6 +40,19 @@ impl CompleteResponse {
             .collect()
     }
 
+    /// `true` when the model stopped because it hit a token budget
+    /// (`max_tokens` cap or the context window itself) rather than
+    /// completing naturally. Tells callers the response was likely
+    /// cut short and they should consider raising `max_tokens`,
+    /// compacting the conversation, or retrying with a larger model.
+    ///
+    /// Mirrors `FinishReason::Length`; provided as a method so
+    /// downstream code doesn't have to depend on the enum directly
+    /// for this common check.
+    pub fn was_truncated(&self) -> bool {
+        matches!(self.finish_reason, FinishReason::Length)
+    }
+
     /// All tool calls emitted by the assistant, in emit order.
     pub fn function_calls(&self) -> Vec<&FunctionCall> {
         self.content
@@ -246,6 +259,47 @@ mod tests {
         let stream = futures_util::stream::iter(events);
         let err = Response::from_stream(stream).buffer().await.expect_err("");
         assert!(err.to_string().contains("model internal error"));
+    }
+
+    #[test]
+    fn was_truncated_reports_length_finish_reason() {
+        let empty_text = AssistantPart::Text {
+            content: String::new(),
+            annotations: Vec::new(),
+        };
+        let truncated = CompleteResponse {
+            content: vec![empty_text.clone()],
+            finish_reason: FinishReason::Length,
+            usage: Usage::default(),
+        };
+        assert!(truncated.was_truncated());
+
+        for reason in [
+            FinishReason::Stop,
+            FinishReason::ToolCalls,
+            FinishReason::ContentFilter,
+        ] {
+            let r = CompleteResponse {
+                content: vec![empty_text.clone()],
+                finish_reason: reason,
+                usage: Usage::default(),
+            };
+            assert!(
+                !r.was_truncated(),
+                "was_truncated should only fire for Length"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_total_tokens_sums_input_and_output() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Usage::default()
+        };
+        assert_eq!(usage.total_tokens(), 150);
+        assert_eq!(Usage::default().total_tokens(), 0);
     }
 
     #[test]

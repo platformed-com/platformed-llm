@@ -608,6 +608,7 @@ mod tests {
             native_json_mode: true,
             response_schema: true,
             response_schema_with_tools: true,
+            ..Capabilities::default()
         };
         assert!(default_middleware(&caps_full).is_empty());
 

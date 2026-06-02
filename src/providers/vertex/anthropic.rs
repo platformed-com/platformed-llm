@@ -422,6 +422,16 @@ impl Provider for AnthropicViaVertexProvider {
             let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
             let body_bytes = response.collect_body().await.unwrap_or_default();
             let body_text = String::from_utf8_lossy(&body_bytes);
+            // Anthropic doesn't expose a typed code for "too many input
+            // tokens" — detect via message-string match on 400s. The
+            // canonical phrasing as of 2026 is "prompt is too long" but
+            // the upstream may rephrase; this is best-effort.
+            if status == 400 && is_anthropic_context_exceeded(&body_text) {
+                return Err(Error::context_window_exceeded(
+                    "Anthropic",
+                    body_text.to_string(),
+                ));
+            }
             return Err(match status {
                 401 | 403 => {
                     Error::auth_with_status(status, format!("Anthropic {status}: {body_text}"))
@@ -504,6 +514,21 @@ pub(crate) struct StreamState {
 ///
 /// Until [`FinishReason`] is extended (Phase 5), `stop_sequence` and
 /// `pause_turn` collapse to `Stop` — the closest existing variant.
+/// Heuristic match for "input too long" 400s. Anthropic returns
+/// `invalid_request_error` with a free-form message and no typed code,
+/// so we look for the documented wording patterns. Conservative — a
+/// near-miss falls through to a generic provider error rather than
+/// claiming a context-window cause we're not sure of.
+fn is_anthropic_context_exceeded(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    (lower.contains("prompt is too long")
+        || lower.contains("input is too long")
+        || lower.contains("maximum")
+            && (lower.contains("tokens") || lower.contains("input length"))
+        || lower.contains("context window"))
+        && lower.contains("invalid_request_error")
+}
+
 pub(crate) fn map_anthropic_stop_reason(reason: Option<&str>) -> FinishReason {
     match reason {
         Some("end_turn") => FinishReason::Stop,
@@ -704,6 +729,25 @@ mod tests {
     fn provider() -> AnthropicViaVertexProvider {
         AnthropicViaVertexProvider::new("p".to_string(), "us-east5".to_string(), "tok".to_string())
             .unwrap()
+    }
+
+    #[test]
+    fn detect_context_exceeded_in_invalid_request_error() {
+        // Documented Anthropic phrasing.
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;
+        assert!(is_anthropic_context_exceeded(body));
+
+        // Alternate phrasing.
+        let body2 = r#"{"type":"error","error":{"type":"invalid_request_error","message":"input is too long for the model's context window"}}"#;
+        assert!(is_anthropic_context_exceeded(body2));
+
+        // A *different* invalid_request_error must not match.
+        let body3 = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages must contain at least one item"}}"#;
+        assert!(!is_anthropic_context_exceeded(body3));
+
+        // An error from a different category must not match either.
+        let body4 = r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        assert!(!is_anthropic_context_exceeded(body4));
     }
 
     #[test]
