@@ -28,9 +28,11 @@
 
 /// Feature support flags for a specific model.
 ///
-/// Fields default to the most-restrictive value (`false` / `None`) so
-/// a default [`Capabilities`] is safe to use anywhere — features must
-/// be explicitly opted into per model.
+/// Boolean fields default to the most-restrictive value (`false`);
+/// numeric token-limit fields default to deliberately conservative
+/// values (see [`Self::default`]) so the headroom helpers err on the
+/// side of triggering compaction earlier than necessary when the
+/// caller hasn't picked specific values.
 ///
 /// Marked `#[non_exhaustive]` so the library can add new capability
 /// flags in a minor release without breaking external callers'
@@ -40,7 +42,7 @@
 /// [`Self::anthropic`]). Within this crate full struct-literal
 /// construction is still permitted, so the matcher functions
 /// continue to read naturally.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Capabilities {
     /// Model natively supports bare-JSON output (no schema enforcement).
@@ -55,18 +57,37 @@ pub struct Capabilities {
     /// tools in the same request. Gemini's documented sharp edge: only
     /// the 3.x family supports this combination.
     pub response_schema_with_tools: bool,
-    /// Total context-window size (input + output combined) in tokens,
-    /// or `None` when unknown. Used by compaction heuristics — see
+    /// Total context-window size (input + output combined) in tokens.
+    /// Used by compaction heuristics — see
     /// [`Self::context_usage_fraction`] and
     /// [`Self::would_exceed_context`]. Family defaults from the
     /// matchers are conservative; callers that know the precise model
     /// should override via [`crate::Provider::capabilities`].
-    pub context_window_tokens: Option<u32>,
-    /// Hard cap on output tokens in a single response, or `None` when
-    /// unknown or not separately specified. Most providers cap output
-    /// well below the full context window; setting `max_tokens` higher
-    /// than this is a caller error that will surface server-side.
-    pub max_output_tokens: Option<u32>,
+    pub context_window_tokens: u32,
+    /// Hard cap on output tokens in a single response. Most providers
+    /// cap output well below the full context window; setting
+    /// `max_tokens` higher than this is a caller error that will
+    /// surface server-side.
+    pub max_output_tokens: u32,
+}
+
+impl Default for Capabilities {
+    /// Most-restrictive defaults: no native JSON / schema support, and
+    /// conservative token windows (`4096` context, `1024` output) that
+    /// roughly match the smallest model families anyone is still
+    /// using. Always overriding-friendly — the headroom helpers
+    /// against these values err on the side of triggering compaction
+    /// earlier than necessary, which is the safe direction for a
+    /// fallback.
+    fn default() -> Self {
+        Self {
+            native_json_mode: false,
+            response_schema: false,
+            response_schema_with_tools: false,
+            context_window_tokens: 4096,
+            max_output_tokens: 1024,
+        }
+    }
 }
 
 impl Capabilities {
@@ -78,21 +99,17 @@ impl Capabilities {
     /// at risk of either being truncated or rejected for exceeding
     /// the context window. Typical compaction trigger is
     /// `fraction > 0.7` or so.
-    ///
-    /// Returns `None` when [`Self::context_window_tokens`] is unknown.
-    pub fn context_usage_fraction(&self, usage: &crate::Usage) -> Option<f32> {
-        let window = self.context_window_tokens?;
-        if window == 0 {
-            return None;
+    pub fn context_usage_fraction(&self, usage: &crate::Usage) -> f32 {
+        if self.context_window_tokens == 0 {
+            return f32::INFINITY;
         }
-        Some(usage.total_tokens() as f32 / window as f32)
+        usage.total_tokens() as f32 / self.context_window_tokens as f32
     }
 
     /// `true` if `tokens` strictly exceeds the model's
-    /// [`Self::context_window_tokens`]. Returns `None` when the window
-    /// is unknown — callers can't make a determination then.
-    pub fn would_exceed_context(&self, tokens: u32) -> Option<bool> {
-        Some(tokens > self.context_window_tokens?)
+    /// [`Self::context_window_tokens`].
+    pub fn would_exceed_context(&self, tokens: u32) -> bool {
+        tokens > self.context_window_tokens
     }
 }
 
@@ -143,8 +160,8 @@ impl Capabilities {
                 native_json_mode: true,
                 response_schema: true,
                 response_schema_with_tools: true,
-                context_window_tokens: Some(128_000),
-                max_output_tokens: Some(16_000),
+                context_window_tokens: 128_000,
+                max_output_tokens: 16_000,
             };
         }
         tracing::debug!(
@@ -155,8 +172,8 @@ impl Capabilities {
             native_json_mode: true,
             response_schema: true,
             response_schema_with_tools: true,
-            context_window_tokens: Some(128_000),
-            max_output_tokens: Some(16_000),
+            context_window_tokens: 128_000,
+            max_output_tokens: 16_000,
         }
     }
 
@@ -181,8 +198,8 @@ impl Capabilities {
                 native_json_mode: true,
                 response_schema: true,
                 response_schema_with_tools: true,
-                context_window_tokens: Some(1_000_000),
-                max_output_tokens: Some(8_000),
+                context_window_tokens: 1_000_000,
+                max_output_tokens: 8_000,
             };
         }
         if m.starts_with("gemini-2") || m.starts_with("gemini-1.5") {
@@ -190,8 +207,8 @@ impl Capabilities {
                 native_json_mode: true,
                 response_schema: true,
                 response_schema_with_tools: false,
-                context_window_tokens: Some(1_000_000),
-                max_output_tokens: Some(8_000),
+                context_window_tokens: 1_000_000,
+                max_output_tokens: 8_000,
             };
         }
         tracing::debug!(
@@ -202,8 +219,8 @@ impl Capabilities {
             native_json_mode: true,
             response_schema: true,
             response_schema_with_tools: false,
-            context_window_tokens: Some(1_000_000),
-            max_output_tokens: Some(8_000),
+            context_window_tokens: 1_000_000,
+            max_output_tokens: 8_000,
         }
     }
 
@@ -229,8 +246,8 @@ impl Capabilities {
             );
         }
         Self {
-            context_window_tokens: Some(200_000),
-            max_output_tokens: Some(8_000),
+            context_window_tokens: 200_000,
+            max_output_tokens: 8_000,
             ..Self::default()
         }
     }
@@ -259,23 +276,25 @@ mod tests {
         assert!(!c.native_json_mode);
         assert!(!c.response_schema);
         assert!(!c.response_schema_with_tools);
-        assert_eq!(c.context_window_tokens, None);
-        assert_eq!(c.max_output_tokens, None);
+        // Conservative — small enough that the headroom helpers
+        // err on the side of triggering compaction early.
+        assert_eq!(c.context_window_tokens, 4096);
+        assert_eq!(c.max_output_tokens, 1024);
     }
 
     #[test]
     fn known_families_populate_token_limits() {
         let openai = Capabilities::openai("gpt-4o");
-        assert_eq!(openai.context_window_tokens, Some(128_000));
-        assert_eq!(openai.max_output_tokens, Some(16_000));
+        assert_eq!(openai.context_window_tokens, 128_000);
+        assert_eq!(openai.max_output_tokens, 16_000);
 
         let google = Capabilities::google("gemini-2.5-pro");
-        assert_eq!(google.context_window_tokens, Some(1_000_000));
-        assert_eq!(google.max_output_tokens, Some(8_000));
+        assert_eq!(google.context_window_tokens, 1_000_000);
+        assert_eq!(google.max_output_tokens, 8_000);
 
         let anthropic = Capabilities::anthropic("claude-sonnet-4-5");
-        assert_eq!(anthropic.context_window_tokens, Some(200_000));
-        assert_eq!(anthropic.max_output_tokens, Some(8_000));
+        assert_eq!(anthropic.context_window_tokens, 200_000);
+        assert_eq!(anthropic.max_output_tokens, 8_000);
     }
 
     #[test]
@@ -287,30 +306,34 @@ mod tests {
             output_tokens: 16_000,
             ..Usage::default()
         };
-        let frac = caps.context_usage_fraction(&usage).unwrap();
+        let frac = caps.context_usage_fraction(&usage);
         assert!((frac - 0.875).abs() < 0.001, "got {frac}");
     }
 
     #[test]
-    fn context_usage_fraction_none_when_window_unknown() {
+    fn context_usage_fraction_uses_default_window_when_unset() {
+        // `Capabilities::default()` is the fallback the library hands
+        // out for unknown models — conservative 4096-token window.
+        // The fraction still computes; callers don't have to handle
+        // an "unknown" state.
         use crate::Usage;
         let caps = Capabilities::default();
         let usage = Usage {
             input_tokens: 1000,
-            output_tokens: 100,
+            output_tokens: 1000,
             ..Usage::default()
         };
-        assert_eq!(caps.context_usage_fraction(&usage), None);
+        let frac = caps.context_usage_fraction(&usage);
+        // 2000 / 4096 ≈ 0.488
+        assert!((frac - (2000.0 / 4096.0)).abs() < 0.001, "got {frac}");
     }
 
     #[test]
     fn would_exceed_context_compares_to_window() {
         let caps = Capabilities::anthropic("claude-sonnet-4-5"); // 200k
-        assert_eq!(caps.would_exceed_context(150_000), Some(false));
-        assert_eq!(caps.would_exceed_context(200_001), Some(true));
-        assert_eq!(caps.would_exceed_context(200_000), Some(false));
-        // Unknown window → None
-        assert_eq!(Capabilities::default().would_exceed_context(1), None);
+        assert!(!caps.would_exceed_context(150_000));
+        assert!(caps.would_exceed_context(200_001));
+        assert!(!caps.would_exceed_context(200_000));
     }
 
     #[test]
