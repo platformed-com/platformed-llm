@@ -686,10 +686,25 @@ impl OpenAIStreamState {
     /// Process one OpenAI wire event into 0 or more `StreamEvent`s.
     pub(crate) fn process(&mut self, event: OpenAIStreamEvent) -> Result<Vec<StreamEvent>, Error> {
         match event {
-            OpenAIStreamEvent::Error { error } => Err(Error::provider(
-                "OpenAI",
-                format!("{}: {}", error.r#type, error.message),
-            )),
+            OpenAIStreamEvent::Error { error } => {
+                // OpenAI's Responses API returns 200 OK and emits the
+                // context-length error inside the SSE stream as an
+                // `event: error` frame with `code:
+                // context_length_exceeded`. Detect it here so callers
+                // driving long conversations get the typed
+                // `ContextWindowExceeded` variant instead of a generic
+                // streaming/provider error.
+                if error.code.as_deref() == Some("context_length_exceeded") {
+                    return Err(Error::context_window_exceeded(
+                        "OpenAI",
+                        format!("{}: {}", error.r#type, error.message),
+                    ));
+                }
+                Err(Error::provider(
+                    "OpenAI",
+                    format!("{}: {}", error.r#type, error.message),
+                ))
+            }
 
             // `response.id` is stable across created/in_progress/
             // completed frames — emit the Continuation part at

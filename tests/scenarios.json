@@ -151,10 +151,15 @@
 
     {
       "name": "context_window_exceeded",
-      "description": "Send a prompt deliberately larger than the model's context window so every provider returns its typed 'too many tokens' 4xx envelope. Pins the wire shape that maps onto `Error::ContextWindowExceeded`. The `content` here is a placeholder — the capture script should expand it to ~1.5x the target model's context window before sending (see capture_traces' oversize_prompt hook). All providers tested; each returns a different 400 envelope (OpenAI: `code: context_length_exceeded`; Anthropic: `invalid_request_error` with 'prompt is too long' wording; Google: `INVALID_ARGUMENT` with 'input token count exceeds'). Fixtures under `tests/cross_provider/traces/<provider>/context_window_exceeded.*` are hand-authored from the published error schemas until live captures replace them.",
+      "description": "Send a prompt deliberately larger than the model's context window so every provider surfaces its 'too many tokens' signal. Pins the wire shape that maps onto `Error::ContextWindowExceeded`. The `content` is a placeholder — `capture_traces` expands it to `oversize_user_content_bytes` UTF-8 bytes of Lorem ipsum filler (per provider, since context sizes vary by 3 orders of magnitude). Per-provider notes: OpenAI's Responses API returns HTTP 200 and emits the error inside the SSE stream as `event: error` with `code: context_length_exceeded` (gpt-4 used here — 8k context, so 80k bytes overflows safely); Google's Vertex returns HTTP 400 with `INVALID_ARGUMENT` and 'input token count exceeds maximum' (gemini-2.5-flash 1M context → 6MB filler); Anthropic via Vertex returns HTTP 400 with `invalid_request_error` and 'prompt is too long' wording — skipped here because the test project doesn't have Anthropic-on-Vertex enabled; the fixture under `traces/anthropic/` stays hand-authored from the documented schema and a maintainer with Anthropic Vertex access should re-capture it.",
       "expect_failure": true,
+      "providers": {
+        "openai":    { "model": "gpt-4", "oversize_user_content_bytes": 80000 },
+        "google":    { "oversize_user_content_bytes": 6000000 },
+        "anthropic": { "skip": true }
+      },
       "messages": [
-        { "role": "user", "content": "<<<expanded by capture_traces to overflow the context window>>>" }
+        { "role": "user", "content": "Hello." }
       ]
     },
 

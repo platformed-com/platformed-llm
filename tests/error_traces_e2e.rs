@@ -119,7 +119,16 @@ fn load_error_traces() -> Vec<ErrorTrace> {
                 Err(_) => continue,
             };
             let status = meta.get("status").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
-            if (200..300).contains(&status) {
+            let expect_failure = meta
+                .get("expect_failure")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // Skip 2xx captures unless the scenario explicitly expects
+            // failure — some providers (notably OpenAI's Responses API)
+            // return 200 OK and surface errors inside the SSE stream
+            // (e.g. `event: error` with `code:
+            // context_length_exceeded`), and those still belong here.
+            if (200..300).contains(&status) && !expect_failure {
                 continue;
             }
             let body = fs::read(&path).unwrap();
@@ -141,17 +150,19 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
     });
     let prompt = Prompt::user("hi");
     let cfg = Config::builder("model").build();
-    match trace.provider {
+    // `generate()` can succeed even on captures we expect to fail —
+    // OpenAI's Responses API returns 200 OK and surfaces the error
+    // inside the SSE stream, so the error only materializes when the
+    // caller drains the response. Run the full pipeline (generate +
+    // buffer) so both paths land in this `Error` result.
+    let outcome = match trace.provider {
         Provider::OpenAI => {
             let p = OpenAIProvider::with_transport(
                 "test".to_string(),
                 "http://placeholder".to_string(),
                 transport,
             );
-            generate(&p, &prompt, &cfg)
-                .await
-                .err()
-                .expect("4xx must produce an error")
+            generate_and_drain(&p, &prompt, &cfg).await
         }
         Provider::Google => {
             let endpoint = VertexEndpoint::with_access_token(
@@ -160,10 +171,7 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
                 "tok".to_string(),
             );
             let p = GoogleProvider::with_transport(endpoint, transport);
-            generate(&p, &prompt, &cfg)
-                .await
-                .err()
-                .expect("4xx must produce an error")
+            generate_and_drain(&p, &prompt, &cfg).await
         }
         Provider::Anthropic => {
             let endpoint = VertexEndpoint::with_access_token(
@@ -172,12 +180,22 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
                 "tok".to_string(),
             );
             let p = AnthropicViaVertexProvider::with_transport(endpoint, transport);
-            generate(&p, &prompt, &cfg)
-                .await
-                .err()
-                .expect("4xx must produce an error")
+            generate_and_drain(&p, &prompt, &cfg).await
         }
+    };
+    match outcome {
+        Ok(()) => panic!("captured failure must produce an error"),
+        Err(e) => e,
     }
+}
+
+async fn generate_and_drain(
+    provider: &dyn platformed_llm::Provider,
+    prompt: &Prompt,
+    cfg: &Config,
+) -> Result<(), Error> {
+    let response = generate(provider, prompt, cfg).await?;
+    response.buffer().await.map(|_| ())
 }
 
 /// For each captured error response, assert the typed [`Error`] variant

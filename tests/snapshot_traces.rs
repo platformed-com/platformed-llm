@@ -124,14 +124,23 @@ fn load_all_traces() -> Vec<Trace> {
                 .unwrap_or("model")
                 .to_string();
             // Error captures don't have an SSE-shaped body. They're
-            // exercised by `error_traces_e2e` instead.
+            // exercised by `error_traces_e2e` instead. Skip any trace
+            // whose meta declares it a failure capture — covers both
+            // the obvious non-2xx case AND OpenAI's
+            // `context_window_exceeded` shape, which returns HTTP 200
+            // and emits the error inside the SSE stream.
             let meta = read_json(&dir.join(format!("{scenario}.meta.json")));
             let status = meta
                 .as_ref()
                 .and_then(|v| v.get("status"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(200);
-            if status != 200 {
+            let expect_failure = meta
+                .as_ref()
+                .and_then(|v| v.get("expect_failure"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if status != 200 || expect_failure {
                 continue;
             }
             let response_sse = fs::read(&path).unwrap();

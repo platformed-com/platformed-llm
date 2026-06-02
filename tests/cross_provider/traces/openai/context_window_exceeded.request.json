@@ -6,7 +6,7 @@
       "type": "message"
     }
   ],
-  "model": "gpt-4o-mini",
+  "model": "gpt-4",
   "store": false,
   "stream": true
 }
