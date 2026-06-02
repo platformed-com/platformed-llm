@@ -1,75 +1,47 @@
 //! Interactive REPL with auto-compaction.
 //!
-//! Demonstrates the compaction primitives shipped with the lib:
+//! Demonstrates [`Compactor`] driving a long-running conversation:
 //!
-//! - [`Provider::capabilities`] tells us the model's context window.
-//! - [`Usage::total_tokens`] reports how much the last turn consumed.
-//! - [`Capabilities::context_usage_fraction`] turns that into a
-//!   `[0.0, 1.0]`-ish ratio.
+//! - After every successful turn, check [`Compactor::should_compact`]
+//!   against the response's [`Usage`] and the model's
+//!   [`Capabilities`]. If over the threshold, summarize-and-rebuild
+//!   before the next user message.
+//! - If a turn fails with [`Error::ContextWindowExceeded`] (the
+//!   single message itself overflowed the window), drop the live
+//!   user message, compact the prior history with the live message
+//!   held out as the tail, and retry once.
 //!
-//! When the ratio crosses `COMPACTION_THRESHOLD`, we ask the model to
-//! summarize the conversation so far into a compact memo and restart
-//! with `[system + summary + last user message]`. This is the same
-//! pattern the Claude CLI's `/compact` uses — collapse history into
-//! a dense recap, keep recent turns verbatim so the active focus
-//! doesn't get lost.
+//! The compaction prompt itself lives in the library
+//! ([`DEFAULT_SUMMARIZATION_INSTRUCTION`]), informed by aider's
+//! "user retelling" framing and the leaked Claude Code `/compact`
+//! anti-drift rules. See [`compaction`](platformed_llm::compaction)
+//! for the rationale.
 //!
 //! ## Usage
 //!
 //! ```text
 //! cargo run --example auto_compaction --features openai
-//! # or
-//! PROVIDER_TYPE=anthropic GOOGLE_CLOUD_PROJECT=... \
-//!   cargo run --example auto_compaction --features anthropic-vertex
 //! ```
 //!
-//! Type messages at the `>` prompt. Type `quit` or send EOF to exit.
-//! After each turn we print the context utilization; once it crosses
-//! the threshold the loop prints `(compacting…)` and rebuilds the
-//! prompt before the next turn.
-//!
-//! ## Things to look at
-//!
-//! - [`compact`] is the only meaningful logic — everything else is
-//!   plumbing.
-//! - We hold the last user message back from the summary and re-attach
-//!   it post-compaction, so the model's next turn still sees what the
-//!   user just asked. (Without this the summary would absorb the live
-//!   question into "the user is asking X" and the next response would
-//!   answer from the meta level.)
-//! - The summary instruction is deliberately terse and asks for a
-//!   memo — model-supplied preamble like "Here's a summary:" would
-//!   leak into the rebuilt prompt and confuse the next turn.
+//! Type messages at the `>` prompt. `quit`, `exit`, `:q`, or Ctrl-D
+//! to exit. After each turn the loop prints the context utilization;
+//! once it crosses the threshold the loop prints `[compacting…]`
+//! and rebuilds the prompt before the next turn.
 
-use std::error::Error;
+use std::error::Error as StdError;
 use std::io::{self, BufRead, Write};
 
-use platformed_llm::{generate, Capabilities, Config, Prompt, Provider, ProviderFactory};
-
-/// Trigger compaction when `context_usage_fraction` crosses this
-/// threshold. 0.7 (= 70%) leaves ~30% headroom for the next turn's
-/// input + output before we'd actually hit the context window.
-const COMPACTION_THRESHOLD: f32 = 0.7;
-
-/// The summarization instruction is appended as a final user turn
-/// when we want a recap. Kept terse — preamble like "Here's the
-/// summary:" would leak into the rebuilt prompt.
-const SUMMARIZATION_INSTRUCTION: &str = "\
-The conversation above will be discarded to free up context space. \
-Reply with a single dense, complete memo that captures every fact, \
-decision, open question, and named entity the next turn needs to \
-continue this conversation. Do not address the user; do not write \
-in second person; do not include any preamble like 'Here's a \
-summary'. Output only the memo.";
+use platformed_llm::compaction::DEFAULT_SUMMARIZATION_INSTRUCTION;
+use platformed_llm::{
+    generate, Capabilities, Compactor, CompleteResponse, Config, Error, Prompt, Provider,
+    ProviderFactory,
+};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn StdError>> {
     dotenvy::dotenv().ok();
     let provider = ProviderFactory::from_env().await?;
 
-    // We need both `&dyn Provider` (for `generate`) and the
-    // provider's name handle (for `capabilities`). Resolve the
-    // model once up front.
     let model = std::env::var("MODEL_NAME").unwrap_or_else(|_| {
         match std::env::var("PROVIDER_TYPE").as_deref() {
             Ok("anthropic") => "claude-sonnet-4-5".to_string(),
@@ -79,12 +51,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
     let caps = provider.capabilities(&model);
     let config = Config::builder(&model).build();
+    let compactor = Compactor::new(); // defaults: 0.7 threshold, library prompts
 
     println!(
         "Model: {} ({} token context, compaction at {:.0}%)",
         model,
         caps.context_window_tokens,
-        COMPACTION_THRESHOLD * 100.0,
+        compactor.threshold() * 100.0,
+    );
+    println!(
+        "Compaction instruction (first line): {}",
+        DEFAULT_SUMMARIZATION_INSTRUCTION
+            .lines()
+            .next()
+            .unwrap_or(""),
     );
     println!("Type a message at the prompt. `quit` or Ctrl-D to exit.\n");
 
@@ -103,36 +83,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if input.read_line(&mut line)? == 0 {
             break; // EOF
         }
-        let user_msg = line.trim();
+        let user_msg = line.trim().to_string();
         if user_msg.is_empty() {
             continue;
         }
-        if matches!(user_msg, "quit" | "exit" | ":q") {
+        if matches!(user_msg.as_str(), "quit" | "exit" | ":q") {
             break;
         }
 
-        conversation = conversation.with_user(user_msg);
-        let response = generate(&*provider, &conversation, &config)
-            .await?
-            .buffer()
-            .await?;
+        // `take()` the conversation so we can either thread it
+        // through the happy path or hand it to the compactor and
+        // rebuild — either way we replace it before the next loop.
+        let (response, next_conversation) =
+            send_with_recovery(&*provider, &config, &compactor, conversation, &user_msg).await?;
+        conversation = next_conversation;
+
         println!("\n{}\n", response.text());
+        report_usage(&caps, &response);
 
-        let fraction = caps.context_usage_fraction(&response.usage);
-        println!(
-            "  [context: {} input + {} output = {} / {} tokens ({:.1}% used)]",
-            response.usage.input_tokens,
-            response.usage.output_tokens,
-            response.usage.total_tokens(),
-            caps.context_window_tokens,
-            fraction * 100.0,
-        );
-
-        conversation = conversation.with_response(&response);
-
-        if fraction > COMPACTION_THRESHOLD {
-            println!("  [compacting…]");
-            conversation = compact(&*provider, &config, &caps, conversation, user_msg).await?;
+        // Proactive compaction once the threshold is crossed.
+        if compactor.should_compact(&caps, &response.usage) {
+            println!(
+                "  [compacting at {:.1}% context…]",
+                caps.context_usage_fraction(&response.usage) * 100.0,
+            );
+            conversation = compactor
+                .compact(&*provider, &config, conversation, None)
+                .await?;
             println!("  [done; conversation rebuilt from summary]\n");
         }
     }
@@ -140,47 +117,66 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Replace the conversation with `[system, "earlier conversation: <summary>", last_user_msg]`.
+/// Send `user_msg` against `conversation`. Returns
+/// `(response, updated conversation including the response)`.
 ///
-/// The summary is produced by the same model — we ask it to recap
-/// the whole conversation into a single memo, then drop the entire
-/// history and start over with that memo as a synthetic prior turn.
-/// The most recent user message is kept verbatim so the next
-/// response answers it directly rather than the meta-level "the
-/// user is asking X" framing it would get if it were swept into the
-/// summary.
-async fn compact(
+/// Recovers from `Error::ContextWindowExceeded` once: the live user
+/// message couldn't fit alongside the existing history, so we
+/// compact the prior history (holding `user_msg` out as the tail
+/// turn), then retry. Subsequent failures propagate.
+async fn send_with_recovery(
     provider: &dyn Provider,
     config: &Config,
-    caps: &Capabilities,
-    history: Prompt,
-    last_user_msg: &str,
-) -> Result<Prompt, Box<dyn Error>> {
-    // Ask the model for the recap. We append the instruction as a
-    // final user turn to the existing history so the model has the
-    // full conversation in context when producing the summary.
-    let summary_prompt = history.with_user(SUMMARIZATION_INSTRUCTION);
-    let summary_response = generate(provider, &summary_prompt, config)
-        .await?
-        .buffer()
-        .await?;
-    let summary = summary_response.text();
-    let summary_tokens = summary_response.usage.output_tokens;
-    let post_summary_fraction = caps.context_usage_fraction(&summary_response.usage);
+    compactor: &Compactor,
+    conversation: Prompt,
+    user_msg: &str,
+) -> Result<(CompleteResponse, Prompt), Error> {
+    // `generate()` itself can fail (pre-flight provider rejection),
+    // and `buffer()` can fail (in-stream error — e.g. OpenAI's
+    // 200-OK-then-SSE-`event:error` shape). Funnel both into one
+    // Result so the recovery branch handles either case uniformly.
+    let pending = generate(provider, &conversation.clone().with_user(user_msg), config).await;
+    let attempt = match pending {
+        Ok(response) => response.buffer().await,
+        Err(e) => Err(e),
+    };
 
-    eprintln!(
-        "  [summary: {summary_tokens} output tokens, prompt was {:.1}% full when generating it]",
-        post_summary_fraction * 100.0,
+    match attempt {
+        Ok(response) => {
+            // Happy path: commit user message + response to history.
+            let next = conversation.with_user(user_msg).with_response(&response);
+            Ok((response, next))
+        }
+        Err(Error::ContextWindowExceeded { message, .. }) => {
+            eprintln!("  [context window exceeded mid-turn: {message}]");
+            eprintln!("  [compacting prior history and retrying…]");
+            // Compact the prior history. `tail_user_msg` re-attaches
+            // the live message at the end of the rebuilt prompt, so
+            // we send the rebuilt prompt as-is on the retry rather
+            // than reconstructing it.
+            let rebuilt = compactor
+                .compact(provider, config, conversation, Some(user_msg))
+                .await?;
+            let response = generate(provider, &rebuilt, config).await?.buffer().await?;
+            // `rebuilt` already includes the tail user message; commit
+            // the response on top.
+            let next = rebuilt.with_response(&response);
+            Ok((response, next))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Print a one-line summary of the model's reported usage and the
+/// resulting context fraction.
+fn report_usage(caps: &Capabilities, response: &CompleteResponse) {
+    let fraction = caps.context_usage_fraction(&response.usage);
+    println!(
+        "  [context: {} input + {} output = {} / {} tokens ({:.1}% used)]",
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+        response.usage.total_tokens(),
+        caps.context_window_tokens,
+        fraction * 100.0,
     );
-
-    // Rebuild: system + summary-as-prior-context + the last user turn.
-    Ok(Prompt::system(
-        "You are a helpful assistant. The next user turn references an earlier conversation; \
-         use the assistant turn below as your memory of what was said previously.",
-    )
-    .with_assistant(format!(
-        "Memo of the earlier conversation:\n\n{}",
-        summary.trim()
-    ))
-    .with_user(last_user_msg))
 }
