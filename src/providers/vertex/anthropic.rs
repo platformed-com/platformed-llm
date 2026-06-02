@@ -510,10 +510,6 @@ pub(crate) struct StreamState {
     pending_stop_reason: Option<String>,
 }
 
-/// Map an Anthropic `stop_reason` string onto our unified [`FinishReason`].
-///
-/// Until [`FinishReason`] is extended (Phase 5), `stop_sequence` and
-/// `pause_turn` collapse to `Stop` — the closest existing variant.
 /// Heuristic match for "input too long" 400s. Anthropic returns
 /// `invalid_request_error` with a free-form message and no typed code,
 /// so we look for the documented wording patterns. Conservative — a
@@ -523,12 +519,16 @@ fn is_anthropic_context_exceeded(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     (lower.contains("prompt is too long")
         || lower.contains("input is too long")
-        || lower.contains("maximum")
-            && (lower.contains("tokens") || lower.contains("input length"))
+        || (lower.contains("maximum")
+            && (lower.contains("tokens") || lower.contains("input length")))
         || lower.contains("context window"))
         && lower.contains("invalid_request_error")
 }
 
+/// Map an Anthropic `stop_reason` string onto our unified [`FinishReason`].
+///
+/// Until [`FinishReason`] is extended (Phase 5), `stop_sequence` and
+/// `pause_turn` collapse to `Stop` — the closest existing variant.
 pub(crate) fn map_anthropic_stop_reason(reason: Option<&str>) -> FinishReason {
     match reason {
         Some("end_turn") => FinishReason::Stop,

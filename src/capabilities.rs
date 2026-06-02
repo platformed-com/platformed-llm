@@ -118,9 +118,6 @@ impl Capabilities {
     /// the context window. Typical compaction trigger is
     /// `fraction > 0.7` or so.
     pub fn context_usage_fraction(&self, usage: &crate::Usage) -> f32 {
-        if self.context_window_tokens == 0 {
-            return f32::INFINITY;
-        }
         usage.total_tokens() as f32 / self.context_window_tokens as f32
     }
 
@@ -133,10 +130,19 @@ impl Capabilities {
 
 impl Capabilities {
     /// Provider-agnostic entry point. Dispatches by model-name prefix:
-    /// - `gpt-*`, `o1*`, `o3*`, `o4*`, `chatgpt-*` → [`Self::openai`].
+    /// - `gpt-*`, `chatgpt-*` → [`Self::openai`].
+    /// - `o<digit>...` (o-series reasoning models — `o1`, `o3`,
+    ///   `o4`, and any future `oN`) → [`Self::openai`].
     /// - `gemini-*` → [`Self::google`].
-    /// - `claude-*` (any case) → [`Self::anthropic`].
+    /// - `claude-*` (or names containing `claude`) → [`Self::anthropic`].
     /// - otherwise → [`Self::default`] (everything off) with a debug log.
+    ///
+    /// The o-series check is intentionally `o + digit` rather than a
+    /// bare `o` prefix so unrelated names that happen to start with
+    /// `o` (e.g. `openai-future-model`, `oracle-x`) fall through to
+    /// the unknown-model path instead of getting routed to the OpenAI
+    /// matcher. This keeps `for_model` consistent with the
+    /// per-family table walkers.
     ///
     /// In practice these namespaces don't collide across providers, so
     /// prefix routing is reliable; callers using a fine-tune or a model
@@ -144,7 +150,7 @@ impl Capabilities {
     /// [`crate::Provider::capabilities`] on their provider instead.
     pub fn for_model(model: &str) -> Self {
         let m = model.to_ascii_lowercase();
-        if m.starts_with("gpt-") || is_openai_o_series(&m) || m.starts_with("chatgpt-") {
+        if m.starts_with("gpt-") || m.starts_with("chatgpt-") || is_openai_o_series(&m) {
             return Self::openai(model);
         }
         if m.starts_with("gemini-") {
@@ -180,16 +186,12 @@ impl Capabilities {
     }
 }
 
-/// True for OpenAI reasoning ("o-series") model names: a leading `o`
-/// immediately followed by a digit (`o1`, `o3`, `o4-mini`, and any
-/// future `o5`/`o6`/…). Matching the digit rather than enumerating
-/// known versions means a newly released o-series model routes to the
-/// permissive OpenAI capability set instead of falling through to the
-/// all-off default (which would spuriously trigger JSON coercion on a
-/// model with native schema support). `model` is assumed already
-/// lowercased.
-fn is_openai_o_series(model: &str) -> bool {
-    let mut chars = model.chars();
+/// `true` when `lowered` looks like an OpenAI o-series reasoning
+/// model name — `o` followed by at least one digit (`o1`, `o3-mini`,
+/// `o4-mini-2025-…`). Used by [`Capabilities::for_model`] dispatch
+/// and by the OPENAI table's catch-all entry so the two paths agree.
+fn is_openai_o_series(lowered: &str) -> bool {
+    let mut chars = lowered.chars();
     chars.next() == Some('o') && chars.next().is_some_and(|c| c.is_ascii_digit())
 }
 
@@ -263,8 +265,17 @@ static OPENAI_MODELS: &[ModelEntry] = &[
     (Prefix("gpt-4o-mini"), openai_caps(128_000, 16_384)),
     (Prefix("gpt-4o"), openai_caps(128_000, 16_384)),
     (Prefix("chatgpt-4o"), openai_caps(128_000, 16_384)),
-    // ----- GPT-4 turbo / legacy -----
+    // ----- GPT-4 turbo / preview / vision (all 128k context) -----
+    // These all share GPT-4 Turbo's 128k window. Listed *before* the
+    // `gpt-4-` legacy catch-all so dated snapshots / preview tags
+    // pick up their real cap rather than the 8k fallback.
     (Prefix("gpt-4-turbo"), openai_caps(128_000, 4096)),
+    (Prefix("gpt-4-vision-preview"), openai_caps(128_000, 4096)),
+    (Prefix("gpt-4-1106-preview"), openai_caps(128_000, 4096)),
+    (Prefix("gpt-4-0125-preview"), openai_caps(128_000, 4096)),
+    // gpt-4-32k (and its dated snapshots) — 32k context.
+    (Prefix("gpt-4-32k"), openai_caps(32_768, 8192)),
+    // ----- GPT-4 legacy (8k context) -----
     (Exact("gpt-4"), openai_caps(8192, 8192)),
     (Prefix("gpt-4-"), openai_caps(8192, 8192)),
     // ----- o-series reasoning models -----
@@ -276,11 +287,14 @@ static OPENAI_MODELS: &[ModelEntry] = &[
     (Prefix("o4-mini"), openai_caps(200_000, 100_000)),
     (Prefix("o4"), openai_caps(200_000, 100_000)),
     // ----- Family catch-all -----
-    // Anything still starting with `gpt-` / `chatgpt-` / `o*` falls
-    // here. Conservative numbers + full feature flags.
+    // Anything still starting with `gpt-` / `chatgpt-` falls here.
+    // There's no `Prefix("o")` entry on purpose: it would over-match
+    // names like `openai-experimental` or `oracle-x` and disagree
+    // with `for_model`'s `o<digit>` routing. Unknown o-series fall
+    // to OPENAI_FALLBACK below, which carries the same conservative
+    // numbers + a tracing::debug breadcrumb pointing at the gap.
     (Prefix("gpt-"), openai_caps(128_000, 16_384)),
     (Prefix("chatgpt-"), openai_caps(128_000, 16_384)),
-    (Prefix("o"), openai_caps(128_000, 16_384)),
 ];
 
 /// Fallback when nothing in [`OPENAI_MODELS`] matches.
@@ -355,26 +369,29 @@ const fn anthropic_caps(context: u32, output: u32) -> Capabilities {
 }
 
 /// Anthropic Claude model table, ordered most-specific first.
+///
+/// Context windows are the **default** values without any beta
+/// headers. Anthropic gates the 1M-token window for Sonnet 4.6 /
+/// Opus 4.6+ behind the `context-1m-2025-08-07` (or successor)
+/// `anthropic-beta` header — callers who opt into that header should
+/// override [`crate::Provider::capabilities`] on their provider to
+/// report the wider window. Defaulting to 200k here under-promises:
+/// the headroom helpers trigger compaction earlier, which is safer
+/// than over-promising and rejecting a request the model would
+/// otherwise accept under the beta path.
 static ANTHROPIC_MODELS: &[ModelEntry] = &[
-    // ----- Claude 4.x Opus (1M context on 4.6+, 128k output) -----
-    (
-        Prefix("claude-opus-4-8"),
-        anthropic_caps(1_000_000, 128_000),
-    ),
-    (
-        Prefix("claude-opus-4-7"),
-        anthropic_caps(1_000_000, 128_000),
-    ),
-    (
-        Prefix("claude-opus-4-6"),
-        anthropic_caps(1_000_000, 128_000),
-    ),
+    // ----- Claude 4.x Opus -----
+    // 4.6+ go to 1M with the context beta header — we under-promise
+    // to the no-beta default (200k). See module-doc above.
+    (Prefix("claude-opus-4-8"), anthropic_caps(200_000, 128_000)),
+    (Prefix("claude-opus-4-7"), anthropic_caps(200_000, 128_000)),
+    (Prefix("claude-opus-4-6"), anthropic_caps(200_000, 128_000)),
     (Prefix("claude-opus-4-1"), anthropic_caps(200_000, 32_000)),
     (Prefix("claude-opus-4"), anthropic_caps(200_000, 32_000)),
-    // ----- Claude 4.x Sonnet (1M context on 4.6, otherwise 200k) -----
+    // ----- Claude 4.x Sonnet (same beta caveat as Opus 4.6+) -----
     (
         Prefix("claude-sonnet-4-6"),
-        anthropic_caps(1_000_000, 128_000),
+        anthropic_caps(200_000, 128_000),
     ),
     (Prefix("claude-sonnet-4-5"), anthropic_caps(200_000, 64_000)),
     (Prefix("claude-sonnet-4"), anthropic_caps(200_000, 64_000)),
@@ -451,9 +468,118 @@ mod tests {
 
     #[test]
     fn openai_family_fallback_for_unknown_name() {
-        // Truly novel name not matching any table row: falls through.
+        // Truly novel name not matching any table row: falls through
+        // the table to OPENAI_FALLBACK. The `Prefix("o")` catch-all
+        // was deliberately removed so `openai-future-model` no longer
+        // collides with the o-series.
         let c = Capabilities::openai("openai-future-model");
         assert_eq!(c, OPENAI_FALLBACK);
+        // A novel future o-series variant also falls to the fallback
+        // (same caps as the OPENAI_FALLBACK constant, but reaches it
+        // via the explicit fallback path rather than over-matching).
+        let c = Capabilities::openai("o9-future-mini");
+        assert_eq!(c, OPENAI_FALLBACK);
+    }
+
+    /// `Capabilities::for_model("oN…")` must route to `openai()` for
+    /// every `N` that's a digit — covers o-series releases the
+    /// dispatch list doesn't enumerate explicitly. The contract is
+    /// "any future `oN` model gets OpenAI caps from the table walker,
+    /// not the all-zeros default."
+    #[test]
+    fn for_model_routes_all_o_series_to_openai() {
+        for m in [
+            "o1",
+            "o2",
+            "o3",
+            "o4",
+            "o5",
+            "o6",
+            "o7",
+            "o9-mini",
+            "o3-2025-04-16",
+        ] {
+            let via_for_model = Capabilities::for_model(m);
+            let via_direct = Capabilities::openai(m);
+            assert_eq!(
+                via_for_model, via_direct,
+                "{m}: for_model and openai() must agree"
+            );
+            assert!(
+                via_for_model.context_window_tokens >= 128_000,
+                "{m}: expected OpenAI-class caps, got {via_for_model:?}"
+            );
+        }
+    }
+
+    /// Names that look o-series-ish but aren't (e.g.
+    /// `openai-experimental`, `oracle-x`) must NOT route to the
+    /// OpenAI matcher — they fall to the unknown-model default.
+    #[test]
+    fn for_model_rejects_non_digit_o_prefix() {
+        for m in ["openai-future-model", "oracle-x", "octopus", "o"] {
+            assert_eq!(
+                Capabilities::for_model(m),
+                Capabilities::default(),
+                "{m}: should be treated as unknown"
+            );
+        }
+    }
+
+    /// Legacy `gpt-4-*` variants whose context isn't 8k must get
+    /// their real value (not the gpt-4 family fallback's 8192).
+    #[test]
+    fn legacy_gpt_4_variants_get_real_context() {
+        // 32k variant family.
+        for m in ["gpt-4-32k", "gpt-4-32k-0613"] {
+            assert_eq!(
+                Capabilities::openai(m).context_window_tokens,
+                32_768,
+                "{m}: gpt-4-32k variant"
+            );
+        }
+        // 128k preview / vision variants.
+        for m in [
+            "gpt-4-1106-preview",
+            "gpt-4-0125-preview",
+            "gpt-4-vision-preview",
+            "gpt-4-turbo-preview",
+            "gpt-4-turbo-2024-04-09",
+        ] {
+            assert_eq!(
+                Capabilities::openai(m).context_window_tokens,
+                128_000,
+                "{m}: 128k turbo/preview variant"
+            );
+        }
+        // Bare `gpt-4` and `gpt-4-0613` stay at 8k.
+        for m in ["gpt-4", "gpt-4-0613"] {
+            assert_eq!(
+                Capabilities::openai(m).context_window_tokens,
+                8192,
+                "{m}: 8k legacy"
+            );
+        }
+    }
+
+    /// Per the table doc-comment, 4.6+ models stay at the no-beta
+    /// default of 200k context — the 1M beta isn't on by default and
+    /// callers opting in must override caps on their Provider.
+    #[test]
+    fn anthropic_4_6_plus_stay_at_200k_no_beta() {
+        for m in [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+        ] {
+            let c = Capabilities::anthropic(m);
+            assert_eq!(
+                c.context_window_tokens, 200_000,
+                "{m}: should default to no-beta context"
+            );
+            assert_eq!(c.max_output_tokens, 128_000, "{m}");
+        }
     }
 
     #[test]
@@ -511,20 +637,6 @@ mod tests {
             let c = Capabilities::anthropic(m);
             assert!(!c.native_json_mode, "{m}");
             assert!(!c.response_schema, "{m}");
-        }
-    }
-
-    #[test]
-    fn anthropic_4_6_plus_have_million_token_context() {
-        for m in [
-            "claude-opus-4-6",
-            "claude-opus-4-7",
-            "claude-opus-4-8",
-            "claude-sonnet-4-6",
-        ] {
-            let c = Capabilities::anthropic(m);
-            assert_eq!(c.context_window_tokens, 1_000_000, "{m}");
-            assert_eq!(c.max_output_tokens, 128_000, "{m}");
         }
     }
 

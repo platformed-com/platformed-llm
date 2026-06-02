@@ -1164,6 +1164,61 @@ mod tests {
         }
     }
 
+    /// OpenAI's Responses API doesn't always return a 4xx for
+    /// over-budget prompts — it can return HTTP 200 OK and emit the
+    /// failure inside the SSE stream as an `event: error` with
+    /// `code: "context_length_exceeded"`. The in-stream branch of
+    /// `OpenAIStreamState::process` must produce the same typed
+    /// `ContextWindowExceeded` variant as the HTTP-400 path.
+    #[test]
+    fn in_stream_context_length_exceeded_is_typed() {
+        use crate::providers::openai::types::ErrorDetails;
+        let mut state = OpenAIStreamState::new();
+        let err = state
+            .process(OpenAIStreamEvent::Error {
+                error: ErrorDetails {
+                    message: "Your input exceeds the context window of this model.".to_string(),
+                    r#type: "invalid_request_error".to_string(),
+                    param: Some("input".to_string()),
+                    code: Some("context_length_exceeded".to_string()),
+                },
+            })
+            .expect_err("Error event must produce an Err");
+        match err {
+            Error::ContextWindowExceeded { provider, message } => {
+                assert_eq!(provider, "OpenAI");
+                assert!(message.contains("context window"));
+            }
+            other => panic!("expected ContextWindowExceeded, got {other:?}"),
+        }
+    }
+
+    /// In-stream `Error` events with codes *other than*
+    /// `context_length_exceeded` must still fall through to the
+    /// generic `Error::Provider` path — the typed variant is reserved
+    /// for the one signal compaction callers care about.
+    #[test]
+    fn in_stream_unrelated_error_stays_generic_provider() {
+        use crate::providers::openai::types::ErrorDetails;
+        let mut state = OpenAIStreamState::new();
+        let err = state
+            .process(OpenAIStreamEvent::Error {
+                error: ErrorDetails {
+                    message: "model overloaded".to_string(),
+                    r#type: "server_error".to_string(),
+                    param: None,
+                    code: Some("server_overloaded".to_string()),
+                },
+            })
+            .expect_err("Error event must produce an Err");
+        match err {
+            Error::Provider {
+                provider: "OpenAI", ..
+            } => {}
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
     #[test]
     fn http_401_maps_to_auth() {
         let body = r#"{"error":{"message":"Bad key","type":"invalid_request_error","code":"invalid_api_key"}}"#;
