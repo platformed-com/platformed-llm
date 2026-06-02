@@ -30,7 +30,7 @@ use futures_util::stream::Stream;
 use futures_util::StreamExt;
 use platformed_llm::providers::OpenAIProvider;
 use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
-use platformed_llm::{Config, Error, PartKind, Prompt, Provider, StreamEvent};
+use platformed_llm::{generate, Config, Error, PartKind, Prompt, StreamEvent};
 
 /// A response body that yields exactly one byte per poll AND inserts a
 /// `Pending` between bytes (waking itself so the runtime makes progress).
@@ -130,8 +130,8 @@ async fn consumer_gets_events_as_bytes_arrive_not_bulk() {
         transport,
     );
     let prompt = Prompt::user("hi");
-    let cfg = Config::new("gpt-4o-mini").build();
-    let response = provider.generate(&prompt, cfg.raw()).await.unwrap();
+    let cfg = Config::builder("gpt-4o-mini").build();
+    let response = generate(&provider, &prompt, &cfg).await.unwrap();
     let mut stream = response.stream();
 
     // Read events as they come. After each event we assert the source

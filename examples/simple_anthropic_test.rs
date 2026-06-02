@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use platformed_llm::accumulator::ResponseAccumulator;
 use platformed_llm::providers::AnthropicViaVertexProvider;
-use platformed_llm::{Config, Error, Prompt, Provider};
+use platformed_llm::{generate, Config, Error, Prompt};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Error> {
 
     // Simple request
     let conversation = Prompt::user("Please just say 'Hello world!' - nothing else.");
-    let cfg = Config::new("claude-3-5-sonnet-v2@20241022")
+    let cfg = Config::builder("claude-3-5-sonnet-v2@20241022")
         .temperature(0.0)
         .max_tokens(20)
         .build();
@@ -40,7 +40,7 @@ async fn main() -> Result<(), Error> {
     println!("📤 Making simple request...");
 
     // Generate response
-    let response = provider.generate(&conversation, cfg.raw()).await?;
+    let response = generate(&provider, &conversation, &cfg).await?;
     let mut stream = response.stream();
 
     println!("📥 Processing stream:");

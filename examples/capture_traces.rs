@@ -344,7 +344,7 @@ fn scenario_to_llm_request(
         }
     }
 
-    let mut cfg = Config::new(model);
+    let mut cfg = Config::builder(model);
     if let Some(t) = scenario.temperature {
         cfg = cfg.temperature(t);
     }
@@ -723,15 +723,16 @@ async fn capture_one(
     Ok(format!("{} status={status}", resp_path.display()))
 }
 
-/// Drive `provider.generate()` and consume the resulting stream so the
-/// recording transport sees every byte. Discards the unified events — the
-/// snapshot test will replay the captured bytes through the lib later.
-async fn run_provider<P: platformed_llm::Provider + ?Sized>(
-    provider: &P,
+/// Drive `platformed_llm::generate()` and consume the resulting stream
+/// so the recording transport sees every byte. Discards the unified
+/// events — the snapshot test will replay the captured bytes through
+/// the lib later.
+async fn run_provider(
+    provider: &dyn platformed_llm::Provider,
     prompt: &Prompt,
     config: &Config,
 ) -> Result<(), Error> {
-    let response = provider.generate(prompt, config.raw()).await?;
+    let response = platformed_llm::generate(provider, prompt, config).await?;
     let mut stream = response.stream();
     while let Some(ev) = stream.next().await {
         // A streaming-level error becomes our error too.

@@ -885,7 +885,7 @@ mod tests {
             GoogleProvider::new("p".to_string(), "us-east1".to_string(), "tok".to_string())
                 .unwrap();
         let prompt = crate::Prompt::user("hi");
-        let cfg = Config::new("gemini").build();
+        let cfg = Config::builder("gemini").build();
         let body = provider.convert_request(&prompt, cfg.raw()).unwrap();
         assert_eq!(body.contents.len(), 1);
         assert_eq!(body.contents[0].role, "user");
@@ -897,7 +897,7 @@ mod tests {
             GoogleProvider::new("p".to_string(), "us-east1".to_string(), "tok".to_string())
                 .unwrap();
         let prompt = crate::Prompt::system("you are helpful").with_user("hi");
-        let cfg = Config::new("gemini").build();
+        let cfg = Config::builder("gemini").build();
         let body = provider.convert_request(&prompt, cfg.raw()).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         let role = json["systemInstruction"]["role"].as_str();
@@ -938,7 +938,7 @@ mod tests {
     #[test]
     fn stop_sequences_threaded_through_request() {
         let prompt = crate::Prompt::user("hi");
-        let cfg = Config::new("gemini")
+        let cfg = Config::builder("gemini")
             .stop(vec!["END".to_string(), "STOP".to_string()])
             .build();
         let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn presence_and_frequency_penalty_threaded_through() {
         let prompt = crate::Prompt::user("hi");
-        let cfg = Config::new("gemini")
+        let cfg = Config::builder("gemini")
             .presence_penalty(0.5)
             .frequency_penalty(0.25)
             .build();
@@ -968,7 +968,7 @@ mod tests {
     fn reasoning_config_emits_thinking_budget() {
         use crate::types::{ReasoningConfig, ReasoningEffort};
         let prompt = crate::Prompt::user("hi");
-        let cfg = Config::new("gemini-2.5-flash")
+        let cfg = Config::builder("gemini-2.5-flash")
             .reasoning(ReasoningConfig {
                 effort: Some(ReasoningEffort::High),
                 summary: None,
@@ -986,7 +986,7 @@ mod tests {
     fn tool_choice_required_maps_to_any_mode() {
         use crate::types::ToolChoice;
         let prompt = crate::Prompt::user("hi");
-        let cfg = Config::new("gemini")
+        let cfg = Config::builder("gemini")
             .tool_choice(ToolChoice::Required)
             .build();
         let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
@@ -998,7 +998,7 @@ mod tests {
     fn tool_choice_function_restricts_allowed_names() {
         use crate::types::ToolChoice;
         let prompt = crate::Prompt::user("hi");
-        let cfg = Config::new("gemini")
+        let cfg = Config::builder("gemini")
             .tool_choice(ToolChoice::Function {
                 name: "get_weather".to_string(),
             })
@@ -1015,7 +1015,7 @@ mod tests {
     fn google_search_builtin_emits_separate_tool_entry() {
         use crate::types::{ProviderBuiltin, Tool};
         let prompt = crate::Prompt::user("hi");
-        let cfg = Config::new("gemini")
+        let cfg = Config::builder("gemini")
             .tools(vec![Tool::builtin(ProviderBuiltin::GoogleSearch)])
             .build();
         let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
@@ -1027,7 +1027,7 @@ mod tests {
     fn code_execution_builtin_emits_separate_tool_entry() {
         use crate::types::{ProviderBuiltin, Tool};
         let prompt = crate::Prompt::user("hi");
-        let cfg = Config::new("gemini")
+        let cfg = Config::builder("gemini")
             .tools(vec![Tool::builtin(ProviderBuiltin::CodeExecution)])
             .build();
         let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
@@ -1043,7 +1043,7 @@ mod tests {
                 cached_content: "projects/p/locations/l/cachedContents/abc".to_string(),
             },
         ));
-        let cfg = Config::new("gemini").build();
+        let cfg = Config::builder("gemini").build();
         let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
@@ -1056,7 +1056,7 @@ mod tests {
     fn response_format_json_object_sets_mime_type() {
         use crate::types::ResponseFormat;
         let prompt = crate::Prompt::user("hi");
-        let cfg = Config::new("gemini")
+        let cfg = Config::builder("gemini")
             .response_format(ResponseFormat::JsonObject)
             .build();
         let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
@@ -1080,7 +1080,7 @@ mod tests {
         )
         .unwrap();
         let prompt = crate::Prompt::user("hi");
-        let cfg = Config::new("gemini")
+        let cfg = Config::builder("gemini")
             .response_format(ResponseFormat::JsonSchema {
                 name: "Point".to_string(),
                 schema: Cow::Owned(schema_raw),
@@ -1107,7 +1107,7 @@ mod tests {
                 response_id: "resp_abc".to_string(),
             },
         ));
-        let cfg = Config::new("gemini").build();
+        let cfg = Config::builder("gemini").build();
         let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert!(json.get("cachedContent").is_none());
@@ -1127,7 +1127,7 @@ mod tests {
                 },
             ))
             .with_user("follow-up");
-        let cfg = Config::new("gemini").build();
+        let cfg = Config::builder("gemini").build();
         let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         assert_eq!(body.contents.len(), 1);
         assert_eq!(body.contents[0].role, "user");
@@ -1158,7 +1158,7 @@ mod tests {
         let prompt = crate::Prompt::user("first turn")
             .with_response(&prior)
             .with_user("follow-up");
-        let cfg = Config::new("gemini").build();
+        let cfg = Config::builder("gemini").build();
         let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["cachedContent"], "cached/prior");
@@ -1189,7 +1189,7 @@ mod tests {
                 },
             ))
             .with_user("c");
-        let cfg = Config::new("gemini").build();
+        let cfg = Config::builder("gemini").build();
         let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         assert_eq!(body.contents.len(), 1);
         let json = serde_json::to_value(&body).unwrap();

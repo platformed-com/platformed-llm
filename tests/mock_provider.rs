@@ -4,7 +4,7 @@
 #![cfg(feature = "mock")]
 
 use platformed_llm::providers::mock::{Chunking, MockProvider, MockResponse};
-use platformed_llm::{Config, FunctionCall, InputItem, Prompt, Provider, UserPart};
+use platformed_llm::{generate, Config, FunctionCall, InputItem, Prompt, UserPart};
 
 #[tokio::test]
 async fn drives_a_tool_call_loop() {
@@ -19,12 +19,11 @@ async fn drives_a_tool_call_loop() {
         .build();
 
     let log = provider.call_log();
-    let config = Config::new("test-model");
+    let config = Config::builder("test-model").build();
 
     // Turn 1: expect a tool call.
     let mut prompt = Prompt::user("what is the answer?");
-    let first = provider
-        .generate(&prompt, &config)
+    let first = generate(&provider, &prompt, &config)
         .await
         .unwrap()
         .buffer()
@@ -37,8 +36,7 @@ async fn drives_a_tool_call_loop() {
     prompt = prompt
         .with_response(&first)
         .with_tool_result(&call.call_id, "42");
-    let final_text = provider
-        .generate(&prompt, &config)
+    let final_text = generate(&provider, &prompt, &config)
         .await
         .unwrap()
         .text()
@@ -69,8 +67,8 @@ async fn surfaces_scripted_errors() {
         ))
         .build();
 
-    let err = provider
-        .generate(&Prompt::user("x"), &Config::new("m"))
+    let cfg = Config::builder("m").build();
+    let err = generate(&provider, &Prompt::user("x"), &cfg)
         .await
         .map(|_| ())
         .expect_err("scripted failure");

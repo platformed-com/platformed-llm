@@ -20,8 +20,7 @@ use bytes::Bytes;
 use futures_util::Stream;
 use platformed_llm::providers::{GoogleProvider, OpenAIProvider, VertexEndpoint};
 use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
-use platformed_llm::Provider as _;
-use platformed_llm::{Config, Error, Prompt};
+use platformed_llm::{generate, Config, Error, Prompt};
 use serde_json::Value;
 
 /// Test-only `TransportImpl` returning a fixed status + body. Used here
@@ -136,7 +135,7 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
         body: trace.body.clone(),
     });
     let prompt = Prompt::user("hi");
-    let cfg = Config::new("model").build();
+    let cfg = Config::builder("model").build();
     match trace.provider {
         Provider::OpenAI => {
             let p = OpenAIProvider::with_transport(
@@ -144,7 +143,7 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
                 "http://placeholder".to_string(),
                 transport,
             );
-            p.generate(&prompt, cfg.raw())
+            generate(&p, &prompt, &cfg)
                 .await
                 .err()
                 .expect("4xx must produce an error")
@@ -155,8 +154,8 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
                 "us-east1".to_string(),
                 "tok".to_string(),
             );
-            GoogleProvider::with_transport(endpoint, transport)
-                .generate(&prompt, cfg.raw())
+            let p = GoogleProvider::with_transport(endpoint, transport);
+            generate(&p, &prompt, &cfg)
                 .await
                 .err()
                 .expect("4xx must produce an error")

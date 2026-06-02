@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use platformed_llm::providers::OpenAIProvider;
-use platformed_llm::{Config, Prompt, Provider, StreamEvent};
+use platformed_llm::{generate, Config, Prompt, StreamEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -78,9 +78,8 @@ async fn dropping_response_closes_underlying_connection() {
 
     let provider = OpenAIProvider::new_with_base_url("test-key".to_string(), base_url).unwrap();
     let prompt = Prompt::user("hi");
-    let cfg = Config::new("gpt-4o-mini").build();
-    let response = provider
-        .generate(&prompt, cfg.raw())
+    let cfg = Config::builder("gpt-4o-mini").build();
+    let response = generate(&provider, &prompt, &cfg)
         .await
         .expect("generate should succeed");
     let mut stream = response.stream();

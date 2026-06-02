@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures_util::Stream;
 use platformed_llm::providers::OpenAIProvider;
 use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
-use platformed_llm::{Config, Error, Prompt, Provider};
+use platformed_llm::{generate, Config, Error, Prompt};
 
 /// Test-only `TransportImpl` returning a fixed status / headers / body.
 /// The lib's error path will read these in the same order as it would
@@ -57,8 +57,8 @@ async fn openai_against(
         transport,
     );
     let prompt = Prompt::user("hi");
-    let cfg = Config::new("gpt-4o-mini").build();
-    provider.generate(&prompt, cfg.raw()).await.map(|_| ())
+    let cfg = Config::builder("gpt-4o-mini").build();
+    generate(&provider, &prompt, &cfg).await.map(|_| ())
 }
 
 #[tokio::test]

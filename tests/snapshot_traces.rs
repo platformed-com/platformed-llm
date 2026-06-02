@@ -26,8 +26,7 @@ use platformed_llm::providers::{
     AnthropicViaVertexProvider, GoogleProvider, OpenAIProvider, VertexEndpoint,
 };
 use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
-use platformed_llm::Provider as _;
-use platformed_llm::{CompleteResponse, Config, Error, Prompt, StreamEvent};
+use platformed_llm::{generate, CompleteResponse, Config, Error, Prompt, StreamEvent};
 use serde_json::Value;
 
 /// Test-only `TransportImpl` that always returns a fixed status + body,
@@ -160,7 +159,7 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
         body: trace.response_sse.clone(),
     });
     let prompt = Prompt::user("replay");
-    let cfg = Config::new(trace.request_model.as_str()).build();
+    let cfg = Config::builder(trace.request_model.as_str()).build();
     let response = match trace.provider {
         Provider::OpenAI => {
             let p = OpenAIProvider::with_transport(
@@ -168,7 +167,7 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
                 "http://placeholder".to_string(),
                 transport,
             );
-            p.generate(&prompt, cfg.raw()).await.unwrap()
+            generate(&p, &prompt, &cfg).await.unwrap()
         }
         Provider::Google => {
             let endpoint = VertexEndpoint::with_access_token(
@@ -176,10 +175,8 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
                 "us-east1".to_string(),
                 "tok".to_string(),
             );
-            GoogleProvider::with_transport(endpoint, transport)
-                .generate(&prompt, cfg.raw())
-                .await
-                .unwrap()
+            let p = GoogleProvider::with_transport(endpoint, transport);
+            generate(&p, &prompt, &cfg).await.unwrap()
         }
         Provider::Anthropic => {
             let endpoint = VertexEndpoint::with_access_token(
@@ -187,10 +184,8 @@ async fn replay(trace: &Trace) -> Vec<StreamEvent> {
                 "us-east1".to_string(),
                 "tok".to_string(),
             );
-            AnthropicViaVertexProvider::with_transport(endpoint, transport)
-                .generate(&prompt, cfg.raw())
-                .await
-                .unwrap()
+            let p = AnthropicViaVertexProvider::with_transport(endpoint, transport);
+            generate(&p, &prompt, &cfg).await.unwrap()
         }
     };
 

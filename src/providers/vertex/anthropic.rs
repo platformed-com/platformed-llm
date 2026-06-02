@@ -730,7 +730,7 @@ mod tests {
     #[test]
     fn convert_simple_text_request() {
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("claude").build();
+        let cfg = Config::builder("claude").build();
         let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         assert_eq!(body.messages.len(), 1);
         assert_eq!(body.messages[0].role, "user");

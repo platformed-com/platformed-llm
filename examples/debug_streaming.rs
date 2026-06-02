@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use platformed_llm::accumulator::ResponseAccumulator;
-use platformed_llm::{Config, Error, Prompt, ProviderFactory};
+use platformed_llm::{generate, Config, Error, Prompt, ProviderFactory};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -34,7 +34,7 @@ async fn main() -> Result<(), Error> {
 
     // Simple request
     let conversation = Prompt::user("Say 'Hello World' exactly.");
-    let cfg = Config::new("gpt-4o-mini")
+    let cfg = Config::builder("gpt-4o-mini")
         .temperature(0.0)
         .max_tokens(10)
         .build();
@@ -42,12 +42,12 @@ async fn main() -> Result<(), Error> {
     println!("📡 Making request...");
 
     // Generate response
-    match provider.generate(&conversation, cfg.raw()).await {
+    match generate(&*provider, &conversation, &cfg).await {
         Ok(response) => {
             println!("✅ Request succeeded");
 
             // Test direct text method
-            let response_clone = provider.generate(&conversation, cfg.raw()).await?;
+            let response_clone = generate(&*provider, &conversation, &cfg).await?;
             let text = response_clone.text().await?;
             println!("📄 Direct text result: '{text}'");
             println!("📄 Text length: {}", text.len());

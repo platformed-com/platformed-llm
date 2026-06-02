@@ -28,7 +28,7 @@
 mod common;
 
 use platformed_llm::providers::LlamaGgufProvider;
-use platformed_llm::{Config, Prompt, Provider};
+use platformed_llm::{generate, Config, Prompt};
 
 use common::test_models;
 
@@ -52,9 +52,10 @@ async fn local_generation_smoke_test() {
     };
 
     let prompt = Prompt::user("Say hello in one word.");
-    let cfg = Config::new("smollm2-135m-instruct").max_tokens(16).build();
-    let response = provider
-        .generate(&prompt, cfg.raw())
+    let cfg = Config::builder("smollm2-135m-instruct")
+        .max_tokens(16)
+        .build();
+    let response = generate(&provider, &prompt, &cfg)
         .await
         .expect("generate succeeded");
     let text = response.text().await.expect("buffered text");

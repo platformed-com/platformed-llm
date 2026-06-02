@@ -215,14 +215,6 @@ impl Config {
         ConfigBuilder::new(model)
     }
 
-    /// Shorthand for [`ConfigBuilder::new`]. Returns a builder, not a
-    /// `Config` — you still need to call `.build()` at the end of the
-    /// chain to finalize.
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(model: impl Into<String>) -> ConfigBuilder {
-        ConfigBuilder::new(model)
-    }
-
     /// Borrow the [`RawConfig`] payload. This is what gets threaded
     /// through middleware and reaches the provider.
     pub fn raw(&self) -> &RawConfig {

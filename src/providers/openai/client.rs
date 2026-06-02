@@ -1166,7 +1166,7 @@ mod tests {
             (ToolChoice::None, serde_json::json!("none")),
             (ToolChoice::Required, serde_json::json!("required")),
         ] {
-            let cfg = Config::new("gpt-4").tool_choice(choice.clone()).build();
+            let cfg = Config::builder("gpt-4").tool_choice(choice.clone()).build();
             let req = provider().convert_request(&prompt, cfg.raw());
             let json = serde_json::to_value(&req).unwrap();
             assert_eq!(
@@ -1179,7 +1179,7 @@ mod tests {
     #[test]
     fn tool_choice_serializes_function_as_typed_object() {
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-4")
+        let cfg = Config::builder("gpt-4")
             .tool_choice(ToolChoice::Function {
                 name: "get_weather".to_string(),
             })
@@ -1198,7 +1198,7 @@ mod tests {
     fn reasoning_config_serializes_to_correct_shape() {
         use crate::types::{ReasoningConfig, ReasoningEffort, ReasoningSummary};
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-5")
+        let cfg = Config::builder("gpt-5")
             .reasoning(ReasoningConfig {
                 effort: Some(ReasoningEffort::High),
                 summary: Some(ReasoningSummary::Auto),
@@ -1263,7 +1263,7 @@ mod tests {
     #[test]
     fn parallel_tool_calls_and_store_are_caller_controlled() {
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-4")
+        let cfg = Config::builder("gpt-4")
             .parallel_tool_calls(false)
             .store(true)
             .build();
@@ -1342,7 +1342,7 @@ mod tests {
                 },
             ))
             .with_user("follow-up");
-        let cfg = Config::new("gpt-5").build();
+        let cfg = Config::builder("gpt-5").build();
         let body = provider().convert_request(&prompt, cfg.raw());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_1"));
         // Only the items after the assistant turn carrying the
@@ -1374,7 +1374,7 @@ mod tests {
         let prompt = Prompt::user("first turn")
             .with_response(&prior)
             .with_user("follow-up");
-        let cfg = Config::new("gpt-5").build();
+        let cfg = Config::builder("gpt-5").build();
         let body = provider().convert_request(&prompt, cfg.raw());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_prior"));
         // Only the follow-up reaches the wire — everything else is
@@ -1400,7 +1400,7 @@ mod tests {
                 },
             ))
             .with_user("c");
-        let cfg = Config::new("gpt-5").build();
+        let cfg = Config::builder("gpt-5").build();
         let body = provider().convert_request(&prompt, cfg.raw());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_new"));
         // Only items strictly after the latest matching assistant turn.
@@ -1420,7 +1420,7 @@ mod tests {
                 },
             ))
             .with_user("b");
-        let cfg = Config::new("gpt-5").build();
+        let cfg = Config::builder("gpt-5").build();
         let body = provider().convert_request(&prompt, cfg.raw());
         assert!(body.previous_response_id.is_none());
         // Both user items still on the wire (continuation part drops out).
@@ -1431,7 +1431,7 @@ mod tests {
     fn computer_use_builtin_carries_config_on_openai() {
         use crate::types::{ComputerUseConfig, ProviderBuiltin, Tool};
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-5")
+        let cfg = Config::builder("gpt-5")
             .tools(vec![Tool::builtin(ProviderBuiltin::ComputerUse(
                 ComputerUseConfig {
                     display_width: 1280,
@@ -1452,7 +1452,7 @@ mod tests {
     fn response_format_json_object_emits_text_format() {
         use crate::types::ResponseFormat;
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-5")
+        let cfg = Config::builder("gpt-5")
             .response_format(ResponseFormat::JsonObject)
             .build();
         let body = provider().convert_request(&prompt, cfg.raw());
@@ -1467,7 +1467,7 @@ mod tests {
         let schema_raw =
             serde_json::value::RawValue::from_string(r#"{"type":"object"}"#.to_string()).unwrap();
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-5")
+        let cfg = Config::builder("gpt-5")
             .response_format(ResponseFormat::JsonSchema {
                 name: "Point".to_string(),
                 schema: Cow::Owned(schema_raw),
@@ -1500,7 +1500,7 @@ mod tests {
         };
         let prompt1 = make_prompt();
         let prompt2 = make_prompt();
-        let cfg = Config::new("gpt-5").build();
+        let cfg = Config::builder("gpt-5").build();
         let req1 = provider().convert_request(&prompt1, cfg.raw());
         let req2 = provider().convert_request(&prompt2, cfg.raw());
         assert!(req1.prompt_cache_key.is_some());
@@ -1510,7 +1510,7 @@ mod tests {
     #[test]
     fn no_cache_breakpoint_means_no_prompt_cache_key() {
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-5").build();
+        let cfg = Config::builder("gpt-5").build();
         let req = provider().convert_request(&prompt, cfg.raw());
         assert!(req.prompt_cache_key.is_none());
     }
@@ -1525,7 +1525,7 @@ mod tests {
                 content: vec![UserPart::Text("ctx".into()), UserPart::CacheBreakpoint],
             })
         };
-        let cfg = Config::new("gpt-5").build();
+        let cfg = Config::builder("gpt-5").build();
         let p1 = make_prompt("system one");
         let p2 = make_prompt("system two");
         let k1 = provider().convert_request(&p1, cfg.raw()).prompt_cache_key;
@@ -1538,7 +1538,7 @@ mod tests {
     fn test_request_conversion() {
         let provider = OpenAIProvider::new("test-key".to_string()).unwrap();
         let prompt = Prompt::user("Hello");
-        let cfg = Config::new("gpt-4")
+        let cfg = Config::builder("gpt-4")
             .temperature(0.7)
             .max_tokens(100)
             .build();
@@ -1552,7 +1552,7 @@ mod tests {
     fn cache_key_is_none_without_breakpoint() {
         // The common (no-breakpoint) path short-circuits to None.
         let p = Prompt::system("sys").with_user("hello");
-        let cfg = Config::new("gpt-5").build();
+        let cfg = Config::builder("gpt-5").build();
         let k = provider().convert_request(&p, cfg.raw()).prompt_cache_key;
         assert_eq!(k, None);
     }
