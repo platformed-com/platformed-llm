@@ -150,6 +150,15 @@
     },
 
     {
+      "name": "context_window_exceeded",
+      "description": "Send a prompt deliberately larger than the model's context window so every provider returns its typed 'too many tokens' 4xx envelope. Pins the wire shape that maps onto `Error::ContextWindowExceeded`. The `content` here is a placeholder — the capture script should expand it to ~1.5x the target model's context window before sending (see capture_traces' oversize_prompt hook). All providers tested; each returns a different 400 envelope (OpenAI: `code: context_length_exceeded`; Anthropic: `invalid_request_error` with 'prompt is too long' wording; Google: `INVALID_ARGUMENT` with 'input token count exceeds'). Fixtures under `tests/cross_provider/traces/<provider>/context_window_exceeded.*` are hand-authored from the published error schemas until live captures replace them.",
+      "expect_failure": true,
+      "messages": [
+        { "role": "user", "content": "<<<expanded by capture_traces to overflow the context window>>>" }
+      ]
+    },
+
+    {
       "name": "model_not_found",
       "description": "Request a non-existent model. On OpenAI this is a 404 with `error.code = model_not_found`; on Vertex this is 404 with a structured google.rpc.Status body. Locks in the body shape so error-mapping tests can match against real responses.",
       "expect_failure": true,

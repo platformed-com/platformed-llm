@@ -1,0 +1,11 @@
+{
+  "anthropic_version": "vertex-2023-10-16",
+  "messages": [
+    {
+      "role": "user",
+      "content": "<<<oversized-prompt-elided>>>"
+    }
+  ],
+  "max_tokens": 1024,
+  "stream": true
+}

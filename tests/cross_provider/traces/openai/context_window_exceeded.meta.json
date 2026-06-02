@@ -1,0 +1,17 @@
+{
+  "captured_at_unix": 1748793600,
+  "endpoint": "https://api.openai.com/v1/responses",
+  "expect_failure": true,
+  "headers": {
+    "content-type": "application/json",
+    "x-request-id": "req_synthetic_context_exceeded"
+  },
+  "latency_ms": 0,
+  "model": "gpt-4o-mini",
+  "provider": "openai",
+  "response_bytes": 308,
+  "scenario": "context_window_exceeded",
+  "status": 400,
+  "synthetic": true,
+  "synthetic_note": "Hand-authored from OpenAI's documented `context_length_exceeded` error envelope (https://platform.openai.com/docs/guides/error-codes). Replace with a real capture by sending an oversized prompt through `cargo run --example capture_traces` when API access is available."
+}

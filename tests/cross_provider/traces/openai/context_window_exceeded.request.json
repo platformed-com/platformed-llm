@@ -1,0 +1,12 @@
+{
+  "input": [
+    {
+      "content": "<<<oversized-prompt-elided>>>",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "model": "gpt-4o-mini",
+  "store": false,
+  "stream": true
+}
