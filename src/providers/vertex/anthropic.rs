@@ -1,12 +1,18 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use futures_util::StreamExt;
 
 use super::anthropic_types::*;
 use super::endpoint::VertexEndpoint;
+use crate::factory::ProviderType;
 use crate::provider::Provider;
+use crate::providers::file_resolve::{resolve_refs, NoLibraryUpload, ResolvedRef};
 use crate::sse_stream::SseStream;
 use crate::transport::{Transport, TransportRequest};
 use crate::types::{
-    AssistantPart, FinishReason, InputItem, PartKind, PartUpdate, ReasoningEffort, Usage, UserPart,
+    AssistantPart, FileResolver, FinishReason, InputItem, PartKind, PartUpdate, ProviderScope,
+    ReasoningEffort, Usage, UserPart,
 };
 use crate::{Error, RawConfig, Response, StreamEvent};
 
@@ -17,6 +23,8 @@ pub struct AnthropicViaVertexProvider {
     /// Comma-separated `anthropic-beta` header values. Used to opt into
     /// beta features (computer use, fine-grained tool streaming, etc.).
     beta: Vec<String>,
+    /// Optional caller-held file registry for resolving `Ref` file inputs.
+    file_resolver: Option<Arc<dyn FileResolver>>,
 }
 
 impl AnthropicViaVertexProvider {
@@ -26,6 +34,7 @@ impl AnthropicViaVertexProvider {
             endpoint: VertexEndpoint::with_access_token(project_id, location, access_token),
             transport: Transport::reqwest()?,
             beta: Vec::new(),
+            file_resolver: None,
         })
     }
 
@@ -41,6 +50,7 @@ impl AnthropicViaVertexProvider {
                 .with_base_url(base_url),
             transport: Transport::reqwest()?,
             beta: Vec::new(),
+            file_resolver: None,
         })
     }
 
@@ -50,6 +60,7 @@ impl AnthropicViaVertexProvider {
             endpoint: VertexEndpoint::with_adc(project_id, location).await?,
             transport: Transport::reqwest()?,
             beta: Vec::new(),
+            file_resolver: None,
         })
     }
 
@@ -60,6 +71,7 @@ impl AnthropicViaVertexProvider {
             endpoint,
             transport,
             beta: Vec::new(),
+            file_resolver: None,
         }
     }
 
@@ -78,11 +90,42 @@ impl AnthropicViaVertexProvider {
         self
     }
 
+    /// Attach a [`FileResolver`] so the provider can resolve
+    /// [`FileSource::Ref`](crate::FileSource::Ref) file inputs.
+    ///
+    /// Anthropic-via-Vertex has no library-owned file store, so the resolver
+    /// should return a durable provider handle via
+    /// [`ResolvedFile::ProviderHandle`](crate::ResolvedFile::ProviderHandle)
+    /// (or, for a genuinely public file, a public URL via
+    /// [`ResolvedFile::Url`](crate::ResolvedFile::Url)); a streaming payload is
+    /// rejected.
+    pub fn with_file_resolver(mut self, resolver: Arc<dyn FileResolver>) -> Self {
+        self.file_resolver = Some(resolver);
+        self
+    }
+
+    /// The [`ProviderScope`] file handles are valid within — the GCP
+    /// project + region.
+    fn scope(&self) -> ProviderScope {
+        ProviderScope::new(
+            ProviderType::Anthropic,
+            format!(
+                "{}/{}",
+                self.endpoint.project_id(),
+                self.endpoint.location()
+            ),
+        )
+    }
+
     /// Convert internal request to Anthropic format.
+    ///
+    /// `resolved` maps each file-`Ref` id to its wire-ready reference, built
+    /// by the async [`resolve_refs`] pre-pass in [`Self::generate`].
     fn convert_request(
         &self,
         prompt: &crate::Prompt,
         config: &RawConfig,
+        resolved: &HashMap<String, ResolvedRef>,
     ) -> Result<AnthropicRequest, Error> {
         let mut messages = Vec::new();
         let mut system_message = None;
@@ -93,7 +136,7 @@ impl AnthropicViaVertexProvider {
                     system_message = Some(content.clone());
                 }
                 InputItem::User { content } => {
-                    let blocks = build_user_blocks(content)?;
+                    let blocks = build_user_blocks(content, resolved)?;
                     if blocks.is_empty() {
                         continue;
                     }
@@ -238,7 +281,10 @@ impl AnthropicViaVertexProvider {
 /// Translate user-side parts into Anthropic content blocks. A
 /// `CacheBreakpoint` attaches `cache_control: {type: "ephemeral"}` to
 /// the most recently emitted block.
-fn build_user_blocks(parts: &[UserPart]) -> Result<Vec<AnthropicContentBlock>, Error> {
+fn build_user_blocks(
+    parts: &[UserPart],
+    resolved: &HashMap<String, ResolvedRef>,
+) -> Result<Vec<AnthropicContentBlock>, Error> {
     let mut blocks = Vec::new();
     for part in parts {
         match part {
@@ -248,20 +294,23 @@ fn build_user_blocks(parts: &[UserPart]) -> Result<Vec<AnthropicContentBlock>, E
             }),
             UserPart::Image(src) => {
                 let source = match src {
-                    crate::types::ImageSource::Url(u) => ijson::ijson!({
+                    crate::types::FileSource::Url(u) => Some(ijson::ijson!({
                         "type": "url",
                         "url": u.clone(),
-                    }),
-                    crate::types::ImageSource::Base64 { data, media_type } => ijson::ijson!({
+                    })),
+                    crate::types::FileSource::Base64 { data, media_type } => Some(ijson::ijson!({
                         "type": "base64",
                         "media_type": media_type.clone(),
                         "data": data.clone(),
-                    }),
+                    })),
+                    crate::types::FileSource::Ref(id) => ref_to_source(resolved, id),
                 };
-                blocks.push(AnthropicContentBlock::Image {
-                    source,
-                    cache_control: None,
-                });
+                if let Some(source) = source {
+                    blocks.push(AnthropicContentBlock::Image {
+                        source,
+                        cache_control: None,
+                    });
+                }
             }
             UserPart::ToolResult { call_id, content } => {
                 let text = flatten_user_parts_to_text(content);
@@ -271,30 +320,59 @@ fn build_user_blocks(parts: &[UserPart]) -> Result<Vec<AnthropicContentBlock>, E
                     is_error: None,
                 });
             }
+            // Audio / video are rejected up front in generate() via
+            // reject_unsupported_modalities; these are defensive drops for any
+            // direct convert_request caller.
             UserPart::Audio(_) => {
-                tracing::debug!("Anthropic provider does not support audio input; dropping");
+                tracing::debug!("Anthropic: dropping unsupported audio part");
+            }
+            UserPart::Video(_) => {
+                tracing::debug!("Anthropic: dropping unsupported video part");
             }
             UserPart::Document(src) => {
                 let source = match src {
-                    crate::types::DocumentSource::Url(u) => ijson::ijson!({
+                    crate::types::FileSource::Url(u) => Some(ijson::ijson!({
                         "type": "url",
                         "url": u.clone(),
-                    }),
-                    crate::types::DocumentSource::Base64 { data, media_type } => ijson::ijson!({
+                    })),
+                    crate::types::FileSource::Base64 { data, media_type } => Some(ijson::ijson!({
                         "type": "base64",
                         "media_type": media_type.clone(),
                         "data": data.clone(),
-                    }),
+                    })),
+                    crate::types::FileSource::Ref(id) => ref_to_source(resolved, id),
                 };
-                blocks.push(AnthropicContentBlock::Document {
-                    source,
-                    cache_control: None,
-                });
+                if let Some(source) = source {
+                    blocks.push(AnthropicContentBlock::Document {
+                        source,
+                        cache_control: None,
+                    });
+                }
             }
             UserPart::CacheBreakpoint => attach_cache_control(blocks.last_mut()),
         }
     }
     Ok(blocks)
+}
+
+/// Resolve a file `Ref` to an Anthropic content-block `source`, or `None`
+/// (logged) when the id wasn't resolved. A provider handle becomes a
+/// `{type:"file", file_id}` source; a URL becomes `{type:"url", url}`.
+fn ref_to_source(resolved: &HashMap<String, ResolvedRef>, id: &str) -> Option<ijson::IValue> {
+    match resolved.get(id) {
+        Some(ResolvedRef::Handle { uri, .. }) => Some(ijson::ijson!({
+            "type": "file",
+            "file_id": uri.clone(),
+        })),
+        Some(ResolvedRef::Url { uri, .. }) => Some(ijson::ijson!({
+            "type": "url",
+            "url": uri.clone(),
+        })),
+        None => {
+            tracing::debug!("Anthropic: unresolved file Ref {id}; dropping");
+            None
+        }
+    }
 }
 
 /// Attach a `cache_control: {type: "ephemeral"}` hint to the most-
@@ -396,7 +474,20 @@ impl Provider for AnthropicViaVertexProvider {
         prompt: &crate::Prompt,
         config: &RawConfig,
     ) -> Result<Response, Error> {
-        let anthropic_request = self.convert_request(prompt, config)?;
+        // Claude accepts only image / document inputs — reject audio / video
+        // up front rather than dropping them.
+        crate::providers::reject_unsupported_modalities(prompt.items(), "Anthropic", false, false)?;
+
+        let resolved = resolve_refs(
+            prompt.items(),
+            &self.scope(),
+            self.file_resolver.as_deref(),
+            &NoLibraryUpload {
+                provider: "Anthropic",
+            },
+        )
+        .await?;
+        let anthropic_request = self.convert_request(prompt, config, &resolved)?;
 
         let url = self.endpoint.url(
             "anthropic",
@@ -888,9 +979,57 @@ mod tests {
     fn convert_simple_text_request() {
         let prompt = Prompt::user("hi");
         let cfg = Config::builder("claude").build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         assert_eq!(body.messages.len(), 1);
         assert_eq!(body.messages[0].role, "user");
+    }
+
+    /// A resolved document `Ref` (handle) lands as a `{type:"file", file_id}`
+    /// source; a URL result as `{type:"url", url}`.
+    #[test]
+    fn resolved_ref_emits_file_and_url_sources() {
+        use crate::providers::file_resolve::ResolvedRef;
+        use crate::types::{FileSource, InputItem, UserPart};
+
+        // Handle -> file source.
+        let prompt = Prompt::new().with_item(InputItem::User {
+            content: vec![UserPart::Document(FileSource::Ref("doc1".into()))],
+        });
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(
+            "doc1".to_string(),
+            ResolvedRef::Handle {
+                uri: "file-abc".into(),
+                media_type: "application/pdf".into(),
+            },
+        );
+        let cfg = Config::builder("claude").build();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &resolved)
+            .unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let source = &json["messages"][0]["content"][0]["source"];
+        assert_eq!(source["type"], "file");
+        assert_eq!(source["file_id"], "file-abc");
+
+        // URL -> url source.
+        let mut resolved_url = std::collections::HashMap::new();
+        resolved_url.insert(
+            "doc1".to_string(),
+            ResolvedRef::Url {
+                uri: "https://example.com/x.pdf".into(),
+                media_type: "application/pdf".into(),
+            },
+        );
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &resolved_url)
+            .unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let source = &json["messages"][0]["content"][0]["source"];
+        assert_eq!(source["type"], "url");
+        assert_eq!(source["url"], "https://example.com/x.pdf");
     }
 
     /// A signature_delta on a thinking block emits PartUpdate::Signature

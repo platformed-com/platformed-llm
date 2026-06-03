@@ -56,25 +56,21 @@ pub enum OpenAIContentPart {
     InputImage {
         #[serde(skip_serializing_if = "Option::is_none")]
         image_url: Option<String>,
-    },
-    InputAudio {
-        input_audio: OpenAIInputAudio,
+        /// Reference to a previously uploaded file (`POST /v1/files`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
     },
     InputFile {
         #[serde(skip_serializing_if = "Option::is_none")]
         file_url: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         file_data: Option<String>,
+        /// Reference to a previously uploaded file (`POST /v1/files`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
     },
-}
-
-/// OpenAI inline audio data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAIInputAudio {
-    pub data: String,
-    pub format: String,
 }
 
 /// OpenAI tool entry in the Responses API `tools` array.

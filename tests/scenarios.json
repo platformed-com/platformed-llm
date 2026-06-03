@@ -244,6 +244,28 @@
     },
 
     {
+      "name": "file_ref_image",
+      "description": "User message with an image referenced by a caller-opaque file Ref (UserPart::Image(FileSource::Ref)). Exercises the lazy-upload path. OpenAI streams the file to POST /v1/files (purpose=vision) and references input_image.file_id. Gemini streams it to a GCS bucket (set GOOGLE_GCS_BUCKET) and references fileData.fileUri=gs://... — skipped when no bucket is configured. Anthropic-via-Vertex has no Files API, so it is skipped.",
+      "max_tokens": 256,
+      "providers": {
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "Briefly describe what you see in this image.",
+          "attachments": [
+            {
+              "type": "file_ref",
+              "path": "tests/fixtures/sample.png",
+              "media_type": "image/png"
+            }
+          ]
+        }
+      ]
+    },
+
+    {
       "name": "structured_output_json",
       "description": "ResponseFormat::JsonObject — bare JSON mode. Locks in the wire shape: OpenAI sets text.format.type=json_object; Gemini sets generationConfig.responseMimeType=application/json. Anthropic skipped (no native JSON mode).",
       "max_tokens": 256,

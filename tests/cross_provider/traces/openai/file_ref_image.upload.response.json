@@ -1,0 +1,11 @@
+{
+  "bytes": 70,
+  "created_at": 0,
+  "expires_at": null,
+  "filename": "file.png",
+  "id": "<captured-file-handle>",
+  "object": "file",
+  "purpose": "vision",
+  "status": "processed",
+  "status_details": null
+}

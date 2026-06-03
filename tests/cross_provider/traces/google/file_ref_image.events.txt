@@ -1,0 +1,8 @@
+PartStart[0] text
+Delta[0] "The image is a solid, uniform field of bright yellow"
+PartEnd[0]
+Done finish=Length input=<n> output=<n>
+
+=== final ===
+finish=Length
+part[0] text "The image is a solid, uniform field of bright yellow" annotations=0

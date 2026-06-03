@@ -66,9 +66,9 @@ pub use middleware::{generate, JsonCoercionMiddleware, Middleware};
 pub use provider::Provider;
 pub use response::{CompleteResponse, Response};
 pub use types::{
-    Annotation, AnnotationKind, AssistantPart, AudioSource, ComputerUseConfig, Config,
-    ConfigBuilder, DocumentSource, FinishReason, Function, FunctionCall, ImageSource, InputItem,
-    PartKind, PartUpdate, Prompt, ProviderBuiltin, ProviderContinuation, RawConfig,
-    ReasoningConfig, ReasoningEffort, ReasoningSummary, ResponseFormat, StreamEvent, Tool,
-    ToolChoice, Usage, UserPart,
+    Annotation, AnnotationKind, AssistantPart, ComputerUseConfig, Config, ConfigBuilder,
+    FileResolver, FileSource, FinishReason, Function, FunctionCall, InputItem, LruFileResolver,
+    PartKind, PartUpdate, Prompt, ProviderBuiltin, ProviderContinuation, ProviderScope, RawConfig,
+    ReasoningConfig, ReasoningEffort, ReasoningSummary, ResolvedFile, ResolvedHandle,
+    ResponseFormat, StreamEvent, Tool, ToolChoice, Usage, UserPart,
 };

@@ -8,7 +8,7 @@ use crate::{Error, Provider};
 use std::{env, fmt};
 
 /// Supported LLM providers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProviderType {
     /// OpenAI's hosted API (`api.openai.com`).
     OpenAI,

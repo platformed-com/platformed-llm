@@ -1,14 +1,21 @@
 use super::types::{
     OpenAIAnnotation, OpenAIReasoning, OpenAIStreamEvent, OpenAIToolChoice, ResponsesRequest,
 };
+use crate::factory::ProviderType;
 use crate::provider::Provider;
-use crate::transport::{Transport, TransportRequest};
+use crate::providers::file_resolve::{
+    media_type_extension, resolve_refs, ProviderUploader, ResolvedRef,
+};
+use crate::transport::{Method, Transport, TransportRequest, UploadRequest};
 use crate::types::{
-    Annotation, AnnotationKind, PartKind, PartUpdate, ProviderBuiltin, ReasoningConfig,
-    ReasoningEffort, ReasoningSummary, ToolChoice,
+    Annotation, AnnotationKind, FileResolver, PartKind, PartUpdate, ProviderBuiltin, ProviderScope,
+    ReasoningConfig, ReasoningEffort, ReasoningSummary, ResolvedHandle, ToolChoice,
 };
 use crate::{Error, RawConfig, Response, StreamEvent};
-use futures_util::StreamExt as _;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt as _};
+use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, trace};
 
@@ -21,6 +28,8 @@ pub struct OpenAIProvider {
     organization: Option<String>,
     /// Optional `OpenAI-Project` header value for project-scoped keys.
     project: Option<String>,
+    /// Optional caller-held file registry for resolving `Ref` file inputs.
+    file_resolver: Option<Arc<dyn FileResolver>>,
 }
 
 impl OpenAIProvider {
@@ -32,6 +41,7 @@ impl OpenAIProvider {
             base_url: "https://api.openai.com/v1".to_string(),
             organization: None,
             project: None,
+            file_resolver: None,
         })
     }
 
@@ -43,6 +53,7 @@ impl OpenAIProvider {
             base_url,
             organization: None,
             project: None,
+            file_resolver: None,
         })
     }
 
@@ -56,6 +67,7 @@ impl OpenAIProvider {
             base_url,
             organization: None,
             project: None,
+            file_resolver: None,
         }
     }
 
@@ -72,8 +84,40 @@ impl OpenAIProvider {
         self
     }
 
+    /// Attach a [`FileResolver`] so the provider can resolve
+    /// [`FileSource::Ref`](crate::FileSource::Ref) file inputs —
+    /// uploading them to `POST /v1/files` on a registry miss and referencing
+    /// the resulting `file_id`.
+    pub fn with_file_resolver(mut self, resolver: Arc<dyn FileResolver>) -> Self {
+        self.file_resolver = Some(resolver);
+        self
+    }
+
+    /// The [`ProviderScope`] handles minted by this client are valid within —
+    /// the base URL plus any org/project scoping.
+    fn scope(&self) -> ProviderScope {
+        let mut account = self.base_url.clone();
+        if let Some(org) = &self.organization {
+            account.push('|');
+            account.push_str(org);
+        }
+        if let Some(project) = &self.project {
+            account.push('|');
+            account.push_str(project);
+        }
+        ProviderScope::new(ProviderType::OpenAI, account)
+    }
+
     /// Convert internal request to OpenAI Responses API format.
-    fn convert_request(&self, prompt: &crate::Prompt, config: &RawConfig) -> ResponsesRequest {
+    ///
+    /// `resolved` maps each file-`Ref` id to its wire-ready reference, built
+    /// by the async [`resolve_refs`] pre-pass in [`Self::generate`].
+    fn convert_request(
+        &self,
+        prompt: &crate::Prompt,
+        config: &RawConfig,
+        resolved: &HashMap<String, ResolvedRef>,
+    ) -> ResponsesRequest {
         let messages = prompt.items();
 
         // Scan history for the latest InputItem::Continuation carrying
@@ -84,7 +128,7 @@ impl OpenAIProvider {
 
         let mut input: Vec<crate::providers::openai::types::OpenAIInputMessage> = Vec::new();
         for item in &messages[start_index..] {
-            Self::flatten_input_item(item, &mut input);
+            Self::flatten_input_item(item, &mut input, resolved);
         }
 
         ResponsesRequest {
@@ -123,6 +167,7 @@ impl OpenAIProvider {
     fn flatten_input_item(
         item: &crate::types::InputItem,
         out: &mut Vec<crate::providers::openai::types::OpenAIInputMessage>,
+        resolved: &HashMap<String, ResolvedRef>,
     ) {
         use crate::providers::openai::types::OpenAIInputMessage;
         use crate::types::{AssistantPart, InputItem, UserPart};
@@ -148,17 +193,37 @@ impl OpenAIProvider {
                         UserPart::Text(s) => {
                             parts.push(OpenAIContentPart::InputText { text: s.clone() })
                         }
-                        UserPart::Image(src) => {
-                            let url = match src {
-                                crate::types::ImageSource::Url(u) => u.clone(),
-                                crate::types::ImageSource::Base64 { data, media_type } => {
-                                    format!("data:{media_type};base64,{data}")
+                        UserPart::Image(src) => match src {
+                            crate::types::FileSource::Url(u) => {
+                                parts.push(OpenAIContentPart::InputImage {
+                                    image_url: Some(u.clone()),
+                                    file_id: None,
+                                });
+                            }
+                            crate::types::FileSource::Base64 { data, media_type } => {
+                                parts.push(OpenAIContentPart::InputImage {
+                                    image_url: Some(format!("data:{media_type};base64,{data}")),
+                                    file_id: None,
+                                });
+                            }
+                            crate::types::FileSource::Ref(id) => match resolved.get(id) {
+                                Some(ResolvedRef::Handle { uri, .. }) => {
+                                    parts.push(OpenAIContentPart::InputImage {
+                                        image_url: None,
+                                        file_id: Some(uri.clone()),
+                                    });
                                 }
-                            };
-                            parts.push(OpenAIContentPart::InputImage {
-                                image_url: Some(url),
-                            });
-                        }
+                                Some(ResolvedRef::Url { uri, .. }) => {
+                                    parts.push(OpenAIContentPart::InputImage {
+                                        image_url: Some(uri.clone()),
+                                        file_id: None,
+                                    });
+                                }
+                                None => {
+                                    tracing::debug!("OpenAI: unresolved image Ref {id}; dropping")
+                                }
+                            },
+                        },
                         UserPart::ToolResult { call_id, content } => {
                             // A user turn mixing free text with a tool
                             // result (legitimate on Anthropic/Gemini,
@@ -181,44 +246,60 @@ impl OpenAIProvider {
                                 output: flatten_user_parts_to_text(content),
                             });
                         }
-                        UserPart::Audio(src) => match src {
-                            crate::types::AudioSource::Base64 { data, media_type } => {
-                                // OpenAI accepts mp3 / wav. media_type is
-                                // expected to be something like "audio/mp3".
-                                let format = media_type
-                                    .strip_prefix("audio/")
-                                    .unwrap_or(media_type.as_str())
-                                    .to_string();
-                                parts.push(OpenAIContentPart::InputAudio {
-                                    input_audio:
-                                        crate::providers::openai::types::OpenAIInputAudio {
-                                            data: data.clone(),
-                                            format,
-                                        },
-                                });
-                            }
-                            crate::types::AudioSource::Url(_) => {
-                                tracing::debug!(
-                                    "OpenAI input_audio requires inline base64; dropping URL audio"
-                                );
-                            }
-                        },
+                        UserPart::Audio(_) => {
+                            // Rejected up front in generate() via
+                            // reject_unsupported_modalities (the Responses API
+                            // has no audio input — verified HTTP 400). Defensive
+                            // drop for any direct convert_request caller.
+                            tracing::debug!("OpenAI: dropping unsupported audio part");
+                        }
                         UserPart::Document(src) => match src {
-                            crate::types::DocumentSource::Url(u) => {
+                            crate::types::FileSource::Url(u) => {
                                 parts.push(OpenAIContentPart::InputFile {
                                     file_url: Some(u.clone()),
                                     file_data: None,
+                                    file_id: None,
                                     filename: None,
                                 });
                             }
-                            crate::types::DocumentSource::Base64 { data, media_type } => {
+                            crate::types::FileSource::Base64 { data, media_type } => {
                                 parts.push(OpenAIContentPart::InputFile {
                                     file_url: None,
                                     file_data: Some(format!("data:{media_type};base64,{data}")),
+                                    file_id: None,
                                     filename: None,
                                 });
                             }
+                            crate::types::FileSource::Ref(id) => match resolved.get(id) {
+                                Some(ResolvedRef::Handle { uri, .. }) => {
+                                    parts.push(OpenAIContentPart::InputFile {
+                                        file_url: None,
+                                        file_data: None,
+                                        file_id: Some(uri.clone()),
+                                        filename: None,
+                                    });
+                                }
+                                Some(ResolvedRef::Url { uri, .. }) => {
+                                    parts.push(OpenAIContentPart::InputFile {
+                                        file_url: Some(uri.clone()),
+                                        file_data: None,
+                                        file_id: None,
+                                        filename: None,
+                                    });
+                                }
+                                None => {
+                                    tracing::debug!(
+                                        "OpenAI: unresolved document Ref {id}; dropping"
+                                    )
+                                }
+                            },
                         },
+                        UserPart::Video(_) => {
+                            // Rejected up front in generate() (no video input on
+                            // the Responses API). Defensive drop for any direct
+                            // convert_request caller.
+                            tracing::debug!("OpenAI: dropping unsupported video part");
+                        }
                         UserPart::CacheBreakpoint => {
                             // OpenAI maps cache breakpoints onto a per-
                             // request `prompt_cache_key` rather than
@@ -426,7 +507,10 @@ fn derive_prompt_cache_key(messages: &[crate::types::InputItem]) -> Option<Strin
                 for part in content {
                     match part {
                         UserPart::Text(s) => s.hash(&mut hasher),
-                        UserPart::Image(_) | UserPart::Audio(_) | UserPart::Document(_) => {
+                        UserPart::Image(_)
+                        | UserPart::Audio(_)
+                        | UserPart::Document(_)
+                        | UserPart::Video(_) => {
                             // Skip multi-modal payloads from the hash —
                             // their base64 representation would dominate
                             // and small re-encodings would defeat the key.
@@ -1028,6 +1112,108 @@ impl OpenAIStreamState {
     }
 }
 
+/// Multipart boundary for `POST /v1/files` uploads. A fixed token is fine —
+/// the body is binary file content, and a collision with this exact ASCII
+/// run is vanishingly unlikely.
+const MULTIPART_BOUNDARY: &str = "platformedllmFormBoundary8x4mZqW2pT";
+
+/// Best-effort filename (OpenAI requires one) derived from the MIME type.
+fn filename_for(media_type: &str) -> String {
+    match media_type_extension(media_type) {
+        "" => "file.bin".to_string(),
+        ext => format!("file.{ext}"),
+    }
+}
+
+#[async_trait::async_trait]
+impl ProviderUploader for OpenAIProvider {
+    /// Stream `body` to `POST /v1/files` as `multipart/form-data` (never
+    /// buffering it whole) and return the resulting `file_id`.
+    ///
+    /// The multipart framing is hand-rolled because the `reqwest` `multipart`
+    /// feature isn't enabled and the library streams the file part. Best-effort
+    /// against the documented `/v1/files` contract; needs live-API verification.
+    async fn upload(
+        &self,
+        media_type: &str,
+        content_length: Option<u64>,
+        body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
+    ) -> Result<ResolvedHandle, Error> {
+        let boundary = MULTIPART_BOUNDARY;
+        // Images referenced via `input_image` must be uploaded with
+        // `purpose: "vision"`; documents (`input_file`) use `user_data`.
+        let purpose = if media_type.starts_with("image/") {
+            "vision"
+        } else {
+            "user_data"
+        };
+        let head = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\n{purpose}\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{fname}\"\r\n\
+             Content-Type: {mt}\r\n\r\n",
+            b = boundary,
+            fname = filename_for(media_type),
+            mt = media_type,
+        );
+        let tail = format!("\r\n--{boundary}--\r\n");
+        let head_b = Bytes::from(head.into_bytes());
+        let tail_b = Bytes::from(tail.into_bytes());
+        // A known body length yields a Content-Length; an unknown one (None)
+        // falls back to chunked transfer-encoding, which `/v1/files` may reject
+        // — resolvers should set `content_length` whenever they can.
+        let total_len = content_length.map(|n| head_b.len() as u64 + n + tail_b.len() as u64);
+        let stream_body = futures_util::stream::once(async move { Ok(head_b) })
+            .chain(body)
+            .chain(futures_util::stream::once(async move { Ok(tail_b) }));
+        let stream_body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> =
+            Box::pin(stream_body);
+
+        let mut headers = vec![
+            (
+                "Authorization".to_string(),
+                format!("Bearer {}", self.api_key),
+            ),
+            (
+                "Content-Type".to_string(),
+                format!("multipart/form-data; boundary={boundary}"),
+            ),
+        ];
+        if let Some(org) = &self.organization {
+            headers.push(("OpenAI-Organization".to_string(), org.clone()));
+        }
+        if let Some(project) = &self.project {
+            headers.push(("OpenAI-Project".to_string(), project.clone()));
+        }
+
+        let req = UploadRequest {
+            method: Method::Post,
+            url: format!("{}/files", self.base_url),
+            headers,
+            content_length: total_len,
+            body: stream_body,
+        };
+        let response = self.transport.send_upload(req).await?;
+        let status = response.status;
+        let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
+        let bytes = response.collect_body().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            let body_str = String::from_utf8_lossy(&bytes).into_owned();
+            return Err(parse_openai_error(status, retry_after, &body_str));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct FileObj {
+            id: String,
+        }
+        let obj: FileObj = serde_json::from_slice(&bytes)?;
+        Ok(ResolvedHandle {
+            uri: obj.id,
+            media_type: media_type.to_string(),
+            expires_at: None,
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for OpenAIProvider {
     /// Generate a chat completion (internally always streams).
@@ -1036,7 +1222,20 @@ impl Provider for OpenAIProvider {
         prompt: &crate::Prompt,
         config: &RawConfig,
     ) -> Result<Response, Error> {
-        let mut openai_request = self.convert_request(prompt, config);
+        // The Responses API accepts only image / document inputs — reject
+        // audio / video up front rather than dropping them.
+        crate::providers::reject_unsupported_modalities(prompt.items(), "OpenAI", false, false)?;
+
+        // Resolve any file `Ref`s to provider handles (uploading on a miss)
+        // before the sync request build.
+        let resolved = resolve_refs(
+            prompt.items(),
+            &self.scope(),
+            self.file_resolver.as_deref(),
+            self,
+        )
+        .await?;
+        let mut openai_request = self.convert_request(prompt, config, &resolved);
         openai_request.stream = Some(true);
 
         debug!(
@@ -1130,6 +1329,34 @@ mod tests {
 
     fn provider() -> OpenAIProvider {
         OpenAIProvider::new("k".to_string()).unwrap()
+    }
+
+    /// `generate()` rejects audio (and video) with a typed
+    /// [`Error::UnsupportedInput`] before any network call — the Responses API
+    /// can't take them.
+    #[tokio::test]
+    async fn generate_rejects_unsupported_audio_input() {
+        use crate::types::{FileSource, InputItem, UserPart};
+        let prompt = Prompt::new().with_item(InputItem::User {
+            content: vec![UserPart::Audio(FileSource::Url(
+                "http://x/a.mp3".to_string(),
+            ))],
+        });
+        let cfg = Config::builder("gpt-4o-mini").build();
+        let err = match provider().generate(&prompt, cfg.raw()).await {
+            Ok(_) => panic!("audio is unsupported on the Responses API"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedInput {
+                    provider: "OpenAI",
+                    modality: "audio"
+                }
+            ),
+            "got: {err:?}"
+        );
     }
 
     /// HTTP 429 with an OpenAI-shaped error body should produce
@@ -1267,7 +1494,8 @@ mod tests {
             (ToolChoice::Required, serde_json::json!("required")),
         ] {
             let cfg = Config::builder("gpt-4").tool_choice(choice.clone()).build();
-            let req = provider().convert_request(&prompt, cfg.raw());
+            let req =
+                provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
             let json = serde_json::to_value(&req).unwrap();
             assert_eq!(
                 json["tool_choice"], expected,
@@ -1284,7 +1512,7 @@ mod tests {
                 name: "get_weather".to_string(),
             })
             .build();
-        let req = provider().convert_request(&prompt, cfg.raw());
+        let req = provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
             json["tool_choice"],
@@ -1304,7 +1532,7 @@ mod tests {
                 summary: Some(ReasoningSummary::Auto),
             })
             .build();
-        let req = provider().convert_request(&prompt, cfg.raw());
+        let req = provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
             json["reasoning"],
@@ -1367,7 +1595,7 @@ mod tests {
             .parallel_tool_calls(false)
             .store(true)
             .build();
-        let req = provider().convert_request(&prompt, cfg.raw());
+        let req = provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["parallel_tool_calls"], false);
         assert_eq!(json["store"], true);
@@ -1443,7 +1671,8 @@ mod tests {
             ))
             .with_user("follow-up");
         let cfg = Config::builder("gpt-5").build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_1"));
         // Only the items after the assistant turn carrying the
         // continuation reach the wire.
@@ -1475,7 +1704,8 @@ mod tests {
             .with_response(&prior)
             .with_user("follow-up");
         let cfg = Config::builder("gpt-5").build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_prior"));
         // Only the follow-up reaches the wire — everything else is
         // covered by the server-side response state.
@@ -1501,7 +1731,8 @@ mod tests {
             ))
             .with_user("c");
         let cfg = Config::builder("gpt-5").build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_new"));
         // Only items strictly after the latest matching assistant turn.
         assert_eq!(body.input.len(), 1);
@@ -1521,7 +1752,8 @@ mod tests {
             ))
             .with_user("b");
         let cfg = Config::builder("gpt-5").build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert!(body.previous_response_id.is_none());
         // Both user items still on the wire (continuation part drops out).
         assert_eq!(body.input.len(), 2);
@@ -1540,7 +1772,8 @@ mod tests {
                 },
             ))])
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["tools"][0]["type"], "computer_use_preview");
         assert_eq!(json["tools"][0]["display_width"], 1280);
@@ -1555,7 +1788,8 @@ mod tests {
         let cfg = Config::builder("gpt-5")
             .response_format(ResponseFormat::JsonObject)
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["text"]["format"]["type"], "json_object");
     }
@@ -1574,7 +1808,8 @@ mod tests {
                 strict: true,
             })
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["text"]["format"]["type"], "json_schema");
         assert_eq!(json["text"]["format"]["name"], "Point");
@@ -1601,8 +1836,10 @@ mod tests {
         let prompt1 = make_prompt();
         let prompt2 = make_prompt();
         let cfg = Config::builder("gpt-5").build();
-        let req1 = provider().convert_request(&prompt1, cfg.raw());
-        let req2 = provider().convert_request(&prompt2, cfg.raw());
+        let req1 =
+            provider().convert_request(&prompt1, cfg.raw(), &std::collections::HashMap::new());
+        let req2 =
+            provider().convert_request(&prompt2, cfg.raw(), &std::collections::HashMap::new());
         assert!(req1.prompt_cache_key.is_some());
         assert_eq!(req1.prompt_cache_key, req2.prompt_cache_key);
     }
@@ -1611,7 +1848,7 @@ mod tests {
     fn no_cache_breakpoint_means_no_prompt_cache_key() {
         let prompt = Prompt::user("hi");
         let cfg = Config::builder("gpt-5").build();
-        let req = provider().convert_request(&prompt, cfg.raw());
+        let req = provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert!(req.prompt_cache_key.is_none());
     }
 
@@ -1628,8 +1865,12 @@ mod tests {
         let cfg = Config::builder("gpt-5").build();
         let p1 = make_prompt("system one");
         let p2 = make_prompt("system two");
-        let k1 = provider().convert_request(&p1, cfg.raw()).prompt_cache_key;
-        let k2 = provider().convert_request(&p2, cfg.raw()).prompt_cache_key;
+        let k1 = provider()
+            .convert_request(&p1, cfg.raw(), &std::collections::HashMap::new())
+            .prompt_cache_key;
+        let k2 = provider()
+            .convert_request(&p2, cfg.raw(), &std::collections::HashMap::new())
+            .prompt_cache_key;
         assert!(k1.is_some());
         assert_ne!(k1, k2);
     }
@@ -1642,7 +1883,8 @@ mod tests {
             .temperature(0.7)
             .max_tokens(100)
             .build();
-        let openai_request = provider.convert_request(&prompt, cfg.raw());
+        let openai_request =
+            provider.convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert_eq!(openai_request.model, "gpt-4");
         assert_eq!(openai_request.temperature, Some(0.7));
         assert_eq!(openai_request.max_output_tokens, Some(100));
@@ -1653,8 +1895,75 @@ mod tests {
         // The common (no-breakpoint) path short-circuits to None.
         let p = Prompt::system("sys").with_user("hello");
         let cfg = Config::builder("gpt-5").build();
-        let k = provider().convert_request(&p, cfg.raw()).prompt_cache_key;
+        let k = provider()
+            .convert_request(&p, cfg.raw(), &std::collections::HashMap::new())
+            .prompt_cache_key;
         assert_eq!(k, None);
+    }
+
+    /// A resolved document `Ref` lands as an `input_file` referencing the
+    /// uploaded `file_id`; an image `Ref` as an `input_image` with `file_id`.
+    #[test]
+    fn resolved_refs_emit_file_id_wire_shapes() {
+        use crate::providers::file_resolve::ResolvedRef;
+        use crate::types::{FileSource, InputItem, UserPart};
+
+        let prompt = Prompt::new().with_item(InputItem::User {
+            content: vec![
+                UserPart::Document(FileSource::Ref("doc1".into())),
+                UserPart::Image(FileSource::Ref("img1".into())),
+            ],
+        });
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(
+            "doc1".to_string(),
+            ResolvedRef::Handle {
+                uri: "file-doc".into(),
+                media_type: "application/pdf".into(),
+            },
+        );
+        resolved.insert(
+            "img1".to_string(),
+            ResolvedRef::Handle {
+                uri: "file-img".into(),
+                media_type: "image/png".into(),
+            },
+        );
+        let cfg = Config::builder("gpt-5").build();
+        let req = provider().convert_request(&prompt, cfg.raw(), &resolved);
+        let json = serde_json::to_value(&req).unwrap();
+        let parts = &json["input"][0]["content"];
+        assert_eq!(parts[0]["type"], "input_file");
+        assert_eq!(parts[0]["file_id"], "file-doc");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["file_id"], "file-img");
+    }
+
+    /// A resolved `Ref` that came back as a plain URL falls back to the URL
+    /// wire form (no upload handle).
+    #[test]
+    fn resolved_url_ref_falls_back_to_url_forms() {
+        use crate::providers::file_resolve::ResolvedRef;
+        use crate::types::{FileSource, InputItem, UserPart};
+
+        let prompt = Prompt::new().with_item(InputItem::User {
+            content: vec![UserPart::Document(FileSource::Ref("doc1".into()))],
+        });
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(
+            "doc1".to_string(),
+            ResolvedRef::Url {
+                uri: "https://example.com/x.pdf".into(),
+                media_type: "application/pdf".into(),
+            },
+        );
+        let cfg = Config::builder("gpt-5").build();
+        let req = provider().convert_request(&prompt, cfg.raw(), &resolved);
+        let json = serde_json::to_value(&req).unwrap();
+        let part = &json["input"][0]["content"][0];
+        assert_eq!(part["type"], "input_file");
+        assert_eq!(part["file_url"], "https://example.com/x.pdf");
+        assert!(part["file_id"].is_null());
     }
 
     fn fn_item(call_id: Option<&str>, name: Option<&str>, arguments: Option<&str>) -> ResponseItem {
