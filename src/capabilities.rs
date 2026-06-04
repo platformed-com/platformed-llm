@@ -70,12 +70,7 @@ impl Capabilities {
     /// [`crate::Provider::capabilities`] on their provider instead.
     pub fn for_model(model: &str) -> Self {
         let m = model.to_ascii_lowercase();
-        if m.starts_with("gpt-")
-            || m.starts_with("o1")
-            || m.starts_with("o3")
-            || m.starts_with("o4")
-            || m.starts_with("chatgpt-")
-        {
+        if m.starts_with("gpt-") || is_openai_o_series(&m) || m.starts_with("chatgpt-") {
             return Self::openai(model);
         }
         if m.starts_with("gemini-") {
@@ -99,12 +94,7 @@ impl Capabilities {
     /// `chatgpt-*` IDs fall back to the full feature set.
     pub fn openai(model: &str) -> Self {
         let m = model.to_ascii_lowercase();
-        if m.starts_with("gpt-")
-            || m.starts_with("o1")
-            || m.starts_with("o3")
-            || m.starts_with("o4")
-            || m.starts_with("chatgpt-")
-        {
+        if m.starts_with("gpt-") || is_openai_o_series(&m) || m.starts_with("chatgpt-") {
             return Self {
                 native_json_mode: true,
                 response_schema: true,
@@ -175,6 +165,19 @@ impl Capabilities {
         }
         Self::default()
     }
+}
+
+/// True for OpenAI reasoning ("o-series") model names: a leading `o`
+/// immediately followed by a digit (`o1`, `o3`, `o4-mini`, and any
+/// future `o5`/`o6`/…). Matching the digit rather than enumerating
+/// known versions means a newly released o-series model routes to the
+/// permissive OpenAI capability set instead of falling through to the
+/// all-off default (which would spuriously trigger JSON coercion on a
+/// model with native schema support). `model` is assumed already
+/// lowercased.
+fn is_openai_o_series(model: &str) -> bool {
+    let mut chars = model.chars();
+    chars.next() == Some('o') && chars.next().is_some_and(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -288,6 +291,34 @@ mod tests {
         // Unknown model — empty caps
         let unknown = Capabilities::for_model("mistral-7b-instruct");
         assert_eq!(unknown, Capabilities::default());
+    }
+
+    /// A future o-series model (`o5`, `o6`, …) must route to the
+    /// permissive OpenAI caps rather than falling through to the
+    /// all-off default — otherwise JSON coercion would fire spuriously
+    /// and downgrade a model with native strict-schema support.
+    #[test]
+    fn for_model_routes_unknown_o_series_permissive() {
+        for model in ["o5", "o5-mini", "o6-pro", "O7"] {
+            let c = Capabilities::for_model(model);
+            assert!(
+                c.native_json_mode && c.response_schema && c.response_schema_with_tools,
+                "{model}: should route to permissive OpenAI caps"
+            );
+        }
+    }
+
+    /// `is_openai_o_series` keys off `o` + digit, not a leading `o`
+    /// alone — non-o-series names that merely start with `o` must not
+    /// be misrouted to OpenAI.
+    #[test]
+    fn o_series_matcher_requires_digit() {
+        assert!(is_openai_o_series("o1"));
+        assert!(is_openai_o_series("o3-mini"));
+        assert!(is_openai_o_series("o5"));
+        assert!(!is_openai_o_series("opus"));
+        assert!(!is_openai_o_series("o"));
+        assert!(!is_openai_o_series("openai-thing"));
     }
 
     #[test]

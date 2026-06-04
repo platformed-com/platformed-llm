@@ -106,9 +106,15 @@ pub fn default_middleware(caps: &Capabilities) -> Vec<Arc<dyn Middleware>> {
 /// Returns `Err(Error::Config)` with a precise message when a gap
 /// remains.
 pub fn validate(config: &RawConfig, caps: &Capabilities) -> Result<(), Error> {
-    let asks_for_schema = matches!(
+    // Only `JsonSchema` maps to Gemini's `responseSchema`, which is the
+    // feature that can't be combined with function tools on the 2.x
+    // family. `JsonObject` maps to `responseMimeType` (the
+    // `native_json_mode` flag) — a different feature that is *not*
+    // subject to the schema-vs-tools restriction — so it must not gate
+    // the combined-request check below.
+    let asks_for_schema_with_tools = matches!(
         config.response_format,
-        Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        Some(ResponseFormat::JsonSchema { .. })
     );
     let has_function_tools = config
         .tools
@@ -133,7 +139,7 @@ pub fn validate(config: &RawConfig, caps: &Capabilities) -> Result<(), Error> {
             )));
         }
     }
-    if asks_for_schema && has_function_tools && !caps.response_schema_with_tools {
+    if asks_for_schema_with_tools && has_function_tools && !caps.response_schema_with_tools {
         return Err(Error::config(format!(
             "model '{}' does not support combining response_format with function-calling \
              tools and no middleware reconciled them",
@@ -264,6 +270,28 @@ mod tests {
         let caps = Capabilities::for_model(&cfg.raw().model);
         let err = validate(cfg.raw(), &caps).expect_err("2.5 doesn't allow schema+tools");
         assert!(err.to_string().contains("combining"), "got: {err}");
+    }
+
+    /// `JsonObject` maps to Gemini's `responseMimeType`, not
+    /// `responseSchema` — so combining it with function tools is *not*
+    /// subject to the schema-vs-tools restriction the 2.x family
+    /// imposes. It must pass validation on a model that supports native
+    /// JSON mode (2.5) even with function tools present.
+    #[test]
+    fn validate_allows_json_object_plus_tools_on_pre_3_gemini() {
+        let cfg = Config::builder("gemini-2.5-flash")
+            .response_format(ResponseFormat::JsonObject)
+            .tools(vec![Tool::Function(Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: std::borrow::Cow::Owned(
+                    serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                ),
+            })])
+            .build();
+        let caps = Capabilities::for_model(&cfg.raw().model);
+        assert!(caps.native_json_mode && !caps.response_schema_with_tools);
+        validate(cfg.raw(), &caps).expect("JsonObject + tools is allowed on 2.5");
     }
 
     #[test]

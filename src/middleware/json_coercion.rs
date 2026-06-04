@@ -13,6 +13,7 @@
 //! works above any provider transparently.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::pin::Pin;
 
 use futures_util::stream::{Stream, StreamExt};
@@ -76,16 +77,21 @@ impl Middleware for JsonCoercionMiddleware {
             .is_some_and(|ts| ts.iter().any(|t| matches!(t, Tool::Function(_))));
 
         // Pick the schema we'll use as the synthetic tool's parameters.
-        let schema_owned: Box<serde_json::value::RawValue> = match &rf {
+        // Match `rf` *by value* so the `JsonSchema` arm can move the
+        // caller's already-owned `Cow<'static, RawValue>` straight into
+        // `Function.parameters` — same type, no string round-trip.
+        let parameters: Cow<'static, serde_json::value::RawValue> = match rf {
             ResponseFormat::Text => return Ok(None),
             ResponseFormat::JsonObject => {
                 if caps.native_json_mode {
                     return Ok(None);
                 }
-                serde_json::value::RawValue::from_string(
-                    r#"{"type":"object","additionalProperties":true}"#.to_string(),
+                Cow::Owned(
+                    serde_json::value::RawValue::from_string(
+                        r#"{"type":"object","additionalProperties":true}"#.to_string(),
+                    )
+                    .map_err(|e| Error::config(format!("synth schema: {e}")))?,
                 )
-                .map_err(|e| Error::config(format!("synth schema: {e}")))?
             }
             ResponseFormat::JsonSchema { schema, .. } => {
                 let supported = if has_caller_function_tools {
@@ -96,8 +102,7 @@ impl Middleware for JsonCoercionMiddleware {
                 if supported {
                     return Ok(None);
                 }
-                serde_json::value::RawValue::from_string(schema.get().to_string())
-                    .map_err(|e| Error::config(format!("synth schema: {e}")))?
+                schema
             }
         };
 
@@ -124,7 +129,7 @@ impl Middleware for JsonCoercionMiddleware {
                  output."
                     .to_string(),
             ),
-            parameters: std::borrow::Cow::Owned(schema_owned),
+            parameters,
         });
 
         // First mutation — clones config exactly once if it was borrowed.
@@ -180,51 +185,147 @@ fn unique_tool_name(base: &str, existing: Option<&[Tool]>) -> String {
     }
 }
 
-/// Stream adapter that rewrites events from a synthetic tool call into
-/// equivalent text-part events. Other tool calls pass through. When
-/// the synth tool was the only tool called, the terminal
-/// `FinishReason::ToolCalls` is rewritten to `FinishReason::Stop` so
-/// the caller's view matches a plain text response.
+/// Stream adapter that turns the coerced provider stream back into
+/// what a caller who asked for structured output expects to see.
+///
+/// - The synthetic tool call's events are relabeled from `ToolCall` to
+///   `Text`, so its JSON arguments surface as the assistant's text.
+/// - **Genuine** visible `Text` parts are suppressed entirely. The
+///   provider can emit free text before / around the forced tool call
+///   (`tool_choice: Required` is Gemini ANY mode, which doesn't gag
+///   text; even a forced Anthropic tool call can be preceded by text
+///   when thinking is on). Without this, [`crate::CompleteResponse::text`]
+///   — which concatenates *all* text parts — would return
+///   `preamble + json`, silently unparseable. Dropping them guarantees
+///   `text()` is exactly the synth JSON.
+/// - Other (real) tool calls pass through unchanged.
+///
+/// Because suppressing a part would leave a hole in the otherwise
+/// contiguous `PartStart` index sequence the accumulator requires, the
+/// kept parts are **renumbered** to stay 0,1,2,…
+///
+/// Terminal handling once `Done` arrives:
+/// - synth tool fired and was the *only* tool → rewrite
+///   `FinishReason::ToolCalls` to `Stop` (looks like a plain text turn).
+/// - synth tool fired alongside real tools → leave the finish reason
+///   as-is (multi-turn tool use in progress).
+/// - synth tool didn't fire but real tools did → legitimate
+///   intermediate turn (model is gathering info); pass through.
+/// - neither fired → the model free-texted instead of producing the
+///   structured answer. Surface an error rather than returning the
+///   silently-suppressed text as an empty response.
 fn rewrite_synth_tool_stream(
     inner: Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>>,
     synth_tool_name: String,
 ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>> {
     let mut synth_seen = false;
     let mut other_tool_seen = false;
-    Box::pin(inner.map(move |ev_result| {
-        let ev = ev_result?;
-        match ev {
-            StreamEvent::PartStart {
-                index,
-                kind:
-                    PartKind::ToolCall {
-                        ref name,
-                        call_id: _,
+    // Original part index -> remapped index (`Some`) or suppressed (`None`).
+    let mut index_map: HashMap<u32, Option<u32>> = HashMap::new();
+    let mut next_index: u32 = 0;
+    Box::pin(
+        inner
+            .map(move |ev_result| -> Option<Result<StreamEvent, Error>> {
+                let ev = match ev_result {
+                    Ok(ev) => ev,
+                    Err(e) => return Some(Err(e)),
+                };
+                match ev {
+                    StreamEvent::PartStart { index, kind } => match kind {
+                        // Synthetic tool call -> relabel to a text part.
+                        PartKind::ToolCall { ref name, .. } if name == &synth_tool_name => {
+                            synth_seen = true;
+                            let mapped = next_index;
+                            next_index += 1;
+                            index_map.insert(index, Some(mapped));
+                            Some(Ok(StreamEvent::PartStart {
+                                index: mapped,
+                                kind: PartKind::Text,
+                            }))
+                        }
+                        // Genuine visible text -> suppress (see fn docs).
+                        PartKind::Text => {
+                            index_map.insert(index, None);
+                            None
+                        }
+                        // Real tool call -> keep, but renumber.
+                        PartKind::ToolCall { .. } => {
+                            other_tool_seen = true;
+                            let mapped = next_index;
+                            next_index += 1;
+                            index_map.insert(index, Some(mapped));
+                            Some(Ok(StreamEvent::PartStart {
+                                index: mapped,
+                                kind,
+                            }))
+                        }
+                        // Reasoning / refusal / builtin / continuation ->
+                        // keep, renumber.
+                        _ => {
+                            let mapped = next_index;
+                            next_index += 1;
+                            index_map.insert(index, Some(mapped));
+                            Some(Ok(StreamEvent::PartStart {
+                                index: mapped,
+                                kind,
+                            }))
+                        }
                     },
-            } if name == &synth_tool_name => {
-                synth_seen = true;
-                Ok(StreamEvent::PartStart {
-                    index,
-                    kind: PartKind::Text,
-                })
-            }
-            StreamEvent::PartStart {
-                kind: PartKind::ToolCall { ref name, .. },
-                ..
-            } if name != &synth_tool_name => {
-                other_tool_seen = true;
-                Ok(ev)
-            }
-            StreamEvent::Done {
-                finish_reason: FinishReason::ToolCalls,
-                usage,
-            } if synth_seen && !other_tool_seen => Ok(StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-                usage,
-            }),
-            other => Ok(other),
-        }
-    }))
+                    StreamEvent::Delta { index, delta } => match index_map.get(&index) {
+                        Some(Some(mapped)) => Some(Ok(StreamEvent::Delta {
+                            index: *mapped,
+                            delta,
+                        })),
+                        _ => None,
+                    },
+                    StreamEvent::PartUpdate { index, update } => match index_map.get(&index) {
+                        Some(Some(mapped)) => Some(Ok(StreamEvent::PartUpdate {
+                            index: *mapped,
+                            update,
+                        })),
+                        _ => None,
+                    },
+                    StreamEvent::PartEnd { index } => match index_map.get(&index) {
+                        Some(Some(mapped)) => Some(Ok(StreamEvent::PartEnd { index: *mapped })),
+                        _ => None,
+                    },
+                    StreamEvent::Done {
+                        finish_reason,
+                        usage,
+                    } => {
+                        if synth_seen {
+                            let finish_reason = if matches!(finish_reason, FinishReason::ToolCalls)
+                                && !other_tool_seen
+                            {
+                                FinishReason::Stop
+                            } else {
+                                finish_reason
+                            };
+                            Some(Ok(StreamEvent::Done {
+                                finish_reason,
+                                usage,
+                            }))
+                        } else if other_tool_seen {
+                            // Intermediate multi-turn turn: the model
+                            // called a real tool and hasn't emitted the
+                            // structured answer yet. Pass through.
+                            Some(Ok(StreamEvent::Done {
+                                finish_reason,
+                                usage,
+                            }))
+                        } else {
+                            Some(Err(Error::streaming(
+                                "json_coercion: model did not invoke the structured-response \
+                                 tool and made no other tool call — the request asked for \
+                                 structured output but the model returned free-form text",
+                            )))
+                        }
+                    }
+                    StreamEvent::Error { error } => Some(Ok(StreamEvent::Error { error })),
+                }
+            })
+            .filter_map(futures_util::future::ready),
+    )
 }
 
 #[cfg(test)]
@@ -765,5 +866,100 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(raw_cow.tool_choice, Some(ToolChoice::Required)));
+    }
+
+    /// Regression: the provider emits free text *before* the synth tool
+    /// call in the same turn (`tool_choice: Required` / ANY mode doesn't
+    /// gag text, and forced Anthropic tool use can be preceded by text
+    /// with thinking on). `CompleteResponse::text()` concatenates all
+    /// text parts, so without suppression the caller would get
+    /// `preamble + json` — unparseable. The genuine text part must be
+    /// dropped so `text()` is exactly the synth JSON.
+    #[tokio::test]
+    async fn text_before_synth_call_is_suppressed() {
+        let synth_name = "respond_with_json".to_string();
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            // Genuine visible text the model emitted first.
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::Text,
+            }),
+            Ok(StreamEvent::Delta {
+                index: 0,
+                delta: "Here you go: ".to_string(),
+            }),
+            Ok(StreamEvent::PartEnd { index: 0 }),
+            // Then the synth tool call carrying the structured answer.
+            Ok(StreamEvent::PartStart {
+                index: 1,
+                kind: PartKind::ToolCall {
+                    call_id: "c1".to_string(),
+                    name: synth_name.clone(),
+                },
+            }),
+            Ok(StreamEvent::Delta {
+                index: 1,
+                delta: r#"{"answer":42}"#.to_string(),
+            }),
+            Ok(StreamEvent::PartEnd { index: 1 }),
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+                usage: Usage::default(),
+            }),
+        ];
+        let provider = MockProvider::new(events);
+        let prompt = Prompt::user("what is the meaning of life?");
+        let config = Config::builder("claude-sonnet-4-5")
+            .response_format(json_schema_rf("Answer", r#"{"type":"object"}"#))
+            .build();
+
+        let complete = generate(&provider, &prompt, &config)
+            .await
+            .unwrap()
+            .buffer()
+            .await
+            .unwrap();
+
+        // The preamble is gone; text() is exactly the synth JSON.
+        assert_eq!(complete.text(), r#"{"answer":42}"#);
+        assert!(matches!(complete.finish_reason, FinishReason::Stop));
+        assert!(complete.function_calls().is_empty());
+    }
+
+    /// When the model never invokes the synth tool and makes no other
+    /// tool call — it just free-texted instead of producing structured
+    /// output — the suppressed text must not surface as a silent empty
+    /// response. The coerced stream errors instead.
+    #[tokio::test]
+    async fn free_text_without_synth_tool_errors() {
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::Text,
+            }),
+            Ok(StreamEvent::Delta {
+                index: 0,
+                delta: "I'd rather just chat.".to_string(),
+            }),
+            Ok(StreamEvent::PartEnd { index: 0 }),
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ];
+        let provider = MockProvider::new(events);
+        let prompt = Prompt::user("hi");
+        let config = Config::builder("claude-sonnet-4-5")
+            .response_format(json_schema_rf("Answer", r#"{"type":"object"}"#))
+            .build();
+
+        let err = generate(&provider, &prompt, &config)
+            .await
+            .unwrap()
+            .buffer()
+            .await
+            .expect_err("free-text-only response should error");
+        assert!(matches!(err, Error::Streaming(_)));
+        assert!(err.to_string().contains("structured output"), "got: {err}");
     }
 }
