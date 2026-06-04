@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures_util::Stream;
 use platformed_llm::providers::{AnthropicViaVertexProvider, GoogleProvider, VertexEndpoint};
 use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
-use platformed_llm::{Config, Error, Prompt, Provider};
+use platformed_llm::{generate, Config, Error, Prompt};
 
 struct StaticTransport {
     status: u16,
@@ -57,8 +57,8 @@ fn transport(status: u16, headers: Vec<(String, String)>, body: &str) -> Transpo
 
 async fn google_err(status: u16, headers: Vec<(String, String)>, body: &str) -> Error {
     let provider = GoogleProvider::with_transport(endpoint(), transport(status, headers, body));
-    provider
-        .generate(&Prompt::user("hi"), &Config::new("gemini-2.5-flash"))
+    let cfg = Config::builder("gemini-2.5-flash").build();
+    generate(&provider, &Prompt::user("hi"), &cfg)
         .await
         .map(|_| ())
         .expect_err("non-2xx should error")
@@ -67,8 +67,8 @@ async fn google_err(status: u16, headers: Vec<(String, String)>, body: &str) -> 
 async fn anthropic_err(status: u16, headers: Vec<(String, String)>, body: &str) -> Error {
     let provider =
         AnthropicViaVertexProvider::with_transport(endpoint(), transport(status, headers, body));
-    provider
-        .generate(&Prompt::user("hi"), &Config::new("claude-sonnet-4"))
+    let cfg = Config::builder("claude-sonnet-4").build();
+    generate(&provider, &Prompt::user("hi"), &cfg)
         .await
         .map(|_| ())
         .expect_err("non-2xx should error")

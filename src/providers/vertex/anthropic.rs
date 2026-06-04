@@ -8,7 +8,7 @@ use crate::transport::{Transport, TransportRequest};
 use crate::types::{
     AssistantPart, FinishReason, InputItem, PartKind, PartUpdate, ReasoningEffort, Usage, UserPart,
 };
-use crate::{Config, Error, Response, StreamEvent};
+use crate::{Error, RawConfig, Response, StreamEvent};
 
 /// Anthropic Claude provider implementation via Vertex AI.
 pub struct AnthropicViaVertexProvider {
@@ -82,7 +82,7 @@ impl AnthropicViaVertexProvider {
     fn convert_request(
         &self,
         prompt: &crate::Prompt,
-        config: &Config,
+        config: &RawConfig,
     ) -> Result<AnthropicRequest, Error> {
         let mut messages = Vec::new();
         let mut system_message = None;
@@ -223,18 +223,13 @@ impl AnthropicViaVertexProvider {
                 "Anthropic provider does not support presence/frequency penalty; dropping"
             );
         }
-        if matches!(
-            config.response_format,
-            Some(
-                crate::types::ResponseFormat::JsonObject
-                    | crate::types::ResponseFormat::JsonSchema { .. }
-            )
-        ) {
-            tracing::debug!(
-                "Anthropic has no native JSON mode; response_format dropped — use a function \
-                 tool with the schema for tool-use coercion instead"
-            );
-        }
+        // `config.response_format` is silently ignored here. Callers
+        // that want structured output on Anthropic should drive the
+        // request through `platformed_llm::generate`, which runs the
+        // default `JsonCoercionMiddleware` and rewrites the request as
+        // a forced-tool-call (unwrapped back to text on the response
+        // side). Calling `Provider::generate` directly bypasses
+        // middleware and the field is just dropped — same as before.
 
         Ok(anthropic_request)
     }
@@ -396,7 +391,11 @@ use crate::providers::flatten_user_parts_to_text;
 
 #[async_trait::async_trait]
 impl Provider for AnthropicViaVertexProvider {
-    async fn generate(&self, prompt: &crate::Prompt, config: &Config) -> Result<Response, Error> {
+    async fn generate(
+        &self,
+        prompt: &crate::Prompt,
+        config: &RawConfig,
+    ) -> Result<Response, Error> {
         let anthropic_request = self.convert_request(prompt, config)?;
 
         let url = self.endpoint.url(
@@ -731,8 +730,8 @@ mod tests {
     #[test]
     fn convert_simple_text_request() {
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("claude");
-        let body = provider().convert_request(&prompt, &cfg).unwrap();
+        let cfg = Config::builder("claude").build();
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         assert_eq!(body.messages.len(), 1);
         assert_eq!(body.messages[0].role, "user");
     }

@@ -4,7 +4,7 @@
 //! Run with: `cargo run --example mock_provider --features mock`
 
 use platformed_llm::providers::mock::{Chunking, MockProvider, MockResponse};
-use platformed_llm::{Config, FunctionCall, Prompt, Provider};
+use platformed_llm::{generate, Config, FunctionCall, Prompt, Provider};
 
 /// A toy "agent loop" — exactly the kind of code you'd want to test
 /// against a mock. It asks the model, runs any tool call, feeds the
@@ -13,11 +13,11 @@ async fn run_agent(
     provider: &dyn Provider,
     question: &str,
 ) -> Result<String, platformed_llm::Error> {
-    let config = Config::new("test-model");
+    let config = Config::builder("test-model").build();
     let mut prompt = Prompt::user(question);
 
     loop {
-        let response = provider.generate(&prompt, &config).await?.buffer().await?;
+        let response = generate(provider, &prompt, &config).await?.buffer().await?;
         match response.function_calls().first() {
             Some(call) => {
                 // Pretend we executed the tool.

@@ -7,7 +7,7 @@ use crate::types::{
     Annotation, AnnotationKind, PartKind, PartUpdate, ProviderBuiltin, ReasoningConfig,
     ReasoningEffort, ReasoningSummary, ToolChoice,
 };
-use crate::{Config, Error, Response, StreamEvent};
+use crate::{Error, RawConfig, Response, StreamEvent};
 use futures_util::StreamExt as _;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
@@ -73,7 +73,7 @@ impl OpenAIProvider {
     }
 
     /// Convert internal request to OpenAI Responses API format.
-    fn convert_request(&self, prompt: &crate::Prompt, config: &Config) -> ResponsesRequest {
+    fn convert_request(&self, prompt: &crate::Prompt, config: &RawConfig) -> ResponsesRequest {
         let messages = prompt.items();
 
         // Scan history for the latest InputItem::Continuation carrying
@@ -1008,7 +1008,11 @@ impl OpenAIStreamState {
 #[async_trait::async_trait]
 impl Provider for OpenAIProvider {
     /// Generate a chat completion (internally always streams).
-    async fn generate(&self, prompt: &crate::Prompt, config: &Config) -> Result<Response, Error> {
+    async fn generate(
+        &self,
+        prompt: &crate::Prompt,
+        config: &RawConfig,
+    ) -> Result<Response, Error> {
         let mut openai_request = self.convert_request(prompt, config);
         openai_request.stream = Some(true);
 
@@ -1162,8 +1166,8 @@ mod tests {
             (ToolChoice::None, serde_json::json!("none")),
             (ToolChoice::Required, serde_json::json!("required")),
         ] {
-            let cfg = Config::new("gpt-4").tool_choice(choice.clone());
-            let req = provider().convert_request(&prompt, &cfg);
+            let cfg = Config::builder("gpt-4").tool_choice(choice.clone()).build();
+            let req = provider().convert_request(&prompt, cfg.raw());
             let json = serde_json::to_value(&req).unwrap();
             assert_eq!(
                 json["tool_choice"], expected,
@@ -1175,10 +1179,12 @@ mod tests {
     #[test]
     fn tool_choice_serializes_function_as_typed_object() {
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-4").tool_choice(ToolChoice::Function {
-            name: "get_weather".to_string(),
-        });
-        let req = provider().convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-4")
+            .tool_choice(ToolChoice::Function {
+                name: "get_weather".to_string(),
+            })
+            .build();
+        let req = provider().convert_request(&prompt, cfg.raw());
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
             json["tool_choice"],
@@ -1192,11 +1198,13 @@ mod tests {
     fn reasoning_config_serializes_to_correct_shape() {
         use crate::types::{ReasoningConfig, ReasoningEffort, ReasoningSummary};
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-5").reasoning(ReasoningConfig {
-            effort: Some(ReasoningEffort::High),
-            summary: Some(ReasoningSummary::Auto),
-        });
-        let req = provider().convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-5")
+            .reasoning(ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                summary: Some(ReasoningSummary::Auto),
+            })
+            .build();
+        let req = provider().convert_request(&prompt, cfg.raw());
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
             json["reasoning"],
@@ -1255,8 +1263,11 @@ mod tests {
     #[test]
     fn parallel_tool_calls_and_store_are_caller_controlled() {
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-4").parallel_tool_calls(false).store(true);
-        let req = provider().convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-4")
+            .parallel_tool_calls(false)
+            .store(true)
+            .build();
+        let req = provider().convert_request(&prompt, cfg.raw());
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["parallel_tool_calls"], false);
         assert_eq!(json["store"], true);
@@ -1331,8 +1342,8 @@ mod tests {
                 },
             ))
             .with_user("follow-up");
-        let cfg = Config::new("gpt-5");
-        let body = provider().convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-5").build();
+        let body = provider().convert_request(&prompt, cfg.raw());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_1"));
         // Only the items after the assistant turn carrying the
         // continuation reach the wire.
@@ -1363,8 +1374,8 @@ mod tests {
         let prompt = Prompt::user("first turn")
             .with_response(&prior)
             .with_user("follow-up");
-        let cfg = Config::new("gpt-5");
-        let body = provider().convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-5").build();
+        let body = provider().convert_request(&prompt, cfg.raw());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_prior"));
         // Only the follow-up reaches the wire — everything else is
         // covered by the server-side response state.
@@ -1389,8 +1400,8 @@ mod tests {
                 },
             ))
             .with_user("c");
-        let cfg = Config::new("gpt-5");
-        let body = provider().convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-5").build();
+        let body = provider().convert_request(&prompt, cfg.raw());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_new"));
         // Only items strictly after the latest matching assistant turn.
         assert_eq!(body.input.len(), 1);
@@ -1409,8 +1420,8 @@ mod tests {
                 },
             ))
             .with_user("b");
-        let cfg = Config::new("gpt-5");
-        let body = provider().convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-5").build();
+        let body = provider().convert_request(&prompt, cfg.raw());
         assert!(body.previous_response_id.is_none());
         // Both user items still on the wire (continuation part drops out).
         assert_eq!(body.input.len(), 2);
@@ -1420,14 +1431,16 @@ mod tests {
     fn computer_use_builtin_carries_config_on_openai() {
         use crate::types::{ComputerUseConfig, ProviderBuiltin, Tool};
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-5").tools(vec![Tool::builtin(ProviderBuiltin::ComputerUse(
-            ComputerUseConfig {
-                display_width: 1280,
-                display_height: 800,
-                environment: "browser".to_string(),
-            },
-        ))]);
-        let body = provider().convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-5")
+            .tools(vec![Tool::builtin(ProviderBuiltin::ComputerUse(
+                ComputerUseConfig {
+                    display_width: 1280,
+                    display_height: 800,
+                    environment: "browser".to_string(),
+                },
+            ))])
+            .build();
+        let body = provider().convert_request(&prompt, cfg.raw());
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["tools"][0]["type"], "computer_use_preview");
         assert_eq!(json["tools"][0]["display_width"], 1280);
@@ -1439,8 +1452,10 @@ mod tests {
     fn response_format_json_object_emits_text_format() {
         use crate::types::ResponseFormat;
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-5").response_format(ResponseFormat::JsonObject);
-        let body = provider().convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-5")
+            .response_format(ResponseFormat::JsonObject)
+            .build();
+        let body = provider().convert_request(&prompt, cfg.raw());
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["text"]["format"]["type"], "json_object");
     }
@@ -1452,12 +1467,14 @@ mod tests {
         let schema_raw =
             serde_json::value::RawValue::from_string(r#"{"type":"object"}"#.to_string()).unwrap();
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-5").response_format(ResponseFormat::JsonSchema {
-            name: "Point".to_string(),
-            schema: Cow::Owned(schema_raw),
-            strict: true,
-        });
-        let body = provider().convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-5")
+            .response_format(ResponseFormat::JsonSchema {
+                name: "Point".to_string(),
+                schema: Cow::Owned(schema_raw),
+                strict: true,
+            })
+            .build();
+        let body = provider().convert_request(&prompt, cfg.raw());
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["text"]["format"]["type"], "json_schema");
         assert_eq!(json["text"]["format"]["name"], "Point");
@@ -1483,9 +1500,9 @@ mod tests {
         };
         let prompt1 = make_prompt();
         let prompt2 = make_prompt();
-        let cfg = Config::new("gpt-5");
-        let req1 = provider().convert_request(&prompt1, &cfg);
-        let req2 = provider().convert_request(&prompt2, &cfg);
+        let cfg = Config::builder("gpt-5").build();
+        let req1 = provider().convert_request(&prompt1, cfg.raw());
+        let req2 = provider().convert_request(&prompt2, cfg.raw());
         assert!(req1.prompt_cache_key.is_some());
         assert_eq!(req1.prompt_cache_key, req2.prompt_cache_key);
     }
@@ -1493,8 +1510,8 @@ mod tests {
     #[test]
     fn no_cache_breakpoint_means_no_prompt_cache_key() {
         let prompt = Prompt::user("hi");
-        let cfg = Config::new("gpt-5");
-        let req = provider().convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-5").build();
+        let req = provider().convert_request(&prompt, cfg.raw());
         assert!(req.prompt_cache_key.is_none());
     }
 
@@ -1508,11 +1525,11 @@ mod tests {
                 content: vec![UserPart::Text("ctx".into()), UserPart::CacheBreakpoint],
             })
         };
-        let cfg = Config::new("gpt-5");
+        let cfg = Config::builder("gpt-5").build();
         let p1 = make_prompt("system one");
         let p2 = make_prompt("system two");
-        let k1 = provider().convert_request(&p1, &cfg).prompt_cache_key;
-        let k2 = provider().convert_request(&p2, &cfg).prompt_cache_key;
+        let k1 = provider().convert_request(&p1, cfg.raw()).prompt_cache_key;
+        let k2 = provider().convert_request(&p2, cfg.raw()).prompt_cache_key;
         assert!(k1.is_some());
         assert_ne!(k1, k2);
     }
@@ -1521,8 +1538,11 @@ mod tests {
     fn test_request_conversion() {
         let provider = OpenAIProvider::new("test-key".to_string()).unwrap();
         let prompt = Prompt::user("Hello");
-        let cfg = Config::new("gpt-4").temperature(0.7).max_tokens(100);
-        let openai_request = provider.convert_request(&prompt, &cfg);
+        let cfg = Config::builder("gpt-4")
+            .temperature(0.7)
+            .max_tokens(100)
+            .build();
+        let openai_request = provider.convert_request(&prompt, cfg.raw());
         assert_eq!(openai_request.model, "gpt-4");
         assert_eq!(openai_request.temperature, Some(0.7));
         assert_eq!(openai_request.max_output_tokens, Some(100));
@@ -1532,9 +1552,8 @@ mod tests {
     fn cache_key_is_none_without_breakpoint() {
         // The common (no-breakpoint) path short-circuits to None.
         let p = Prompt::system("sys").with_user("hello");
-        let k = provider()
-            .convert_request(&p, &Config::new("gpt-5"))
-            .prompt_cache_key;
+        let cfg = Config::builder("gpt-5").build();
+        let k = provider().convert_request(&p, cfg.raw()).prompt_cache_key;
         assert_eq!(k, None);
     }
 

@@ -26,16 +26,16 @@
 //! - **Fixed** ([`MockProvider::with_text`] / [`MockProvider::always`]) —
 //!   the same reply on every call, forever.
 //! - **Dynamic** ([`MockProvider::with_handler`]) — a closure that picks a
-//!   reply based on the incoming [`Prompt`] / [`Config`], enabling
-//!   full tool-call-loop tests.
+//!   reply based on the incoming [`Prompt`] / [`crate::RawConfig`],
+//!   enabling full tool-call-loop tests.
 //!
-//! Every mode records the `(Prompt, Config)` of each call; grab a
+//! Every mode records the `(Prompt, RawConfig)` of each call; grab a
 //! [`CallLog`] via [`MockProvider::call_log`] *before* moving the provider
 //! into the code under test, then assert on what your code actually sent.
 //!
 //! ```no_run
 //! use platformed_llm::providers::mock::{MockProvider, MockResponse, Chunking};
-//! use platformed_llm::{Config, Prompt, Provider};
+//! use platformed_llm::{generate, Config, Prompt};
 //!
 //! # async fn demo() -> Result<(), platformed_llm::Error> {
 //! let provider = MockProvider::builder()
@@ -45,8 +45,8 @@
 //!     .build();
 //!
 //! let log = provider.call_log();
-//! let text = provider
-//!     .generate(&Prompt::user("hi"), &Config::new("test-model"))
+//! let cfg = Config::builder("test-model").build();
+//! let text = generate(&provider, &Prompt::user("hi"), &cfg)
 //!     .await?
 //!     .text()
 //!     .await?;
@@ -63,7 +63,7 @@ use async_trait::async_trait;
 use crate::types::{
     AssistantPart, FinishReason, FunctionCall, PartKind, PartUpdate, StreamEvent, Usage,
 };
-use crate::{Config, Error, Prompt, Provider, Response};
+use crate::{Error, Prompt, Provider, RawConfig, Response};
 
 /// How a [`MockResponse`]'s text / tool-argument content is split into
 /// streaming [`StreamEvent::Delta`]s.
@@ -417,7 +417,7 @@ pub struct RecordedCall {
     /// The prompt the caller passed.
     pub prompt: Prompt,
     /// The config the caller passed.
-    pub config: Config,
+    pub config: RawConfig,
 }
 
 /// A cheap, cloneable handle to a [`MockProvider`]'s recorded calls.
@@ -446,7 +446,7 @@ impl CallLog {
     }
 }
 
-type Handler = Box<dyn Fn(&Prompt, &Config) -> MockResponse + Send + Sync>;
+type Handler = Box<dyn Fn(&Prompt, &RawConfig) -> MockResponse + Send + Sync>;
 
 enum Mode {
     Queue(Mutex<VecDeque<Reply>>),
@@ -499,7 +499,7 @@ impl MockProvider {
     /// (pre-stream) errors are only scriptable via the queue builder.
     pub fn with_handler<F>(handler: F) -> Self
     where
-        F: Fn(&Prompt, &Config) -> MockResponse + Send + Sync + 'static,
+        F: Fn(&Prompt, &RawConfig) -> MockResponse + Send + Sync + 'static,
     {
         Self::new(Mode::Handler(Box::new(handler)), Chunking::default())
     }
@@ -518,7 +518,7 @@ impl MockProvider {
         }
     }
 
-    fn next_reply(&self, prompt: &Prompt, config: &Config) -> Result<Reply, Error> {
+    fn next_reply(&self, prompt: &Prompt, config: &RawConfig) -> Result<Reply, Error> {
         match &self.mode {
             Mode::Always(response) => Ok(Reply::Respond(response.clone())),
             Mode::Handler(handler) => Ok(Reply::Respond(handler(prompt, config))),
@@ -538,7 +538,7 @@ impl MockProvider {
 
 #[async_trait]
 impl Provider for MockProvider {
-    async fn generate(&self, prompt: &Prompt, config: &Config) -> Result<Response, Error> {
+    async fn generate(&self, prompt: &Prompt, config: &RawConfig) -> Result<Response, Error> {
         self.log
             .lock()
             .expect("MockProvider log mutex poisoned")
@@ -599,8 +599,8 @@ impl MockProviderBuilder {
 mod tests {
     use super::*;
 
-    fn cfg() -> Config {
-        Config::new("test-model")
+    fn cfg() -> RawConfig {
+        crate::Config::builder("test-model").build().raw().clone()
     }
 
     #[tokio::test]
@@ -816,8 +816,9 @@ mod tests {
         let log = provider.call_log();
         assert!(log.is_empty());
 
+        let cfg = crate::Config::builder("model-x").build();
         provider
-            .generate(&Prompt::user("hello"), &Config::new("model-x"))
+            .generate(&Prompt::user("hello"), cfg.raw())
             .await
             .unwrap();
 

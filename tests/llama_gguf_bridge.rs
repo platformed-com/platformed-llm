@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use platformed_llm::providers::local::LocalEngine;
 use platformed_llm::providers::LlamaGgufProvider;
-use platformed_llm::{Config, FinishReason, Prompt, Provider};
+use platformed_llm::{generate, Config, FinishReason, Prompt};
 
 /// Mock engine yielding a fixed script of token results.
 struct ScriptEngine(Vec<Result<String, String>>);
@@ -33,10 +33,8 @@ fn provider(script: Vec<Result<String, String>>) -> LlamaGgufProvider {
 async fn budget_exhausted_reports_length() {
     // 3 chunks emitted, max_tokens 2 → budget exhausted → Length.
     let p = provider(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())]);
-    let resp = p
-        .generate(&Prompt::user("hi"), &Config::new("m").max_tokens(2))
-        .await
-        .unwrap();
+    let cfg = Config::builder("m").max_tokens(2).build();
+    let resp = generate(&p, &Prompt::user("hi"), &cfg).await.unwrap();
     let complete = resp.buffer().await.unwrap();
     assert_eq!(complete.finish_reason, FinishReason::Length);
 }
@@ -44,10 +42,8 @@ async fn budget_exhausted_reports_length() {
 #[tokio::test]
 async fn natural_stop_reports_stop() {
     let p = provider(vec![Ok("hello".into())]);
-    let resp = p
-        .generate(&Prompt::user("hi"), &Config::new("m").max_tokens(100))
-        .await
-        .unwrap();
+    let cfg = Config::builder("m").max_tokens(100).build();
+    let resp = generate(&p, &Prompt::user("hi"), &cfg).await.unwrap();
     let complete = resp.buffer().await.unwrap();
     assert_eq!(complete.finish_reason, FinishReason::Stop);
 }
@@ -55,10 +51,8 @@ async fn natural_stop_reports_stop() {
 #[tokio::test]
 async fn engine_error_propagates_and_suppresses_done() {
     let p = provider(vec![Ok("partial".into()), Err("boom".into())]);
-    let resp = p
-        .generate(&Prompt::user("hi"), &Config::new("m").max_tokens(100))
-        .await
-        .unwrap();
+    let cfg = Config::builder("m").max_tokens(100).build();
+    let resp = generate(&p, &Prompt::user("hi"), &cfg).await.unwrap();
     // The mid-stream engine error must surface as a stream error
     // (collect returns Err), not a silent clean finish.
     let err = resp

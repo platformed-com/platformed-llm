@@ -1,7 +1,9 @@
 use futures_util::StreamExt;
 use ijson::IValue;
 use platformed_llm::accumulator::ResponseAccumulator;
-use platformed_llm::{Config, Error, Function, Prompt, ProviderFactory, StreamEvent, Tool};
+use platformed_llm::{
+    generate, Config, Error, Function, Prompt, ProviderFactory, StreamEvent, Tool,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -154,17 +156,18 @@ async fn main() -> Result<(), Error> {
 
     println!("🎯 Using model: {model_name}");
 
-    let cfg = Config::new(&model_name)
+    let cfg = Config::builder(&model_name)
         .temperature(0.2)
         .max_tokens(300)
-        .tools(vec![get_weather.clone(), calculate.clone()]);
+        .tools(vec![get_weather.clone(), calculate.clone()])
+        .build();
 
     println!("👤 User: What's the weather like in Tokyo? Also, what's 15 multiplied by 23?");
     println!();
 
     // Generate response with function calling
     println!("📡 Making API request...");
-    let response = match provider.generate(&conversation, &cfg).await {
+    let response = match generate(&*provider, &conversation, &cfg).await {
         Ok(response) => {
             println!("✅ API request successful");
             response
@@ -308,7 +311,7 @@ async fn main() -> Result<(), Error> {
         println!();
         println!("🔁 Sending function results back to AI...");
 
-        current_response = provider.generate(&conversation, &cfg).await?;
+        current_response = generate(&*provider, &conversation, &cfg).await?;
     }
 
     println!();

@@ -11,6 +11,12 @@
 /// expose it for advanced users that drive the event stream themselves
 /// (e.g. running the accumulator alongside a live UI handler).
 pub mod accumulator;
+/// Per-model capability table consulted by middleware to decide which
+/// features can be requested natively vs. need a polyfill or drop.
+pub mod capabilities;
+/// Request/response middleware applied above the provider layer —
+/// polyfills, validation, and the top-level [`generate`] entry point.
+pub mod middleware;
 /// Concrete provider implementations. Browse this module to see what
 /// backends the lib supports and how to construct each one.
 pub mod providers;
@@ -41,13 +47,16 @@ mod types;
 // and are reachable via the fully-qualified path. No globs — adding a
 // `pub` item to an internal module must not leak it.
 
+pub use capabilities::Capabilities;
 pub use error::Error;
 pub use factory::{ProviderConfig, ProviderFactory, ProviderType};
+pub use middleware::{generate, JsonCoercionMiddleware, Middleware};
 pub use provider::Provider;
 pub use response::{CompleteResponse, Response};
 pub use types::{
     Annotation, AnnotationKind, AssistantPart, AudioSource, ComputerUseConfig, Config,
-    DocumentSource, FinishReason, Function, FunctionCall, ImageSource, InputItem, PartKind,
-    PartUpdate, Prompt, ProviderBuiltin, ProviderContinuation, ReasoningConfig, ReasoningEffort,
-    ReasoningSummary, ResponseFormat, StreamEvent, Tool, ToolChoice, Usage, UserPart,
+    ConfigBuilder, DocumentSource, FinishReason, Function, FunctionCall, ImageSource, InputItem,
+    PartKind, PartUpdate, Prompt, ProviderBuiltin, ProviderContinuation, RawConfig,
+    ReasoningConfig, ReasoningEffort, ReasoningSummary, ResponseFormat, StreamEvent, Tool,
+    ToolChoice, Usage, UserPart,
 };

@@ -13,8 +13,8 @@ pub mod streaming;
 // module doesn't accidentally leak into the public surface.
 
 pub use config::{
-    Config, ProviderContinuation, ReasoningConfig, ReasoningEffort, ReasoningSummary,
-    ResponseFormat, ToolChoice, Usage,
+    Config, ConfigBuilder, ProviderContinuation, RawConfig, ReasoningConfig, ReasoningEffort,
+    ReasoningSummary, ResponseFormat, ToolChoice, Usage,
 };
 pub use message::{
     Annotation, AnnotationKind, AssistantPart, AudioSource, ComputerUseConfig, DocumentSource,

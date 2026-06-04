@@ -34,7 +34,7 @@ use futures::channel::oneshot;
 use llama_gguf::engine::EngineConfig;
 
 use crate::provider::Provider;
-use crate::types::{Config, FinishReason, Prompt, Tool};
+use crate::types::{FinishReason, Prompt, RawConfig, Tool};
 use crate::{Error, Response};
 
 use super::chat_template::{function_tools, translate_to_events, ChatTemplate, TokenStream};
@@ -78,7 +78,8 @@ impl LlamaGgufProvider {
 
     /// Load a GGUF model with a caller-supplied [`EngineConfig`]. The
     /// `max_tokens` field is overridden per-call by
-    /// [`Config::max_tokens`]; everything else is locked in at load time.
+    /// [`crate::RawConfig::max_tokens`]; everything else is locked in at
+    /// load time.
     pub fn from_engine_config(config: EngineConfig) -> Result<Self, Error> {
         let engine = llama_gguf::engine::Engine::load(config)
             .map_err(|e| Error::provider("llama-gguf", format!("failed to load model: {e}")))?;
@@ -119,7 +120,16 @@ impl LlamaGgufProvider {
 
 #[async_trait]
 impl Provider for LlamaGgufProvider {
-    async fn generate(&self, prompt: &Prompt, config: &Config) -> Result<Response, Error> {
+    /// Local llama-gguf has no native JSON mode, no schema-constrained
+    /// output, no schema+tools. Return [`crate::Capabilities::default`]
+    /// (everything false) — the default middleware chain will
+    /// polyfill `response_format` via tool-use coercion, which the
+    /// ChatML template supports natively.
+    fn capabilities(&self, _model: &str) -> crate::Capabilities {
+        crate::Capabilities::default()
+    }
+
+    async fn generate(&self, prompt: &Prompt, config: &RawConfig) -> Result<Response, Error> {
         let tools = config
             .tools
             .as_deref()

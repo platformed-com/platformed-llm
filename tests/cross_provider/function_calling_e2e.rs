@@ -8,7 +8,7 @@
 
 use futures_util::StreamExt;
 use platformed_llm::accumulator::ResponseAccumulator;
-use platformed_llm::{Config, InputItem, Prompt, ProviderContinuation};
+use platformed_llm::{generate, Config, InputItem, Prompt, ProviderContinuation};
 
 use super::providers::{
     anthropic::AnthropicTestSetup, create_weather_tool, google::GoogleTestSetup,
@@ -25,15 +25,16 @@ async fn run_function_calling_test<T: ProviderTestSetup>() -> Result<(), Box<dyn
     )
     .with_user("What's the weather like in Paris?");
 
-    let cfg = Config::new(config.model)
+    let cfg = Config::builder(config.model)
         .temperature(0.7)
         .max_tokens(150)
-        .tools(vec![create_weather_tool()]);
+        .tools(vec![create_weather_tool()])
+        .build();
 
     // First turn: ScriptedTransport asserts the lib's emitted request
     // body matches the expected initial payload, then returns the
     // canned function-call SSE.
-    let response = provider.generate(&conversation, &cfg).await?;
+    let response = generate(&*provider, &conversation, &cfg).await?;
 
     let mut accumulator = ResponseAccumulator::new();
     let mut stream = response.stream();
@@ -98,10 +99,13 @@ async fn run_function_calling_test<T: ProviderTestSetup>() -> Result<(), Box<dyn
             .to_string(),
     ));
 
-    let followup_cfg = Config::new(config.model).temperature(0.7).max_tokens(150);
+    let followup_cfg = Config::builder(config.model)
+        .temperature(0.7)
+        .max_tokens(150)
+        .build();
 
     // Second turn: ScriptedTransport asserts the follow-up body shape.
-    let followup_response = provider.generate(&conversation, &followup_cfg).await?;
+    let followup_response = generate(&*provider, &conversation, &followup_cfg).await?;
     let followup_text = followup_response.text().await?;
     assert!(
         !followup_text.trim().is_empty(),

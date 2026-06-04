@@ -104,9 +104,9 @@ pub enum ProviderContinuation {
 ///   "json_schema": {...}}`.
 /// - **Gemini**: maps to `generationConfig.responseMimeType:
 ///   "application/json"` plus `responseSchema` for `JsonSchema`.
-/// - **Anthropic**: silently dropped — Anthropic has no native JSON
-///   mode. Callers wanting structured output on Anthropic should use
-///   tool-use coercion (a function tool with the schema).
+/// - **Anthropic**: no native JSON mode. The default middleware chain
+///   polyfills this via tool-use coercion (see
+///   [`crate::JsonCoercionMiddleware`]).
 #[derive(Debug, Clone)]
 pub enum ResponseFormat {
     /// Default — unconstrained text output.
@@ -144,14 +144,16 @@ pub enum ToolChoice {
     },
 }
 
-/// Model selection plus sampling / tool / structured-output settings
-/// for an LLM call. Independent of the prompt so a single `Config`
-/// can be reused across many prompts targeting the same model.
+/// The request payload that flows through the middleware chain and
+/// into the provider.
 ///
-/// `model` is required; every other field is `Option` and `None` means
-/// "use the provider's default."
+/// Held inside [`Config`] as the `raw` template; copied at the top of
+/// [`crate::generate`] into a `Cow<RawConfig>` that middleware
+/// modify. Capabilities are *not* a field here — they're resolved by
+/// the provider per call (see [`crate::Provider::capabilities`]) and
+/// flow alongside `RawConfig` through the pipeline.
 #[derive(Debug, Clone)]
-pub struct Config {
+pub struct RawConfig {
     /// Provider-specific model identifier (e.g. `"gpt-4o"`,
     /// `"gemini-2.5-pro"`, `"claude-sonnet-4-5"`).
     pub model: String,
@@ -187,7 +189,92 @@ pub struct Config {
     pub response_format: Option<ResponseFormat>,
 }
 
+/// User-facing request spec. Bundles the [`RawConfig`] payload with
+/// an optional middleware override. Capabilities are *not* per-call
+/// — they're owned by the provider (see
+/// [`crate::Provider::capabilities`]) and resolved at
+/// [`crate::generate`] time. Middleware default to
+/// [`crate::middleware::default_middleware`] applied to the resolved
+/// caps unless the caller pinned a specific chain via
+/// [`ConfigBuilder::with_middleware`].
+///
+/// Constructed via [`Config::builder`]. The struct itself is
+/// inspectable but immutable from the caller's side; use the builder
+/// to make changes.
+#[derive(Clone)]
+pub struct Config {
+    raw: RawConfig,
+    #[allow(clippy::type_complexity)]
+    middleware_override: Option<Vec<std::sync::Arc<dyn crate::middleware::Middleware>>>,
+}
+
 impl Config {
+    /// Start a builder targeting `model`. Equivalent to
+    /// [`ConfigBuilder::new`].
+    pub fn builder(model: impl Into<String>) -> ConfigBuilder {
+        ConfigBuilder::new(model)
+    }
+
+    /// Borrow the [`RawConfig`] payload. This is what gets threaded
+    /// through middleware and reaches the provider.
+    pub fn raw(&self) -> &RawConfig {
+        &self.raw
+    }
+
+    /// Caller's middleware override, if any. `None` means
+    /// [`crate::middleware::default_middleware`] is derived from the
+    /// resolved capabilities at `generate()` time.
+    pub fn middleware_override(
+        &self,
+    ) -> Option<&[std::sync::Arc<dyn crate::middleware::Middleware>]> {
+        self.middleware_override.as_deref()
+    }
+}
+
+// `Config` carries an `Arc<dyn Middleware>` vector; `dyn Middleware: Debug`
+// is a trait supertype so this would work, but the wrapper struct doesn't
+// derive `Debug` automatically because of the trait-object indirection. A
+// manual impl prints the raw fields plus a count of installed middleware
+// so logs are useful without dumping every middleware's Debug body.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("raw", &self.raw)
+            .field(
+                "middleware_override_count",
+                &self.middleware_override.as_ref().map(|m| m.len()),
+            )
+            .finish()
+    }
+}
+
+/// Builder for [`Config`]. Created via [`ConfigBuilder::new`] or
+/// [`Config::builder`]; finalized via [`ConfigBuilder::build`].
+///
+/// All settings except `model` default to `None` (provider default).
+/// Capability and middleware overrides default to "use the library's
+/// auto-derived value"; setting either pins the chain to the value
+/// you supply, including `Vec::new()` to disable polyfills entirely.
+#[derive(Clone)]
+pub struct ConfigBuilder {
+    model: String,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    top_p: Option<f32>,
+    stop: Option<Vec<String>>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    tools: Option<Vec<super::message::Tool>>,
+    tool_choice: Option<ToolChoice>,
+    parallel_tool_calls: Option<bool>,
+    store: Option<bool>,
+    reasoning: Option<ReasoningConfig>,
+    response_format: Option<ResponseFormat>,
+    #[allow(clippy::type_complexity)]
+    middleware_override: Option<Vec<std::sync::Arc<dyn crate::middleware::Middleware>>>,
+}
+
+impl ConfigBuilder {
     /// Build a config targeting `model`. All other fields default to
     /// `None` (provider default); set them via the chainable builder
     /// methods.
@@ -206,6 +293,7 @@ impl Config {
             store: None,
             reasoning: None,
             response_format: None,
+            middleware_override: None,
         }
     }
 
@@ -309,6 +397,45 @@ impl Config {
         self.response_format = Some(response_format);
         self
     }
+
+    /// Override the middleware chain. Pass `Vec::new()` to disable all
+    /// polyfills (validation will still run and surface unsupported
+    /// requests as `Error::Config`). Pass a custom list to add your
+    /// own middleware or reorder the defaults.
+    pub fn with_middleware(
+        mut self,
+        middleware: Vec<std::sync::Arc<dyn crate::middleware::Middleware>>,
+    ) -> Self {
+        self.middleware_override = Some(middleware);
+        self
+    }
+
+    /// Finalize into a [`Config`]. Cheap — no capability resolution
+    /// or middleware derivation happens here. Both are deferred to
+    /// [`crate::generate`], which asks the provider for the model's
+    /// capabilities and derives the default middleware list from
+    /// them. Use [`Self::with_middleware`] to pin a specific chain
+    /// before the call.
+    pub fn build(self) -> Config {
+        Config {
+            raw: RawConfig {
+                model: self.model,
+                temperature: self.temperature,
+                max_tokens: self.max_tokens,
+                top_p: self.top_p,
+                stop: self.stop,
+                presence_penalty: self.presence_penalty,
+                frequency_penalty: self.frequency_penalty,
+                tools: self.tools,
+                tool_choice: self.tool_choice,
+                parallel_tool_calls: self.parallel_tool_calls,
+                store: self.store,
+                reasoning: self.reasoning,
+                response_format: self.response_format,
+            },
+            middleware_override: self.middleware_override,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -316,43 +443,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn llm_config_builder_chains() {
-        let cfg = Config::new("gpt-4")
+    fn builder_chains() {
+        let cfg = Config::builder("gpt-4")
             .temperature(0.8)
             .max_tokens(500)
-            .top_p(0.9);
-        assert_eq!(cfg.model, "gpt-4");
-        assert_eq!(cfg.temperature, Some(0.8));
-        assert_eq!(cfg.max_tokens, Some(500));
-        assert_eq!(cfg.top_p, Some(0.9));
-        assert!(cfg.tools.is_none());
+            .top_p(0.9)
+            .build();
+        assert_eq!(cfg.raw().model, "gpt-4");
+        assert_eq!(cfg.raw().temperature, Some(0.8));
+        assert_eq!(cfg.raw().max_tokens, Some(500));
+        assert_eq!(cfg.raw().top_p, Some(0.9));
+        assert!(cfg.raw().tools.is_none());
     }
 
     #[test]
     #[should_panic(expected = "temperature must be finite")]
     fn temperature_out_of_range_panics() {
-        Config::new("m").temperature(5.0);
+        ConfigBuilder::new("m").temperature(5.0);
     }
 
     #[test]
     #[should_panic(expected = "temperature must be finite")]
     fn temperature_nan_panics() {
-        Config::new("m").temperature(f32::NAN);
+        ConfigBuilder::new("m").temperature(f32::NAN);
     }
 
     #[test]
     #[should_panic(expected = "top_p must be finite")]
     fn top_p_out_of_range_panics() {
-        Config::new("m").top_p(1.5);
+        ConfigBuilder::new("m").top_p(1.5);
     }
 
     #[test]
     fn boundary_values_are_accepted() {
-        let cfg = Config::new("m")
+        let cfg = ConfigBuilder::new("m")
             .temperature(2.0)
             .top_p(0.0)
             .presence_penalty(-2.0)
-            .frequency_penalty(2.0);
-        assert_eq!(cfg.temperature, Some(2.0));
+            .frequency_penalty(2.0)
+            .build();
+        assert_eq!(cfg.raw().temperature, Some(2.0));
+    }
+
+    #[test]
+    fn build_records_middleware_override() {
+        let cfg = Config::builder("claude-sonnet-4-5")
+            .with_middleware(Vec::new())
+            .build();
+        assert_eq!(cfg.middleware_override().map(|m| m.len()), Some(0));
     }
 }
