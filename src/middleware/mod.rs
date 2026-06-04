@@ -106,15 +106,17 @@ pub fn default_middleware(caps: &Capabilities) -> Vec<Arc<dyn Middleware>> {
 /// Returns `Err(Error::Config)` with a precise message when a gap
 /// remains.
 pub fn validate(config: &RawConfig, caps: &Capabilities) -> Result<(), Error> {
-    // Only `JsonSchema` maps to Gemini's `responseSchema`, which is the
-    // feature that can't be combined with function tools on the 2.x
-    // family. `JsonObject` maps to `responseMimeType` (the
-    // `native_json_mode` flag) — a different feature that is *not*
-    // subject to the schema-vs-tools restriction — so it must not gate
-    // the combined-request check below.
-    let asks_for_schema_with_tools = matches!(
+    // Vertex rejects *controlled generation of any form* combined with
+    // function calling on the restricted Gemini families — the wire
+    // error is literally "Function calling with a response mime type:
+    // 'application/json' is unsupported". That covers both
+    // `responseMimeType` (our `JsonObject`) and `responseSchema` (our
+    // `JsonSchema`), so both must gate the combined-request check.
+    // `response_schema_with_tools` is the flag for "controlled
+    // generation may be combined with tools".
+    let asks_for_schema = matches!(
         config.response_format,
-        Some(ResponseFormat::JsonSchema { .. })
+        Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
     );
     let has_function_tools = config
         .tools
@@ -139,7 +141,7 @@ pub fn validate(config: &RawConfig, caps: &Capabilities) -> Result<(), Error> {
             )));
         }
     }
-    if asks_for_schema_with_tools && has_function_tools && !caps.response_schema_with_tools {
+    if asks_for_schema && has_function_tools && !caps.response_schema_with_tools {
         return Err(Error::config(format!(
             "model '{}' does not support combining response_format with function-calling \
              tools and no middleware reconciled them",
@@ -272,13 +274,17 @@ mod tests {
         assert!(err.to_string().contains("combining"), "got: {err}");
     }
 
-    /// `JsonObject` maps to Gemini's `responseMimeType`, not
-    /// `responseSchema` — so combining it with function tools is *not*
-    /// subject to the schema-vs-tools restriction the 2.x family
-    /// imposes. It must pass validation on a model that supports native
-    /// JSON mode (2.5) even with function tools present.
+    /// Vertex rejects controlled generation combined with function
+    /// calling on Gemini 2.x — and that restriction covers
+    /// `responseMimeType` (`JsonObject`), not just `responseSchema`
+    /// (the wire error is "Function calling with a response mime type:
+    /// 'application/json' is unsupported"). So `validate()` must reject
+    /// `JsonObject` + tools on 2.5 when no middleware reconciled it,
+    /// exactly as it does for `JsonSchema` + tools. (With the default
+    /// middleware present `JsonCoercionMiddleware` polyfills it; this
+    /// guards the safety net for callers who disable middleware.)
     #[test]
-    fn validate_allows_json_object_plus_tools_on_pre_3_gemini() {
+    fn validate_rejects_json_object_plus_tools_on_pre_3_gemini() {
         let cfg = Config::builder("gemini-2.5-flash")
             .response_format(ResponseFormat::JsonObject)
             .tools(vec![Tool::Function(Function {
@@ -291,7 +297,9 @@ mod tests {
             .build();
         let caps = Capabilities::for_model(&cfg.raw().model);
         assert!(caps.native_json_mode && !caps.response_schema_with_tools);
-        validate(cfg.raw(), &caps).expect("JsonObject + tools is allowed on 2.5");
+        let err = validate(cfg.raw(), &caps)
+            .expect_err("JsonObject + tools is rejected on 2.5 controlled generation");
+        assert!(err.to_string().contains("combining"), "got: {err}");
     }
 
     #[test]

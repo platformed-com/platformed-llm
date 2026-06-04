@@ -83,7 +83,17 @@ impl Middleware for JsonCoercionMiddleware {
         let parameters: Cow<'static, serde_json::value::RawValue> = match rf {
             ResponseFormat::Text => return Ok(None),
             ResponseFormat::JsonObject => {
-                if caps.native_json_mode {
+                // Native JSON mode alone is enough *unless* the caller
+                // also has function tools: Vertex rejects controlled
+                // generation (responseMimeType included) combined with
+                // function calling on the restricted families, so fall
+                // back to tool-coercion in that case too.
+                let supported = if has_caller_function_tools {
+                    caps.response_schema_with_tools
+                } else {
+                    caps.native_json_mode
+                };
+                if supported {
                     return Ok(None);
                 }
                 Cow::Owned(
@@ -644,6 +654,74 @@ mod tests {
         assert!(tools
             .iter()
             .any(|t| matches!(t, Tool::Function(f) if f.name.starts_with("respond_with_json"))));
+    }
+
+    /// `JsonObject` alone on a model with native JSON mode (Gemini 2.5)
+    /// is handled natively — the polyfill no-ops.
+    #[test]
+    fn json_object_without_tools_noops_on_native_json_model() {
+        let prompt = Prompt::user("hi");
+        let cfg = ConfigBuilder::new("gemini-2.5-flash")
+            .response_format(ResponseFormat::JsonObject)
+            .build();
+        let mut prompt_cow: Cow<'_, Prompt> = Cow::Borrowed(&prompt);
+        let mut raw_cow: Cow<'_, RawConfig> = Cow::Borrowed(cfg.raw());
+        let transform = JsonCoercionMiddleware
+            .apply(
+                &mut prompt_cow,
+                &mut raw_cow,
+                &Capabilities::for_model(&cfg.raw().model),
+            )
+            .unwrap();
+        assert!(transform.is_none());
+        assert!(matches!(raw_cow, Cow::Borrowed(_)));
+    }
+
+    /// `JsonObject` + tools on Gemini 2.5: native JSON mode exists, but
+    /// Vertex rejects controlled generation combined with function
+    /// calling (`responseMimeType` included), so the polyfill must NOT
+    /// no-op — it synthesizes an open-object tool and clears
+    /// `response_format`, exactly as the `JsonSchema` + tools path does.
+    #[test]
+    fn json_object_plus_tools_polyfills_on_pre_3_gemini() {
+        let prompt = Prompt::user("hi");
+        let cfg = ConfigBuilder::new("gemini-2.5-flash")
+            .response_format(ResponseFormat::JsonObject)
+            .tools(vec![Tool::Function(Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: std::borrow::Cow::Owned(
+                    serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                ),
+            })])
+            .build();
+        let mut prompt_cow: Cow<'_, Prompt> = Cow::Borrowed(&prompt);
+        let mut raw_cow: Cow<'_, RawConfig> = Cow::Borrowed(cfg.raw());
+        let transform = JsonCoercionMiddleware
+            .apply(
+                &mut prompt_cow,
+                &mut raw_cow,
+                &Capabilities::for_model(&cfg.raw().model),
+            )
+            .unwrap();
+        assert!(transform.is_some());
+        let raw = &*raw_cow;
+        assert!(raw.response_format.is_none());
+        assert!(matches!(raw.tool_choice, Some(ToolChoice::Required)));
+        let tools = raw.tools.as_ref().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(tools
+            .iter()
+            .any(|t| matches!(t, Tool::Function(f) if f.name.starts_with("respond_with_json"))));
+        // The synth tool's schema is the open-object schema.
+        let synth = tools
+            .iter()
+            .find_map(|t| match t {
+                Tool::Function(f) if f.name.starts_with("respond_with_json") => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        assert!(synth.parameters.get().contains("additionalProperties"));
     }
 
     /// When no caller function tools are present, the polyfill still
