@@ -1,9 +1,8 @@
 PartStart[0] text
 Delta[0] "4"
-Delta[0] " +"
-Delta[0] " "
+Delta[0] "+"
 Delta[0] "4"
-Delta[0] " equals"
+Delta[0] " is"
 Delta[0] " "
 Delta[0] "8"
 Delta[0] "."
@@ -14,5 +13,5 @@ Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
-part[0] text "4 + 4 equals 8." annotations=0
+part[0] text "4+4 is 8." annotations=0
 part[1] continuation kind=OpenAI id=<n>

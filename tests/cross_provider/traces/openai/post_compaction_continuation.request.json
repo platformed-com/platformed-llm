@@ -7,7 +7,7 @@
     },
     {
       "content": "[Compacted memo of earlier conversation]\n\nI asked you what 2+2 was, and you said 4. I then asked what 3+3 was, and you said 6.",
-      "role": "assistant",
+      "role": "user",
       "type": "message"
     },
     {

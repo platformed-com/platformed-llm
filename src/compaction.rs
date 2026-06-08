@@ -96,9 +96,9 @@ Output ONLY the memo. Do not address the user; do not include preamble like \
 \"Here's a summary\"; do not wrap the memo in markdown fences.";
 
 /// Default prefix applied to the summary text when it's inserted as
-/// the synthetic assistant turn during rebuild. Signals to the
-/// post-compaction model that the assistant turn is a memo, not its
-/// own prior reply.
+/// the synthetic user turn during rebuild. Signals to the
+/// post-compaction model that the user turn is a memo recapping
+/// earlier conversation, not a fresh request.
 pub const DEFAULT_MEMO_PREFIX: &str = "[Compacted memo of earlier conversation]\n\n";
 
 /// Configurable conversation compactor.
@@ -150,7 +150,7 @@ impl Compactor {
     }
 
     /// Override the prefix applied to the summary text when it's
-    /// inserted as a synthetic assistant turn during rebuild.
+    /// inserted as a synthetic user turn during rebuild.
     pub fn with_memo_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.memo_prefix = prefix.into();
         self
@@ -172,7 +172,22 @@ impl Compactor {
 
     /// Rewrite `history` as a compacted prompt: ask the model to
     /// summarize the conversation so far into a dense memo, then
-    /// rebuild as `[original system, synthetic assistant memo]`.
+    /// rebuild as `[original system, synthetic user memo]`.
+    ///
+    /// The memo lands as a `User` turn rather than `Assistant` for
+    /// two reasons. First, it matches the voice of the default
+    /// summarization instruction (aider's "user retelling" framing:
+    /// "I asked you to…"), so the role and the content agree.
+    /// Second, it's load-bearing on Anthropic-via-Vertex, which
+    /// hoists `system` to a top-level field. If the rebuild started
+    /// with an assistant turn the wire `messages` array would lead
+    /// with `assistant`, and Anthropic's Messages API rejects that
+    /// with a 400 (`first message must use the "user" role`). With
+    /// the memo as a user turn the wire array leads with `user`,
+    /// which every provider accepts; the caller's subsequent
+    /// `with_user(live)` append produces two consecutive user turns,
+    /// which Anthropic and Google both merge transparently and
+    /// OpenAI accepts as-is.
     ///
     /// The returned prompt is *ready to continue from* — callers
     /// append whatever the next turn looks like (a fresh user
@@ -219,7 +234,7 @@ impl Compactor {
             Some(s) => Prompt::system(s),
             None => Prompt::new(),
         };
-        Ok(rebuilt.with_assistant(format!("{}{}", self.memo_prefix, summary.trim())))
+        Ok(rebuilt.with_user(format!("{}{}", self.memo_prefix, summary.trim())))
     }
 }
 
@@ -238,7 +253,7 @@ mod tests {
     use super::*;
     use crate::providers::mock::{MockProvider, MockResponse};
     use crate::types::Usage;
-    use crate::{AssistantPart, InputItem, UserPart};
+    use crate::{InputItem, UserPart};
 
     fn caps_128k() -> Capabilities {
         Capabilities {
@@ -295,27 +310,27 @@ mod tests {
             .await
             .unwrap();
         let items = compacted.items();
-        // [system, assistant(memo)].
+        // [system, user(memo)].
         assert_eq!(items.len(), 2);
         assert!(matches!(&items[0], InputItem::System(s) if s == "You are helpful."));
         match &items[1] {
-            InputItem::Assistant { content } => {
+            InputItem::User { content } => {
                 assert_eq!(content.len(), 1);
                 match &content[0] {
-                    AssistantPart::Text { content: t, .. } => {
+                    UserPart::Text(t) => {
                         assert!(t.starts_with(DEFAULT_MEMO_PREFIX));
                         assert!(t.contains("Memo body"));
                     }
                     other => panic!("expected text part, got {other:?}"),
                 }
             }
-            other => panic!("expected assistant turn, got {other:?}"),
+            other => panic!("expected user turn, got {other:?}"),
         }
     }
 
-    /// `compact()` returns just `[system, assistant-memo]` — the
-    /// caller appends the next turn themselves. This test pins that
-    /// shape and demonstrates the standard caller-side append.
+    /// `compact()` returns just `[system, user-memo]` — the caller
+    /// appends the next turn themselves. This test pins that shape
+    /// and demonstrates the standard caller-side append.
     #[tokio::test]
     async fn caller_attaches_next_turn_after_compaction() {
         let provider = MockProvider::builder()
@@ -328,7 +343,7 @@ mod tests {
             .compact(&provider, &config, history)
             .await
             .unwrap();
-        // Rebuilt prompt is exactly [system, assistant-memo].
+        // Rebuilt prompt is exactly [system, user-memo].
         assert_eq!(compacted.items().len(), 2);
 
         // Callers attach whatever the next turn looks like — here a
@@ -360,10 +375,10 @@ mod tests {
             .compact(&provider, &config, history)
             .await
             .unwrap();
-        // First item is the assistant-memo (no system was preserved).
+        // First item is the user-memo (no system was preserved).
         match &compacted.items()[0] {
-            InputItem::Assistant { .. } => {}
-            other => panic!("expected assistant first, got {other:?}"),
+            InputItem::User { .. } => {}
+            other => panic!("expected user first, got {other:?}"),
         }
     }
 

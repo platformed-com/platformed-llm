@@ -9,7 +9,7 @@
 //! - If a turn fails with [`Error::ContextWindowExceeded`] (the
 //!   single message itself overflowed the window), compact the prior
 //!   history, then re-attach the live user message and retry once.
-//!   `Compactor::compact` returns `[system, assistant-memo]`; the
+//!   `Compactor::compact` returns `[system, user-memo]`; the
 //!   caller appends the next turn — see `send_with_recovery` below.
 //!
 //! The compaction prompt itself lives in the library
@@ -149,7 +149,7 @@ async fn send_with_recovery(
         Err(Error::ContextWindowExceeded { message, .. }) => {
             eprintln!("  [context window exceeded mid-turn: {message}]");
             eprintln!("  [compacting prior history and retrying…]");
-            // Compact returns `[system, assistant-memo]`; we attach
+            // Compact returns `[system, user-memo]`; we attach
             // the live user message on top and retry. This is the
             // same shape as the happy path's
             // `conversation.with_user(user_msg)` — the only
