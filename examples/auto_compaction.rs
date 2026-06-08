@@ -4,13 +4,14 @@
 //!
 //! - After every successful turn, check [`Compactor::should_compact`]
 //!   against the response's [`Usage`] and the model's
-//!   [`Capabilities`]. If over the threshold, summarize-and-rebuild
-//!   before the next user message.
-//! - If a turn fails with [`Error::ContextWindowExceeded`] (the
-//!   single message itself overflowed the window), compact the prior
-//!   history, then re-attach the live user message and retry once.
-//!   `Compactor::compact` returns `[system, user-memo]`; the
-//!   caller appends the next turn — see `send_with_recovery` below.
+//!   [`Capabilities`]. If over the threshold, hand the full
+//!   conversation to [`Compactor::compact`] which returns a drop-in
+//!   smaller replacement (memo + last `keep_recent_turns` groups
+//!   verbatim).
+//! - If a turn fails with [`Error::ContextWindowExceeded`] mid-flight,
+//!   hand the failed prompt (with the live user message already
+//!   attached) to `compact()` — it holds out the trailing in-flight
+//!   exchange automatically so the retry is a one-liner.
 //!
 //! The compaction prompt itself lives in the library
 //! ([`DEFAULT_SUMMARIZATION_INSTRUCTION`]), informed by aider's
@@ -120,9 +121,10 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 /// `(response, updated conversation including the response)`.
 ///
 /// Recovers from `Error::ContextWindowExceeded` once: the live user
-/// message couldn't fit alongside the existing history, so we
-/// compact the prior history, append the live message on top of the
-/// rebuilt prompt, and retry. Subsequent failures propagate.
+/// message couldn't fit alongside the existing history, so we hand
+/// the failed prompt to `compact()` — which holds out the live user
+/// turn automatically as part of its `keep_recent_turns` policy —
+/// and retry. Subsequent failures propagate.
 async fn send_with_recovery(
     provider: &dyn Provider,
     config: &Config,
@@ -130,35 +132,32 @@ async fn send_with_recovery(
     conversation: Prompt,
     user_msg: &str,
 ) -> Result<(CompleteResponse, Prompt), Error> {
+    let pending = conversation.with_user(user_msg);
     // `generate()` itself can fail (pre-flight provider rejection),
     // and `buffer()` can fail (in-stream error — e.g. OpenAI's
     // 200-OK-then-SSE-`event:error` shape). Funnel both into one
     // Result so the recovery branch handles either case uniformly.
-    let pending = generate(provider, &conversation.clone().with_user(user_msg), config).await;
-    let attempt = match pending {
+    let attempt = match generate(provider, &pending, config).await {
         Ok(response) => response.buffer().await,
         Err(e) => Err(e),
     };
 
     match attempt {
         Ok(response) => {
-            // Happy path: commit user message + response to history.
-            let next = conversation.with_user(user_msg).with_response(&response);
+            // Happy path: pending already includes the user message;
+            // append the response and we're done.
+            let next = pending.with_response(&response);
             Ok((response, next))
         }
         Err(Error::ContextWindowExceeded { message, .. }) => {
             eprintln!("  [context window exceeded mid-turn: {message}]");
-            eprintln!("  [compacting prior history and retrying…]");
-            // Compact returns `[system, user-memo]`; we attach
-            // the live user message on top and retry. This is the
-            // same shape as the happy path's
-            // `conversation.with_user(user_msg)` — the only
-            // difference is `conversation` is now the compacted
-            // rebuild rather than the bloated original.
-            let rebuilt = compactor.compact(provider, config, conversation).await?;
-            let retry = rebuilt.clone().with_user(user_msg);
+            eprintln!("  [compacting and retrying…]");
+            // The live user message is the trailing group of `pending`
+            // — `compact` holds it out and re-attaches it on top of
+            // the memo, so the retry is a drop-in resend.
+            let retry = compactor.compact(provider, config, pending).await?;
             let response = generate(provider, &retry, config).await?.buffer().await?;
-            let next = rebuilt.with_user(user_msg).with_response(&response);
+            let next = retry.with_response(&response);
             Ok((response, next))
         }
         Err(e) => Err(e),

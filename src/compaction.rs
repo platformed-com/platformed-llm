@@ -244,82 +244,251 @@ impl Compactor {
         caps.context_usage_fraction(usage) >= self.threshold
     }
 
-    /// Rewrite `history` as a compacted prompt: ask the model to
-    /// summarize the conversation so far into a dense memo, then
-    /// rebuild as `[original system, synthetic user memo]`.
+    /// Rewrite `prompt` as a compacted prompt: hold out the last
+    /// [`Self::keep_recent_turns`] message groups verbatim, ask the
+    /// model to summarise everything older into a dense memo, then
+    /// rebuild as `[original system, user(memo), …held-out groups…]`.
     ///
-    /// The memo lands as a `User` turn rather than `Assistant` for
-    /// two reasons. First, it matches the voice of the default
-    /// summarization instruction (aider's "user retelling" framing:
-    /// "I asked you to…"), so the role and the content agree.
-    /// Second, it's load-bearing on Anthropic-via-Vertex, which
-    /// hoists `system` to a top-level field. If the rebuild started
-    /// with an assistant turn the wire `messages` array would lead
-    /// with `assistant`, and Anthropic's Messages API rejects that
-    /// with a 400 (`first message must use the "user" role`). With
-    /// the memo as a user turn the wire array leads with `user`,
-    /// which every provider accepts; the caller's subsequent
-    /// `with_user(live)` append produces two consecutive user turns,
-    /// which Anthropic and Google both merge transparently and
-    /// OpenAI accepts as-is.
-    ///
-    /// The returned prompt is *ready to continue from* — callers
-    /// append whatever the next turn looks like (a fresh user
-    /// message, a multipart user turn with attachments, a
-    /// tool-result, etc.) using the normal `Prompt` builder methods.
-    /// The library doesn't take an opinion on what that next turn
-    /// is, because user turns aren't always plain strings (they may
-    /// carry images, tool results, cache breakpoints) and callers
-    /// already own that construction.
+    /// The returned prompt is a drop-in replacement for `prompt`: the
+    /// caller hands it to [`crate::generate`] in place of the
+    /// original. The held-out tail (whether that's a live user
+    /// question, a tool-call/result pair mid-agentic-loop, or just a
+    /// trailing assistant turn after a completed exchange) rides
+    /// through verbatim — callers don't have to manage that
+    /// bookkeeping themselves.
     ///
     /// The recovery pattern after a mid-turn
     /// [`Error::ContextWindowExceeded`]:
     ///
     /// ```ignore
-    /// let rebuilt = compactor
-    ///     .compact(&*provider, &config, history)
-    ///     .await?
-    ///     .with_user(live_user_msg); // the request that failed
-    /// let response = generate(&*provider, &rebuilt, &config).await?.buffer().await?;
+    /// let retry = compactor
+    ///     .compact(&*provider, &config, failed_prompt)
+    ///     .await?;
+    /// let response = generate(&*provider, &retry, &config).await?.buffer().await?;
     /// ```
     ///
-    /// The summarization request itself goes through the same
-    /// `provider` + `config` (so it'll honor the active middleware
-    /// chain). If summarization fails — including with
+    /// No-op fast path: if the prompt has at most
+    /// `keep_recent_turns` non-system groups, the prompt is returned
+    /// unchanged without invoking the summarisation model.
+    ///
+    /// The summarisation request itself goes through the same
+    /// `provider` + `config` (so it honours the active middleware
+    /// chain). If summarisation fails — including with
     /// [`Error::ContextWindowExceeded`] when the history is *already*
-    /// too big to summarize in one shot — the error propagates and
+    /// too big to summarise in one shot — the error propagates and
     /// the caller must split the work themselves.
     pub async fn compact(
         &self,
         provider: &dyn Provider,
         config: &Config,
-        history: Prompt,
+        prompt: Prompt,
     ) -> Result<Prompt, Error> {
-        let original_system = extract_first_system(&history);
-
-        let summary_prompt = history.with_user(&self.summarization_instruction);
+        // 1. Split into system (preserved verbatim, doesn't count
+        //    toward the keep_recent_turns budget) and the rest.
+        let (system, rest) = split_off_system(prompt);
+        // 2. Partition `rest` into atomic groups: User, AssistantText,
+        //    and ToolCall (assistant tool_call + matching user
+        //    tool_result fused into one group).
+        let groups = group_items(rest);
+        // 3. If we don't have more groups than keep_recent_turns,
+        //    there's nothing to summarise — fast path.
+        if groups.len() <= self.keep_recent_turns {
+            return Ok(reassemble(system, Vec::new(), None, groups));
+        }
+        // 4. Split into [to_summarise, to_keep]: everything before
+        //    the last keep_recent_turns groups goes to summarisation.
+        let split_at = groups.len() - self.keep_recent_turns;
+        let mut iter = groups.into_iter();
+        let to_summarise: Vec<Group> = iter.by_ref().take(split_at).collect();
+        let to_keep: Vec<Group> = iter.collect();
+        // 5. Build the summarisation request: system (if any) + the
+        //    items-to-summarise + the summarisation instruction as a
+        //    final user turn. Because to_summarise was popped before
+        //    the instruction lands, the instruction is always a
+        //    standalone directive — no role-merging surprises.
+        let mut summary_prompt = match &system {
+            Some(s) => Prompt::system(s.clone()),
+            None => Prompt::new(),
+        };
+        for g in &to_summarise {
+            for item in g.items() {
+                summary_prompt = summary_prompt.with_item(item.clone());
+            }
+        }
+        let summary_prompt = summary_prompt.with_user(&self.summarization_instruction);
         let summary_response = generate(provider, &summary_prompt, config)
             .await?
             .buffer()
             .await?;
         let summary = summary_response.text();
-
-        let rebuilt = match original_system {
-            Some(s) => Prompt::system(s),
-            None => Prompt::new(),
-        };
-        Ok(rebuilt.with_user(format!("{}{}", self.memo_prefix, summary.trim())))
+        let memo = format!("{}{}", self.memo_prefix, summary.trim());
+        // 6. Rebuild: system + user(memo) + held-out groups.
+        Ok(reassemble(system, to_summarise, Some(memo), to_keep))
     }
 }
 
-/// Return the content of the first `InputItem::System` in `prompt`,
-/// if any. Used to preserve the caller's system instruction across
-/// a compaction rebuild.
-fn extract_first_system(prompt: &Prompt) -> Option<String> {
-    prompt.items().iter().find_map(|item| match item {
-        InputItem::System(s) => Some(s.clone()),
-        _ => None,
-    })
+/// Atomic message group. System messages are handled separately
+/// (always preserved, never counted toward `keep_recent_turns`).
+#[derive(Debug)]
+enum Group {
+    /// A standalone user turn (text / image / cache breakpoint / etc.).
+    /// Does NOT include user turns whose content is wrapped into a
+    /// `ToolCall` group below.
+    User(InputItem),
+    /// A plain-text assistant turn (no tool calls).
+    Assistant(InputItem),
+    /// Atomic `(assistant tool_call, user tool_result)` exchange.
+    /// Both items ride through compaction together so call_id
+    /// integrity holds — OpenAI 400s on `function_call_output.call_id`
+    /// mismatch, Anthropic on `tool_use_id` mismatch, and Google
+    /// silently drops orphaned results client-side via
+    /// `push_part`.
+    ToolPair {
+        assistant: InputItem,
+        user_results: InputItem,
+    },
+}
+
+impl Group {
+    /// The InputItems this group expands to, in order.
+    fn items(&self) -> Vec<&InputItem> {
+        match self {
+            Group::User(i) | Group::Assistant(i) => vec![i],
+            Group::ToolPair {
+                assistant,
+                user_results,
+            } => vec![assistant, user_results],
+        }
+    }
+
+    fn into_items(self) -> Vec<InputItem> {
+        match self {
+            Group::User(i) | Group::Assistant(i) => vec![i],
+            Group::ToolPair {
+                assistant,
+                user_results,
+            } => vec![assistant, user_results],
+        }
+    }
+}
+
+/// Pop the first `InputItem::System` (if any) off the prompt, returning
+/// its content plus the remaining items. System messages elsewhere in
+/// the prompt are left in place (a caller that puts multiple system
+/// messages in the middle of the conversation is doing something
+/// unusual; we just preserve the first one for the rebuild).
+fn split_off_system(prompt: Prompt) -> (Option<String>, Vec<InputItem>) {
+    let mut system = None;
+    let mut rest = Vec::new();
+    for item in prompt.into_items() {
+        match (&system, &item) {
+            (None, InputItem::System(s)) => {
+                system = Some(s.clone());
+            }
+            _ => rest.push(item),
+        }
+    }
+    (system, rest)
+}
+
+/// Walk a flat item list and bucket consecutive items into atomic
+/// `Group`s. The interesting case is `(assistant with ToolCall, user
+/// with matching ToolResult)` pairs — those fuse into a single
+/// `ToolPair` group. Everything else is one item per group.
+///
+/// Edge cases:
+/// - An assistant turn with tool_calls whose immediately-following
+///   user turn doesn't have matching tool_results: treat the
+///   assistant as a standalone Assistant group (don't fuse).
+/// - An assistant turn with tool_calls that's the last item: same
+///   — standalone Assistant group, no pair.
+/// - System messages in the rest list: shouldn't happen after
+///   `split_off_system`, but if one slips through, treat as its own
+///   group via the catch-all User branch (won't compile actually —
+///   System isn't User; we just preserve it as a "User-like" group
+///   for the simple fall-through).
+fn group_items(items: Vec<InputItem>) -> Vec<Group> {
+    let mut groups = Vec::new();
+    let mut iter = items.into_iter().peekable();
+    while let Some(item) = iter.next() {
+        match item {
+            InputItem::Assistant { ref content } if has_tool_call(content) => {
+                // Try to fuse with the next user turn IF that user
+                // turn's content has any ToolResult parts.
+                if iter.peek().is_some_and(is_user_with_tool_result) {
+                    let user_results = iter.next().expect("peeked Some");
+                    groups.push(Group::ToolPair {
+                        assistant: item,
+                        user_results,
+                    });
+                } else {
+                    groups.push(Group::Assistant(item));
+                }
+            }
+            InputItem::Assistant { .. } => {
+                groups.push(Group::Assistant(item));
+            }
+            InputItem::User { .. } => {
+                groups.push(Group::User(item));
+            }
+            // System slipping through here is unusual but we preserve
+            // it as a User-shaped pass-through so the rebuild doesn't
+            // drop it silently.
+            InputItem::System(_) => {
+                groups.push(Group::User(item));
+            }
+        }
+    }
+    groups
+}
+
+fn has_tool_call(content: &[crate::AssistantPart]) -> bool {
+    use crate::AssistantPart;
+    content
+        .iter()
+        .any(|p| matches!(p, AssistantPart::ToolCall(_)))
+}
+
+fn is_user_with_tool_result(item: &InputItem) -> bool {
+    use crate::UserPart;
+    match item {
+        InputItem::User { content } => content
+            .iter()
+            .any(|p| matches!(p, UserPart::ToolResult { .. })),
+        _ => false,
+    }
+}
+
+/// Build the final prompt: optional system + optional memo + held-out
+/// groups. When `memo` is `None` we're on the no-op fast path —
+/// `to_summarise` is empty and we reassemble the original input.
+fn reassemble(
+    system: Option<String>,
+    to_summarise: Vec<Group>,
+    memo: Option<String>,
+    to_keep: Vec<Group>,
+) -> Prompt {
+    let mut out = match system {
+        Some(s) => Prompt::system(s),
+        None => Prompt::new(),
+    };
+    if let Some(memo_text) = memo {
+        out = out.with_user(memo_text);
+    } else {
+        // No-op path: the items we'd otherwise summarise need to be
+        // re-emitted verbatim.
+        for g in to_summarise {
+            for item in g.into_items() {
+                out = out.with_item(item);
+            }
+        }
+    }
+    for g in to_keep {
+        for item in g.into_items() {
+            out = out.with_item(item);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
