@@ -559,22 +559,34 @@ pub(crate) fn map_anthropic_stop_reason(reason: Option<&str>) -> FinishReason {
 
 /// Merge an Anthropic `usage` object into the running [`Usage`] tally.
 ///
-/// Anthropic's streaming protocol reports `input_tokens` once on
-/// `message_start` and a cumulative `output_tokens` on the final
-/// `message_delta`. We always overwrite with the latest non-`None` value so
-/// the `Done` event reflects the model's authoritative final counts.
+/// Anthropic's streaming protocol reports `input_tokens` and the
+/// cache fields together on `message_start`, and a cumulative
+/// `output_tokens` on the final `message_delta`. We always overwrite
+/// with the latest non-`None` value so the `Done` event reflects
+/// the model's authoritative final counts.
+///
+/// `input_tokens` on the wire is the UNCACHED remainder — Anthropic
+/// reports the cache fields as additive. The unified [`Usage`] type
+/// documents `input_tokens` as the total prompt (with cache_* fields
+/// as breakdowns / subsets), so this merge normalises by adding the
+/// cache fields when `input_tokens` is set.
 fn merge_anthropic_usage(target: &mut Usage, src: &AnthropicUsage) {
-    if let Some(t) = src.input_tokens {
-        target.input_tokens = t;
-    }
-    if let Some(t) = src.output_tokens {
-        target.output_tokens = t;
-    }
     if let Some(t) = src.cache_read_input_tokens {
         target.cache_read_input_tokens = Some(t);
     }
     if let Some(t) = src.cache_creation_input_tokens {
         target.cache_creation_input_tokens = Some(t);
+    }
+    if let Some(t) = src.input_tokens {
+        // Cache fields are always emitted alongside `input_tokens`
+        // at `message_start`, so reading them off `src` here gives
+        // the right total.
+        target.input_tokens = t
+            .saturating_add(src.cache_read_input_tokens.unwrap_or(0))
+            .saturating_add(src.cache_creation_input_tokens.unwrap_or(0));
+    }
+    if let Some(t) = src.output_tokens {
+        target.output_tokens = t;
     }
 }
 
@@ -785,6 +797,70 @@ mod tests {
     fn context_window_phrase_still_matches() {
         let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"this request exceeds the model's context window"}}"#;
         assert!(is_anthropic_context_exceeded(body));
+    }
+
+    /// PR-review #5. The streaming `merge_anthropic_usage` must
+    /// normalise `input_tokens` to be the union of uncached +
+    /// cache_read + cache_creation — matching the
+    /// `From<AnthropicUsage>` branch and the unified `Usage`
+    /// invariant.
+    #[test]
+    fn merge_normalises_cache_into_input_tokens() {
+        let mut target = Usage::default();
+        // message_start: input_tokens + cache fields.
+        let start = AnthropicUsage {
+            input_tokens: Some(5_000),
+            output_tokens: None,
+            cache_read_input_tokens: Some(150_000),
+            cache_creation_input_tokens: Some(10_000),
+        };
+        merge_anthropic_usage(&mut target, &start);
+        assert_eq!(
+            target.input_tokens, 165_000,
+            "merge must add cache_read + cache_creation to uncached input"
+        );
+        assert_eq!(target.cache_read_input_tokens, Some(150_000));
+        assert_eq!(target.cache_creation_input_tokens, Some(10_000));
+
+        // message_delta: only output_tokens. Must not clobber the
+        // normalised input_tokens.
+        let delta = AnthropicUsage {
+            input_tokens: None,
+            output_tokens: Some(2_000),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        };
+        merge_anthropic_usage(&mut target, &delta);
+        assert_eq!(target.input_tokens, 165_000, "input_tokens must persist");
+        assert_eq!(target.output_tokens, 2_000);
+    }
+
+    /// Bridge from #5 to the compaction threshold: a warm-cache
+    /// Anthropic Usage that pre-fix reported a context fraction of
+    /// ~0.035 must now correctly report ~0.785 against a 200k
+    /// window, so [`crate::Compactor::should_compact`] fires.
+    #[test]
+    fn warm_cache_usage_triggers_compaction_threshold() {
+        use crate::Capabilities;
+        let mut usage = Usage::default();
+        merge_anthropic_usage(
+            &mut usage,
+            &AnthropicUsage {
+                input_tokens: Some(5_000),
+                output_tokens: Some(2_000),
+                cache_read_input_tokens: Some(150_000),
+                cache_creation_input_tokens: None,
+            },
+        );
+        let caps = Capabilities {
+            context_window_tokens: 200_000,
+            ..Capabilities::default()
+        };
+        let fraction = caps.context_usage_fraction(&usage);
+        assert!(
+            fraction > 0.7,
+            "warm-cache usage should report >0.7 (got {fraction}); pre-fix this was ~0.035"
+        );
     }
 
     #[test]

@@ -271,12 +271,101 @@ pub struct AnthropicMessageDelta {
 
 impl From<AnthropicUsage> for Usage {
     fn from(usage: AnthropicUsage) -> Self {
+        // Anthropic reports `input_tokens` as the UNCACHED remainder —
+        // `cache_read_input_tokens` and `cache_creation_input_tokens`
+        // are additive on top of it. OpenAI and Google, by contrast,
+        // report `input_tokens` as the union and cache fields as a
+        // subset. Normalise here so `Usage::input_tokens` means
+        // "total prompt tokens" uniformly across providers, with
+        // cache_read / cache_creation preserved as the breakdown
+        // (and now matching the subset invariant the type docs
+        // state). Without this normalisation `total_tokens()` would
+        // silently undercount on Anthropic with warm caches, and
+        // `should_compact` would under-fire — a 150k-cached / 5k-fresh
+        // / 2k-out turn against a 200k window would report 0.035
+        // instead of ~0.785.
+        let uncached_input = usage.input_tokens.unwrap_or(0);
+        let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+        let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
         Usage {
-            input_tokens: usage.input_tokens.unwrap_or(0),
+            input_tokens: uncached_input
+                .saturating_add(cache_read)
+                .saturating_add(cache_creation),
             output_tokens: usage.output_tokens.unwrap_or(0),
             cache_read_input_tokens: usage.cache_read_input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
             reasoning_tokens: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PR-review #5. Anthropic reports `input_tokens` as the
+    /// *uncached* remainder with cache_read / cache_creation
+    /// additive on top. The unified `Usage` type documents
+    /// `input_tokens` as the total prompt (cache fields as
+    /// subsets), so the `From` conversion must normalise.
+    ///
+    /// Without this normalisation, a typical agentic loop with a
+    /// warm cache (e.g. 150k cached system + tool defs, 5k fresh
+    /// turn input, 2k output against a 200k window) would report
+    /// `total_tokens() = 7k` and a context fraction of ~0.035,
+    /// far below the default 0.7 compaction threshold. Compaction
+    /// would never fire and the conversation would eventually hit
+    /// the real context window. The test is the regression guard
+    /// for that scenario.
+    #[test]
+    fn cache_tokens_fold_into_input_tokens() {
+        let wire = AnthropicUsage {
+            input_tokens: Some(5_000),
+            output_tokens: Some(2_000),
+            cache_read_input_tokens: Some(150_000),
+            cache_creation_input_tokens: None,
+        };
+        let usage: Usage = wire.into();
+        assert_eq!(
+            usage.input_tokens, 155_000,
+            "input_tokens must be the union of uncached + cache_read + cache_creation"
+        );
+        assert_eq!(usage.output_tokens, 2_000);
+        assert_eq!(usage.cache_read_input_tokens, Some(150_000));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+        // Sanity: total_tokens reflects the real context touch.
+        assert_eq!(
+            usage.input_tokens + usage.output_tokens,
+            157_000,
+            "total_tokens should match the real prompt+completion"
+        );
+    }
+
+    #[test]
+    fn cache_creation_also_folds_in() {
+        let wire = AnthropicUsage {
+            input_tokens: Some(5_000),
+            output_tokens: Some(1_000),
+            cache_read_input_tokens: Some(50_000),
+            cache_creation_input_tokens: Some(20_000),
+        };
+        let usage: Usage = wire.into();
+        assert_eq!(usage.input_tokens, 75_000);
+    }
+
+    /// No-cache case: `input_tokens` passes through unchanged.
+    /// Confirms the normalisation is a no-op when cache fields
+    /// are absent.
+    #[test]
+    fn no_cache_fields_passes_through_unchanged() {
+        let wire = AnthropicUsage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(500),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        };
+        let usage: Usage = wire.into();
+        assert_eq!(usage.input_tokens, 1_000);
+        assert_eq!(usage.output_tokens, 500);
     }
 }
