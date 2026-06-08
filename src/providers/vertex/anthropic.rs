@@ -515,12 +515,24 @@ pub(crate) struct StreamState {
 /// so we look for the documented wording patterns. Conservative — a
 /// near-miss falls through to a generic provider error rather than
 /// claiming a context-window cause we're not sure of.
+///
+/// The set of accepted phrases is intentionally narrow:
+/// - `prompt is too long`
+/// - `input is too long`
+/// - `context window`
+///
+/// An earlier version included a loose `maximum && (tokens || input
+/// length)` clause as a catch-all. It false-positived on Anthropic's
+/// output-cap validation error (`max_tokens: N > M, which is the
+/// maximum allowed number of output tokens`), which would have made
+/// a compaction-aware caller destroy history in response to an
+/// output-config error. Dropped — the three explicit phrases above
+/// cover the documented context-exceeded responses, and a near-miss
+/// falling through to `Error::Provider` is the safer default.
 fn is_anthropic_context_exceeded(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     (lower.contains("prompt is too long")
         || lower.contains("input is too long")
-        || (lower.contains("maximum")
-            && (lower.contains("tokens") || lower.contains("input length")))
         || lower.contains("context window"))
         && lower.contains("invalid_request_error")
 }
@@ -748,6 +760,31 @@ mod tests {
         // An error from a different category must not match either.
         let body4 = r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
         assert!(!is_anthropic_context_exceeded(body4));
+    }
+
+    /// PR-review #3: the `max_tokens > model_max_output` validation
+    /// error contains `maximum`, `tokens`, and `invalid_request_error`
+    /// — under the loose conjunction `maximum && (tokens || input
+    /// length)` it false-positived as `ContextWindowExceeded`,
+    /// which would lead a compaction-aware caller to destroy
+    /// history in response to an *output*-config error and then
+    /// retry into the same failure. The detector must reject this.
+    #[test]
+    fn output_token_cap_error_is_not_context_exceeded() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 100000 > 64000, which is the maximum allowed number of output tokens for claude-sonnet-4-5"}}"#;
+        assert!(
+            !is_anthropic_context_exceeded(body),
+            "output-token-cap error must not classify as context-exceeded"
+        );
+    }
+
+    /// Pin the "context window" wording path — Anthropic documents
+    /// at least one variant that uses that exact phrase rather than
+    /// "input/prompt too long". The detector keeps that branch.
+    #[test]
+    fn context_window_phrase_still_matches() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"this request exceeds the model's context window"}}"#;
+        assert!(is_anthropic_context_exceeded(body));
     }
 
     #[test]
