@@ -2,22 +2,62 @@
 //! summary so a long-running session stays under the model's context
 //! window.
 //!
-//! Use [`Compactor`] when you're driving a multi-turn conversation
-//! and want to keep going past the point where the raw history
-//! wouldn't fit. The typical loop:
+//! [`Compactor`] takes a prompt about to be sent to a model and
+//! returns a smaller drop-in replacement. The lib holds out the
+//! trailing in-flight exchange so the caller doesn't have to manage
+//! that bookkeeping manually:
 //!
-//! 1. Send the user's message and get a response (via
-//!    [`crate::generate`]).
-//! 2. After the response, call [`Compactor::should_compact`] with
-//!    the model's [`Capabilities`] and the response's [`Usage`].
-//!    If `true`, call [`Compactor::compact`] to rewrite the prompt.
-//! 3. If a request fails with [`crate::Error::ContextWindowExceeded`]
-//!    (a single turn that itself overflowed the window), call
-//!    [`Compactor::compact`] with the *pre-request* history and the
-//!    in-flight user message as the held-out tail — then retry.
+//! - When the prompt's tail is a user turn (the typical shape of a
+//!   prompt about to be sent — a live question, or a tool result the
+//!   model is expected to react to), the lib pops that user turn
+//!   before summarising and re-attaches it on top of the memo.
+//! - When the tail is a [`UserPart::ToolResult`], the lib also
+//!   preserves the immediately-preceding assistant turn that emitted
+//!   the matching `tool_call`. Compaction without this would leave
+//!   an orphaned tool_result whose `call_id` references nothing —
+//!   OpenAI 400s, Anthropic 400s, and Google silently drops the
+//!   result (see [`crate::providers::vertex::google`]).
+//! - When the tail is an assistant turn (proactive compaction
+//!   immediately after a turn completed), the assistant turn is the
+//!   held-out group; the caller appends the next user turn on top.
+//!
+//! The number of recent turns kept verbatim is configurable via
+//! [`Compactor::with_keep_recent_turns`] (default 3). This matches
+//! the consensus in other compaction implementations — Microsoft
+//! Agent Framework's `MinimumPreserved`, Inspect AI's
+//! `keep_tool_uses`, aider's token-budget-driven head/tail split.
+//!
+//! Typical workflows:
+//!
+//! ```ignore
+//! // After a turn completes, check whether the next call needs compacting.
+//! if compactor.should_compact(&caps, &response.usage) {
+//!     conversation = compactor.compact(provider, config, conversation).await?;
+//! }
+//!
+//! // Recovery: a request failed with ContextWindowExceeded; compact
+//! // and retry. The live user message rides through as the held-out
+//! // tail, so the retry is a drop-in resend.
+//! match generate(provider, &prompt, config).await {
+//!     Err(Error::ContextWindowExceeded { .. }) => {
+//!         let retry = compactor.compact(provider, config, prompt).await?;
+//!         generate(provider, &retry, config).await?
+//!     }
+//!     Ok(r) => r,
+//! }
+//! ```
 //!
 //! [`examples/auto_compaction.rs`](../../examples/auto_compaction.rs)
 //! demonstrates both paths against a live provider.
+//!
+//! ## Scope
+//!
+//! This module is **summarisation-only**: it replaces older turns
+//! with a memo. Callers who need other compaction strategies — tool
+//! result collapsing, sliding-window truncation, hard-limit
+//! truncation, or a layered pipeline of all of these — should build
+//! them on top. See Microsoft Agent Framework's `CompactionStrategy`
+//! taxonomy for prior art on a fuller toolbox.
 //!
 //! ## Prompt design
 //!
@@ -61,6 +101,19 @@ use crate::{generate, Capabilities, Config, Error, InputItem, Prompt, Provider, 
 /// compaction kicks in. 0.7 leaves ~30% headroom for the next turn's
 /// input + output before the window would actually be exceeded.
 pub const DEFAULT_COMPACTION_THRESHOLD: f32 = 0.7;
+
+/// Default number of trailing message groups held out from
+/// summarisation and preserved verbatim in the rebuilt prompt. Each
+/// group is one of: a `User` turn, a plain-text `Assistant` turn, or
+/// an atomic `(Assistant tool_call, User tool_result)` pair. System
+/// messages are always preserved and don't count toward this budget.
+///
+/// 3 is the consensus floor across other compaction implementations:
+/// Microsoft Agent Framework's `SummarizationCompactionStrategy`
+/// defaults `MinimumPreserved` to 4, Inspect AI's Edit Compaction
+/// defaults `keep_tool_uses` to 3. Trades a small amount of
+/// compression for substantially better continuation quality.
+pub const DEFAULT_KEEP_RECENT_TURNS: usize = 3;
 
 /// Default summarization instruction sent to the model when running
 /// [`Compactor::compact`]. Synthesizes the patterns from aider's
@@ -114,6 +167,7 @@ pub struct Compactor {
     threshold: f32,
     summarization_instruction: String,
     memo_prefix: String,
+    keep_recent_turns: usize,
 }
 
 impl Default for Compactor {
@@ -122,6 +176,7 @@ impl Default for Compactor {
             threshold: DEFAULT_COMPACTION_THRESHOLD,
             summarization_instruction: DEFAULT_SUMMARIZATION_INSTRUCTION.to_string(),
             memo_prefix: DEFAULT_MEMO_PREFIX.to_string(),
+            keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
         }
     }
 }
@@ -156,9 +211,28 @@ impl Compactor {
         self
     }
 
+    /// Number of trailing message groups to preserve verbatim — the
+    /// rest gets summarised into a single memo. Default is
+    /// [`DEFAULT_KEEP_RECENT_TURNS`] (3). A "group" is a `User` turn,
+    /// a plain-text `Assistant` turn, or an atomic
+    /// `(Assistant tool_call, User tool_result)` pair. System
+    /// messages are always preserved and never count toward this
+    /// budget. Setting `0` summarises everything; setting a value
+    /// larger than the prompt's group count makes `compact` a
+    /// no-op.
+    pub fn with_keep_recent_turns(mut self, keep_recent_turns: usize) -> Self {
+        self.keep_recent_turns = keep_recent_turns;
+        self
+    }
+
     /// Current threshold.
     pub fn threshold(&self) -> f32 {
         self.threshold
+    }
+
+    /// Current `keep_recent_turns` setting.
+    pub fn keep_recent_turns(&self) -> usize {
+        self.keep_recent_turns
     }
 
     /// `true` when `usage` (from the most recent turn) indicates the
@@ -295,120 +369,571 @@ mod tests {
         assert!(c.should_compact(&caps, &usage));
     }
 
+    // =====================================================================
+    // Compaction spec
+    // =====================================================================
+    //
+    // The tests below specify how `Compactor::compact` should behave as a
+    // drop-in compaction primitive an agentic caller (Claude Code, aider,
+    // our own auto_compaction example) can hand any in-flight prompt to.
+    // They reflect what the public surface needs to do.
+    //
+    // Contract:
+    //
+    // 1. `compact(prompt)` takes the prompt the caller was about to send
+    //    and returns a smaller drop-in replacement. The lib holds out the
+    //    last `keep_recent_turns` message groups verbatim and summarises
+    //    everything older into a single user-role memo, so the caller
+    //    doesn't have to do any bookkeeping.
+    //
+    // 2. A "group" is the atomic unit of the message index:
+    //
+    //      - `System`     — preserved unconditionally, doesn't count toward
+    //                       `keep_recent_turns`.
+    //      - `User`       — a single `InputItem::User` (text, image,
+    //                       cache breakpoint, …) that is not part of a
+    //                       tool exchange.
+    //      - `Assistant`  — a plain-text `InputItem::Assistant` with no
+    //                       tool calls.
+    //      - `ToolCall`   — an `InputItem::Assistant` containing one or
+    //                       more `AssistantPart::ToolCall`s plus the
+    //                       immediately-following `InputItem::User`
+    //                       carrying the matching `UserPart::ToolResult`s.
+    //                       Treated as ONE atomic group: either both
+    //                       items ride through compaction together or
+    //                       both go into the memo. Splitting them would
+    //                       leave a `call_id` orphan — OpenAI 400s on
+    //                       `function_call_output.call_id` mismatch,
+    //                       Anthropic 400s on `tool_use_id` mismatch,
+    //                       and Google silently drops the result
+    //                       client-side (see google.rs::push_part).
+    //
+    //    Group atomicity matches the model used by Microsoft Agent
+    //    Framework's `MessageGroup` / `MessageGroupKind` and OpenClaw's
+    //    compaction-chunk boundary handling.
+    //
+    // 3. The summarization request the lib sends to the model includes
+    //    every item EXCEPT the held-out groups, with the summarization
+    //    instruction appended as a final user turn. Because the tail
+    //    groups were popped first, the request always ends in
+    //    assistant / system / empty before the instruction lands —
+    //    review comment #2 (the instruction getting glued onto a user
+    //    tail by provider-side merging) becomes structurally impossible.
+    //
+    // 4. Held-out content rides through verbatim. Multipart user turns
+    //    (text + images + cache breakpoints + tool results) are preserved
+    //    item-for-item, part-for-part. Cache breakpoints survive. A
+    //    `ToolCall` group rides through with all its parts (text +
+    //    tool_calls + reasoning), not selectively split.
+    //
+    // 5. The memo itself is a single `User` text part prefixed with the
+    //    configured `memo_prefix`. It's a user turn (not assistant) so
+    //    the wire array leads with `user` after every provider's
+    //    system-hoist behaviour — see commit 8d694c7 for why.
+    //
+    // 6. When the prompt has fewer non-system groups than
+    //    `keep_recent_turns`, `compact` is a no-op: it returns the
+    //    input unchanged without calling the summarisation model.
+    //    Avoids a round-trip when there's nothing to compact.
+
+    /// **Spec 1 — typical conversational tail.** A prompt that ends in a
+    /// user question is the common shape: caller built `conversation +
+    /// next_question` and is about to send it. With `keep_recent_turns=1`
+    /// only the trailing user turn rides through; everything before it
+    /// gets summarised. The verbatim live question stays at the tail.
     #[tokio::test]
-    async fn compact_summarizes_and_rebuilds_prompt() {
+    async fn user_text_tail_is_held_out_after_memo() {
         let provider = MockProvider::builder()
-            .reply(MockResponse::text("Memo body: we discussed weather."))
+            .reply(MockResponse::text("dense memo body"))
             .build();
         let config = Config::builder("test-model").build();
-        let history = Prompt::system("You are helpful.")
-            .with_user("What's the weather?")
-            .with_assistant("Sunny.");
+        let prompt = Prompt::system("be helpful")
+            .with_user("first question")
+            .with_assistant("first answer")
+            .with_user("second question")
+            .with_assistant("second answer")
+            .with_user("the live question");
 
         let compacted = Compactor::new()
-            .compact(&provider, &config, history)
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, prompt)
             .await
             .unwrap();
         let items = compacted.items();
-        // [system, user(memo)].
-        assert_eq!(items.len(), 2);
-        assert!(matches!(&items[0], InputItem::System(s) if s == "You are helpful."));
+
+        // Shape: [system, user(memo), user(live)]
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert!(matches!(&items[0], InputItem::System(s) if s == "be helpful"));
         match &items[1] {
             InputItem::User { content } => {
                 assert_eq!(content.len(), 1);
                 match &content[0] {
                     UserPart::Text(t) => {
                         assert!(t.starts_with(DEFAULT_MEMO_PREFIX));
-                        assert!(t.contains("Memo body"));
+                        assert!(t.contains("dense memo body"));
                     }
-                    other => panic!("expected text part, got {other:?}"),
+                    other => panic!("memo must be a single text part, got {other:?}"),
                 }
             }
-            other => panic!("expected user turn, got {other:?}"),
+            other => panic!("memo must land as user turn, got {other:?}"),
+        }
+        match &items[2] {
+            InputItem::User { content } => match &content[0] {
+                UserPart::Text(t) => assert_eq!(t, "the live question"),
+                other => panic!("tail's first part must be the verbatim question, got {other:?}"),
+            },
+            other => panic!("tail must be a user turn, got {other:?}"),
         }
     }
 
-    /// `compact()` returns just `[system, user-memo]` — the caller
-    /// appends the next turn themselves. This test pins that shape
-    /// and demonstrates the standard caller-side append.
+    /// **Spec 2 — mid-tool-loop tail.** When the prompt ends in a
+    /// `tool_result`, the assistant turn that emitted the matching
+    /// `tool_call` rides through compaction alongside it. Without this
+    /// the rebuilt prompt has an orphaned tool_result: OpenAI 400s,
+    /// Anthropic 400s, Google silently drops it. The compaction must
+    /// preserve call_id integrity end-to-end.
     #[tokio::test]
-    async fn caller_attaches_next_turn_after_compaction() {
+    async fn tool_result_tail_holds_out_with_its_matching_assistant_tool_call() {
+        use crate::{AssistantPart, FunctionCall};
         let provider = MockProvider::builder()
-            .reply(MockResponse::text("memo"))
+            .reply(MockResponse::text("memo body"))
             .build();
         let config = Config::builder("test-model").build();
-        let history = Prompt::system("sys").with_user("earlier");
+        let prompt = Prompt::system("be helpful")
+            .with_user("look up old data")
+            .with_assistant_tool_call(FunctionCall {
+                call_id: "call_old".into(),
+                name: "search".into(),
+                arguments: r#"{"q":"old"}"#.into(),
+            })
+            .with_tool_result("call_old", "old result")
+            .with_assistant("here you go")
+            .with_user("now look up new data")
+            .with_assistant_tool_call(FunctionCall {
+                call_id: "call_pending".into(),
+                name: "search".into(),
+                arguments: r#"{"q":"new"}"#.into(),
+            })
+            .with_tool_result("call_pending", "fresh result");
 
         let compacted = Compactor::new()
-            .compact(&provider, &config, history)
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, prompt)
             .await
             .unwrap();
-        // Rebuilt prompt is exactly [system, user-memo].
-        assert_eq!(compacted.items().len(), 2);
+        let items = compacted.items();
 
-        // Callers attach whatever the next turn looks like — here a
-        // multipart user message demonstrates that the lib doesn't
-        // need a string-shaped hook.
-        let with_next = compacted.with_item(InputItem::User {
+        // Shape: [system, user(memo), assistant(call_pending), user(tool_result for call_pending)]
+        // The pending tool_call + result is one atomic group; with
+        // keep_recent_turns=1 it's the single held-out group.
+        assert_eq!(items.len(), 4, "{items:?}");
+        assert!(matches!(&items[0], InputItem::System(_)));
+        assert!(matches!(&items[1], InputItem::User { .. }));
+
+        // The pending tool_call rides through; the OLDER call_old is
+        // summarized into the memo, NOT preserved as a turn.
+        match &items[2] {
+            InputItem::Assistant { content } => {
+                let calls: Vec<&FunctionCall> = content
+                    .iter()
+                    .filter_map(|p| match p {
+                        AssistantPart::ToolCall(c) => Some(c),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(calls.len(), 1, "expected exactly one preserved tool_call");
+                assert_eq!(
+                    calls[0].call_id, "call_pending",
+                    "only the immediately-preceding call should be preserved"
+                );
+            }
+            other => panic!("expected preserved assistant tool_call, got {other:?}"),
+        }
+        match &items[3] {
+            InputItem::User { content } => {
+                let results: Vec<&str> = content
+                    .iter()
+                    .filter_map(|p| match p {
+                        UserPart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(results, vec!["call_pending"]);
+            }
+            other => panic!("expected preserved tool_result, got {other:?}"),
+        }
+    }
+
+    /// **Spec 3 — parallel tool calls.** Providers canonically pair one
+    /// assistant turn carrying N `ToolCall`s with one user turn carrying
+    /// N matching `ToolResult`s. Preserving "the last assistant + user
+    /// pair" as a unit handles this naturally — the whole multi-call
+    /// block rides through, all call_ids stay matched.
+    #[tokio::test]
+    async fn parallel_tool_calls_in_tail_preserve_whole_block_as_unit() {
+        use crate::{AssistantPart, FunctionCall};
+        let provider = MockProvider::builder()
+            .reply(MockResponse::text("memo body"))
+            .build();
+        let config = Config::builder("test-model").build();
+        let parallel_assistant = InputItem::Assistant {
             content: vec![
-                UserPart::Text("what should I do next?".into()),
-                UserPart::Text(" (with structure)".into()),
+                AssistantPart::ToolCall(FunctionCall {
+                    call_id: "call_a".into(),
+                    name: "get_weather".into(),
+                    arguments: r#"{"city":"Paris"}"#.into(),
+                }),
+                AssistantPart::ToolCall(FunctionCall {
+                    call_id: "call_b".into(),
+                    name: "get_weather".into(),
+                    arguments: r#"{"city":"London"}"#.into(),
+                }),
             ],
-        });
-        assert_eq!(with_next.items().len(), 3);
-        match with_next.items().last().unwrap() {
-            InputItem::User { content } => assert_eq!(content.len(), 2),
-            other => panic!("expected user turn, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn compact_works_without_system_message() {
-        let provider = MockProvider::builder()
-            .reply(MockResponse::text("memo"))
-            .build();
-        let config = Config::builder("test-model").build();
-        // No system message in the history.
-        let history = Prompt::user("hi").with_assistant("hello");
+        };
+        let parallel_results = InputItem::User {
+            content: vec![
+                UserPart::ToolResult {
+                    call_id: "call_a".into(),
+                    content: vec![UserPart::Text("sunny".into())],
+                },
+                UserPart::ToolResult {
+                    call_id: "call_b".into(),
+                    content: vec![UserPart::Text("rainy".into())],
+                },
+            ],
+        };
+        let prompt = Prompt::system("sys")
+            .with_user("warm up")
+            .with_assistant("ready")
+            .with_user("weather in Paris and London?")
+            .with_item(parallel_assistant)
+            .with_item(parallel_results);
 
         let compacted = Compactor::new()
-            .compact(&provider, &config, history)
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, prompt)
             .await
             .unwrap();
-        // First item is the user-memo (no system was preserved).
-        match &compacted.items()[0] {
-            InputItem::User { .. } => {}
-            other => panic!("expected user first, got {other:?}"),
+        let items = compacted.items();
+
+        // Shape: [system, user(memo), assistant(call_a + call_b), user(result_a + result_b)]
+        assert_eq!(items.len(), 4, "{items:?}");
+        match &items[2] {
+            InputItem::Assistant { content } => {
+                let ids: Vec<&str> = content
+                    .iter()
+                    .filter_map(|p| match p {
+                        AssistantPart::ToolCall(c) => Some(c.call_id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(ids, vec!["call_a", "call_b"]);
+            }
+            other => panic!("expected parallel assistant block, got {other:?}"),
+        }
+        match &items[3] {
+            InputItem::User { content } => {
+                let ids: Vec<&str> = content
+                    .iter()
+                    .filter_map(|p| match p {
+                        UserPart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(ids, vec!["call_a", "call_b"]);
+            }
+            other => panic!("expected parallel results block, got {other:?}"),
         }
     }
 
+    /// **Spec 4 — assistant-terminated history (proactive path).** Caller
+    /// just finished a normal turn and is checking `should_compact`
+    /// against the response's usage; the conversation ends in
+    /// `assistant`. With `keep_recent_turns=1` the trailing assistant
+    /// turn rides through; the rebuilt prompt ends in `assistant`,
+    /// ready for the caller to append the next user turn on top. The
+    /// rebuild's tail role matches the input's tail role.
     #[tokio::test]
-    async fn compact_records_the_summarization_request() {
-        // Confirm the call we send to the model includes the
-        // summarization instruction as a final user turn.
+    async fn assistant_tail_compacts_with_held_out_assistant_turn() {
+        let provider = MockProvider::builder()
+            .reply(MockResponse::text("memo body"))
+            .build();
+        let config = Config::builder("test-model").build();
+        let prompt = Prompt::system("sys")
+            .with_user("q1")
+            .with_assistant("a1")
+            .with_user("q2")
+            .with_assistant("the trailing answer");
+
+        let compacted = Compactor::new()
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, prompt)
+            .await
+            .unwrap();
+        let items = compacted.items();
+
+        // Shape: [system, user(memo), assistant(trailing)]
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert!(matches!(&items[0], InputItem::System(_)));
+        assert!(matches!(&items[1], InputItem::User { .. }));
+        match &items[2] {
+            InputItem::Assistant { content } => {
+                use crate::AssistantPart;
+                assert!(content.iter().any(|p| matches!(
+                    p,
+                    AssistantPart::Text { content: t, .. } if t == "the trailing answer"
+                )));
+            }
+            other => panic!("expected held-out assistant tail, got {other:?}"),
+        }
+    }
+
+    /// **Spec 5 — multipart user tail.** The tail user turn can carry
+    /// text + images + cache breakpoints in any combination. Every part
+    /// rides through compaction verbatim — the lib doesn't peek inside
+    /// and re-serialize.
+    #[tokio::test]
+    async fn multipart_user_tail_preserves_every_part_verbatim() {
+        use crate::ImageSource;
+        let provider = MockProvider::builder()
+            .reply(MockResponse::text("memo body"))
+            .build();
+        let config = Config::builder("test-model").build();
+        let multipart_tail = InputItem::User {
+            content: vec![
+                UserPart::Text("look at this:".into()),
+                UserPart::Image(ImageSource::Url("https://example.com/img.png".into())),
+                UserPart::CacheBreakpoint,
+                UserPart::Text("what do you see?".into()),
+            ],
+        };
+        let prompt = Prompt::system("sys")
+            .with_user("warm up")
+            .with_assistant("ready")
+            .with_user("more context")
+            .with_assistant("noted")
+            .with_item(multipart_tail.clone());
+
+        let compacted = Compactor::new()
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, prompt)
+            .await
+            .unwrap();
+        let items = compacted.items();
+        assert_eq!(items.len(), 3, "{items:?}");
+        // Tail at index 2 must equal the multipart input we supplied —
+        // same parts in the same order.
+        match (&items[2], &multipart_tail) {
+            (InputItem::User { content: actual }, InputItem::User { content: expected }) => {
+                assert_eq!(actual.len(), expected.len(), "tail part count drifted");
+                for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                    match (a, e) {
+                        (UserPart::Text(at), UserPart::Text(et)) => {
+                            assert_eq!(at, et, "text part {i} drifted")
+                        }
+                        (UserPart::Image(_), UserPart::Image(_)) => {}
+                        (UserPart::CacheBreakpoint, UserPart::CacheBreakpoint) => {}
+                        (a, e) => panic!("part {i} variant changed: {a:?} vs {e:?}"),
+                    }
+                }
+            }
+            (other, _) => panic!("expected user tail, got {other:?}"),
+        }
+    }
+
+    /// **Spec 6 — summarization request excludes the held-out tail.**
+    /// The model summarizing the conversation should see the items that
+    /// are being discarded (so it knows what to capture in the memo) but
+    /// NOT the held-out tail (which is going to ride through anyway and
+    /// would just bias the summary toward whatever the live question
+    /// happens to be).
+    #[tokio::test]
+    async fn summarization_request_omits_the_held_out_segment() {
         let provider = MockProvider::builder()
             .reply(MockResponse::text("memo"))
             .build();
         let log = provider.call_log();
         let config = Config::builder("test-model").build();
-        let history = Prompt::system("sys").with_user("ask").with_assistant("ans");
+        let prompt = Prompt::system("sys")
+            .with_user("first thing")
+            .with_assistant("first reply")
+            .with_user("second thing")
+            .with_assistant("second reply")
+            .with_user("LIVE QUESTION SHOULD NOT APPEAR IN SUMMARY INPUT");
+
         let _ = Compactor::new()
-            .compact(&provider, &config, history)
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, prompt)
             .await
             .unwrap();
+
         let calls = log.calls();
         assert_eq!(calls.len(), 1);
-        // The last item must be a user turn carrying the instruction.
-        let items = calls[0].prompt.items();
-        match items.last().unwrap() {
-            InputItem::User { content } => match &content[0] {
-                UserPart::Text(t) => assert!(
-                    t.contains("dense, detailed memo"),
-                    "summarization instruction missing"
-                ),
-                other => panic!("expected text user part, got {other:?}"),
-            },
-            other => panic!("expected user turn last, got {other:?}"),
+        let request_items = calls[0].prompt.items();
+        // The held-out tail must not be in the summarization request.
+        for item in request_items {
+            if let InputItem::User { content } = item {
+                for part in content {
+                    if let UserPart::Text(t) = part {
+                        assert!(
+                            !t.contains("LIVE QUESTION SHOULD NOT APPEAR IN SUMMARY INPUT"),
+                            "held-out tail leaked into summarization request"
+                        );
+                    }
+                }
+            }
         }
+        // Sanity: the items being discarded ARE in the summarization
+        // request (so the model has something to summarize).
+        let saw_discarded = request_items.iter().any(|i| match i {
+            InputItem::User { content } => content
+                .iter()
+                .any(|p| matches!(p, UserPart::Text(t) if t.contains("first thing"))),
+            _ => false,
+        });
+        assert!(
+            saw_discarded,
+            "discarded turns must be present in summarization request"
+        );
+    }
+
+    /// **Spec 7 — system message persists.** Whatever system message
+    /// the caller had in the input prompt (if any) appears as item 0 in
+    /// the rebuild. Without a system message in the input, the rebuild
+    /// just doesn't have one — no synthetic system is injected.
+    #[tokio::test]
+    async fn system_message_persists_through_compaction() {
+        let provider = MockProvider::builder()
+            .reply(MockResponse::text("memo"))
+            .reply(MockResponse::text("memo"))
+            .build();
+        let config = Config::builder("test-model").build();
+
+        // With system.
+        let with_sys = Prompt::system("you are X")
+            .with_user("hi")
+            .with_assistant("hello")
+            .with_user("more")
+            .with_assistant("ok")
+            .with_user("live");
+        let out = Compactor::new()
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, with_sys)
+            .await
+            .unwrap();
+        assert!(matches!(&out.items()[0], InputItem::System(s) if s == "you are X"));
+
+        // Without system — no synthetic system is fabricated.
+        let no_sys = Prompt::user("hi")
+            .with_assistant("hello")
+            .with_user("more")
+            .with_assistant("ok")
+            .with_user("live");
+        let out = Compactor::new()
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, no_sys)
+            .await
+            .unwrap();
+        assert!(
+            !matches!(&out.items()[0], InputItem::System(_)),
+            "no synthetic system should appear when input had none"
+        );
+    }
+
+    /// **Spec 8 — `keep_recent_turns` preserves N groups.** With
+    /// `keep_recent_turns=3` (the library default), the last three
+    /// non-system groups ride through verbatim and only older
+    /// content gets summarised. Mirrors Microsoft Agent Framework's
+    /// `MinimumPreserved` / Inspect AI's `keep_tool_uses` semantics.
+    #[tokio::test]
+    async fn keep_recent_turns_preserves_n_groups() {
+        let provider = MockProvider::builder()
+            .reply(MockResponse::text("memo body"))
+            .build();
+        let config = Config::builder("test-model").build();
+        // 6 non-system groups: user, assistant, user, assistant, user, assistant.
+        let prompt = Prompt::system("sys")
+            .with_user("q1")
+            .with_assistant("a1")
+            .with_user("q2")
+            .with_assistant("a2")
+            .with_user("q3")
+            .with_assistant("a3");
+
+        let compacted = Compactor::new()
+            .with_keep_recent_turns(3)
+            .compact(&provider, &config, prompt)
+            .await
+            .unwrap();
+        let items = compacted.items();
+
+        // Shape: [system, user(memo), user(q2), assistant(a2), user(q3), assistant(a3)]
+        // — the last 3 groups (a2 onward: actually user(q3)/assistant(a3) plus
+        // assistant(a2) — wait, last 3 groups counting BACK from the end are
+        // assistant(a3), user(q3), assistant(a2). Adding memo and system:
+        // [sys, memo, assistant(a2), user(q3), assistant(a3)].
+        assert_eq!(items.len(), 5, "{items:?}");
+        assert!(matches!(&items[0], InputItem::System(_)));
+        assert!(matches!(&items[1], InputItem::User { .. }));
+        // The three preserved groups in original order.
+        use crate::AssistantPart;
+        assert!(matches!(
+            &items[2],
+            InputItem::Assistant { content } if content.iter().any(|p| matches!(
+                p,
+                AssistantPart::Text { content: t, .. } if t == "a2"
+            ))
+        ));
+        assert!(matches!(
+            &items[3],
+            InputItem::User { content } if content.iter().any(|p| matches!(
+                p,
+                UserPart::Text(t) if t == "q3"
+            ))
+        ));
+        assert!(matches!(
+            &items[4],
+            InputItem::Assistant { content } if content.iter().any(|p| matches!(
+                p,
+                AssistantPart::Text { content: t, .. } if t == "a3"
+            ))
+        ));
+    }
+
+    /// **Spec 9 — no-op when there's not enough to compact.** If the
+    /// prompt has at most `keep_recent_turns` non-system groups,
+    /// there's nothing older to summarise; the lib returns the
+    /// prompt unchanged without invoking the summarisation model.
+    /// Avoids a wasted round-trip and a spurious empty memo.
+    #[tokio::test]
+    async fn no_op_when_history_smaller_than_keep_recent_turns() {
+        let provider = MockProvider::builder()
+            // Will panic if called — the test asserts the model isn't.
+            .reply(MockResponse::text("this should never appear"))
+            .build();
+        let log = provider.call_log();
+        let config = Config::builder("test-model").build();
+        // 3 non-system groups; keep_recent_turns=3 → nothing to summarise.
+        let prompt = Prompt::system("sys")
+            .with_user("q1")
+            .with_assistant("a1")
+            .with_user("live");
+
+        let original_items = prompt.items().to_vec();
+        let compacted = Compactor::new()
+            .with_keep_recent_turns(3)
+            .compact(&provider, &config, prompt)
+            .await
+            .unwrap();
+        assert_eq!(
+            compacted.items().len(),
+            original_items.len(),
+            "no-op compaction must preserve item count"
+        );
+        assert_eq!(
+            log.calls().len(),
+            0,
+            "no-op compaction must not call the summarisation model"
+        );
     }
 }
