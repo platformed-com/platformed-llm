@@ -84,6 +84,23 @@ pub enum Error {
         /// Provider-supplied error description.
         message: String,
     },
+
+    /// Compaction couldn't produce a usable memo — the
+    /// summarisation model returned no usable text (empty, refusal,
+    /// pure tool-call, content-filtered) or was truncated by an
+    /// output-token budget mid-memo. The lib propagates rather
+    /// than committing a degenerate memo because the only
+    /// alternative is silently destroying history; the caller can
+    /// retry with a larger summarisation budget, switch the
+    /// summarisation model, surface to the user, etc. The original
+    /// prompt is untouched — `compact()` is transactional in the
+    /// failure case.
+    #[error("compaction failed: {reason}")]
+    Compaction {
+        /// Human-readable description of what went wrong (empty
+        /// summary, truncation, etc.).
+        reason: String,
+    },
 }
 
 impl Error {
@@ -156,6 +173,15 @@ impl Error {
         Error::ContextWindowExceeded {
             provider,
             message: message.into(),
+        }
+    }
+
+    /// Build a compaction failure error. Use when
+    /// `Compactor::compact` couldn't produce a usable memo (empty
+    /// summary, refusal, truncated).
+    pub fn compaction(reason: impl Into<String>) -> Self {
+        Error::Compaction {
+            reason: reason.into(),
         }
     }
 }

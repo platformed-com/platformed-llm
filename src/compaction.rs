@@ -320,8 +320,28 @@ impl Compactor {
             .await?
             .buffer()
             .await?;
+        // Guard: refuse to commit a degenerate memo. Either branch
+        // here means the summarisation model didn't produce a usable
+        // memo body, so swapping it in for older history would
+        // silently destroy context. Propagate the failure with a
+        // descriptive reason so the caller can recover (retry with a
+        // larger summarisation budget, switch summarisation model,
+        // surface to user).
+        if summary_response.was_truncated() {
+            return Err(Error::compaction(
+                "summarisation response was truncated (FinishReason::Length); \
+                 retry with a larger summarisation max_tokens or smaller history",
+            ));
+        }
         let summary = summary_response.text();
-        let memo = format!("{}{}", self.memo_prefix, summary.trim());
+        let trimmed = summary.trim();
+        if trimmed.is_empty() {
+            return Err(Error::compaction(
+                "summarisation response produced no usable text \
+                 (empty / whitespace / refusal / pure tool-call)",
+            ));
+        }
+        let memo = format!("{}{}", self.memo_prefix, trimmed);
         // 6. Rebuild: system + user(memo) + held-out groups.
         Ok(reassemble(system, to_summarise, Some(memo), to_keep))
     }
@@ -1103,6 +1123,116 @@ mod tests {
             log.calls().len(),
             0,
             "no-op compaction must not call the summarisation model"
+        );
+    }
+
+    /// **Spec 10 — empty summary fails fast.** A summarisation
+    /// response with no usable text (refusal, content-filtered,
+    /// pure tool-call, all-whitespace) means we can't build a
+    /// meaningful memo. Compacting anyway would land
+    /// `[system, user("[Compacted memo of earlier conversation]\n\n")]`
+    /// — the prefix label with no body — and silently drop the
+    /// older history. The lib must refuse the rebuild and surface
+    /// the failure so the caller can decide (retry with a larger
+    /// budget, switch summarisation model, surface to user).
+    /// PR-review #6.
+    #[tokio::test]
+    async fn empty_summary_response_errors_without_destroying_history() {
+        let provider = MockProvider::builder()
+            // Reply with empty text — accumulator finishes with Stop.
+            .reply(MockResponse::text(""))
+            .build();
+        let config = Config::builder("test-model").build();
+        let prompt = Prompt::system("sys")
+            .with_user("q1")
+            .with_assistant("a1")
+            .with_user("q2")
+            .with_assistant("a2")
+            .with_user("live");
+
+        let result = Compactor::new()
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, prompt)
+            .await;
+        match result {
+            Err(Error::Compaction { reason }) => {
+                assert!(
+                    reason.to_ascii_lowercase().contains("empty")
+                        || reason.to_ascii_lowercase().contains("no usable"),
+                    "error must name the empty-summary cause: got {reason:?}"
+                );
+            }
+            other => panic!("expected Error::Compaction for empty summary, got {other:?}"),
+        }
+    }
+
+    /// **Spec 11 — truncated summary fails fast.** If the
+    /// summarisation model hit its output-token budget mid-memo
+    /// (`FinishReason::Length`), the resulting text is a
+    /// mid-sentence fragment. Committing it as the memo would
+    /// silently truncate the historical context every caller relies
+    /// on. The lib refuses the rebuild and surfaces the failure so
+    /// the caller can retry with a larger summarisation budget.
+    /// PR-review #6.
+    #[tokio::test]
+    async fn truncated_summary_response_errors_without_destroying_history() {
+        use crate::{AssistantPart, FinishReason};
+        let truncated = MockResponse::from_parts(
+            vec![AssistantPart::Text {
+                content: "I asked you to compute 4+4 and you said the".to_string(),
+                annotations: Vec::new(),
+            }],
+            FinishReason::Length,
+        );
+        let provider = MockProvider::builder().reply(truncated).build();
+        let config = Config::builder("test-model").build();
+        let prompt = Prompt::system("sys")
+            .with_user("q1")
+            .with_assistant("a1")
+            .with_user("q2")
+            .with_assistant("a2")
+            .with_user("live");
+
+        let result = Compactor::new()
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, prompt)
+            .await;
+        match result {
+            Err(Error::Compaction { reason }) => {
+                assert!(
+                    reason.to_ascii_lowercase().contains("truncated")
+                        || reason.to_ascii_lowercase().contains("length"),
+                    "error must name the truncation cause: got {reason:?}"
+                );
+            }
+            other => panic!("expected Error::Compaction for truncated summary, got {other:?}"),
+        }
+    }
+
+    /// **Spec 12 — whitespace-only summary fails fast.** Same
+    /// destructive failure mode as the empty case — the model
+    /// emitted text but only whitespace, so the trimmed memo body
+    /// is empty. Treat as empty.
+    #[tokio::test]
+    async fn whitespace_only_summary_response_errors() {
+        let provider = MockProvider::builder()
+            .reply(MockResponse::text("   \n  \t  "))
+            .build();
+        let config = Config::builder("test-model").build();
+        let prompt = Prompt::system("sys")
+            .with_user("q1")
+            .with_assistant("a1")
+            .with_user("q2")
+            .with_assistant("a2")
+            .with_user("live");
+
+        let result = Compactor::new()
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, prompt)
+            .await;
+        assert!(
+            matches!(result, Err(Error::Compaction { .. })),
+            "expected Error::Compaction for whitespace-only summary, got {result:?}"
         );
     }
 }
