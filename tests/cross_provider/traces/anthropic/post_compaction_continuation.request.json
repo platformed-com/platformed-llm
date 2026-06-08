@@ -1,0 +1,16 @@
+{
+  "anthropic_version": "vertex-2023-10-16",
+  "max_tokens": 64,
+  "messages": [
+    {
+      "content": "[Compacted memo of earlier conversation]\n\nI asked you what 2+2 was, and you said 4. I then asked what 3+3 was, and you said 6.",
+      "role": "assistant"
+    },
+    {
+      "content": "What's 4+4?",
+      "role": "user"
+    }
+  ],
+  "stream": true,
+  "system": "You are a helpful assistant. Reply concisely."
+}

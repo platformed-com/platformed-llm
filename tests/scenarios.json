@@ -164,6 +164,20 @@
     },
 
     {
+      "name": "post_compaction_continuation",
+      "description": "Mirror the wire shape `Compactor::compact(...).with_user(live)` produces today: [system, assistant-memo, user-live]. OpenAI keeps the system message in its `input` array so the wire array still leads with `system` (HTTP 200, confirmed). Google hoists system into `systemInstruction`, leaving `contents = [model, user]` — Vertex Gemini accepts this cleanly (HTTP 200, confirmed against gemini-2.5-flash). Anthropic hoists system into the top-level `system` field, leaving `messages = [assistant, user]`; the Messages API documents that the first message must be `user` and 400s otherwise. Skipped here for Anthropic because the test project doesn't have Anthropic-on-Vertex access — the fixture under `traces/anthropic/` is hand-authored from the documented error envelope on top of the lib's real recorded request shape, and a maintainer with access should re-capture once the rebuild is fixed. The assertion that compaction must succeed on every provider lives in `snapshot_traces.rs::post_compaction_continuation_succeeds_on_every_provider`; today it fails because the Anthropic trace records the 400, and it flips green once the trace is re-captured against fixed code.",
+      "max_tokens": 64,
+      "providers": {
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "system", "content": "You are a helpful assistant. Reply concisely." },
+        { "role": "assistant", "content": "[Compacted memo of earlier conversation]\n\nI asked you what 2+2 was, and you said 4. I then asked what 3+3 was, and you said 6." },
+        { "role": "user", "content": "What's 4+4?" }
+      ]
+    },
+
+    {
       "name": "model_not_found",
       "description": "Request a non-existent model. On OpenAI this is a 404 with `error.code = model_not_found`; on Vertex this is 404 with a structured google.rpc.Status body. Locks in the body shape so error-mapping tests can match against real responses.",
       "expect_failure": true,
