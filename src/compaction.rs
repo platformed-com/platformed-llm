@@ -16,7 +16,7 @@
 //!   the matching `tool_call`. Compaction without this would leave
 //!   an orphaned tool_result whose `call_id` references nothing —
 //!   OpenAI 400s, Anthropic 400s, and Google silently drops the
-//!   result (see [`crate::providers::vertex::google`]).
+//!   result (see the orphan handling in `providers::vertex::google::push_part`).
 //! - When the tail is an assistant turn (proactive compaction
 //!   immediately after a turn completed), the assistant turn is the
 //!   held-out group; the caller appends the next user turn on top.

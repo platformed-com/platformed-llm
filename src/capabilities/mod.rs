@@ -22,7 +22,7 @@
 //! family-shaped names the table doesn't know about. Adding a new
 //! model = appending one row.
 
-/// How a [`ModelEntry`] matches a model name.
+/// How a `ModelEntry` matches a model name.
 ///
 /// Lookups are case-insensitive — names are lowercased before
 /// comparison so `"GPT-4o"` and `"gpt-4o"` resolve to the same caps.
@@ -206,21 +206,21 @@ impl Capabilities {
         Self::default()
     }
 
-    /// Capabilities for an OpenAI model name. Walks the
-    /// [`openai`](self::openai) submodule's `MODELS` table; falls
-    /// back to its `FALLBACK` constant on no match.
+    /// Capabilities for an OpenAI model name. Walks the `openai`
+    /// submodule's `MODELS` table; falls back to its `FALLBACK`
+    /// constant on no match.
     pub fn openai(model: &str) -> Self {
         lookup(model, openai::MODELS, openai::FALLBACK, "OpenAI")
     }
 
     /// Capabilities for a Google / Gemini model name. Walks the
-    /// [`google`](self::google) submodule's table.
+    /// `google` submodule's table.
     pub fn google(model: &str) -> Self {
         lookup(model, google::MODELS, google::FALLBACK, "Google")
     }
 
     /// Capabilities for an Anthropic Claude model name. Walks the
-    /// [`anthropic`](self::anthropic) submodule's table.
+    /// `anthropic` submodule's table.
     pub fn anthropic(model: &str) -> Self {
         lookup(model, anthropic::MODELS, anthropic::FALLBACK, "Anthropic")
     }
