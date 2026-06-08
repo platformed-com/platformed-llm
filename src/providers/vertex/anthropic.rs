@@ -422,6 +422,16 @@ impl Provider for AnthropicViaVertexProvider {
             let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
             let body_bytes = response.collect_body().await.unwrap_or_default();
             let body_text = String::from_utf8_lossy(&body_bytes);
+            // Anthropic doesn't expose a typed code for "too many input
+            // tokens" — detect via message-string match on 400s. The
+            // canonical phrasing as of 2026 is "prompt is too long" but
+            // the upstream may rephrase; this is best-effort.
+            if status == 400 && is_anthropic_context_exceeded(&body_text) {
+                return Err(Error::context_window_exceeded(
+                    "Anthropic",
+                    body_text.to_string(),
+                ));
+            }
             return Err(match status {
                 401 | 403 => {
                     Error::auth_with_status(status, format!("Anthropic {status}: {body_text}"))
@@ -500,6 +510,33 @@ pub(crate) struct StreamState {
     pending_stop_reason: Option<String>,
 }
 
+/// Heuristic match for "input too long" 400s. Anthropic returns
+/// `invalid_request_error` with a free-form message and no typed code,
+/// so we look for the documented wording patterns. Conservative — a
+/// near-miss falls through to a generic provider error rather than
+/// claiming a context-window cause we're not sure of.
+///
+/// The set of accepted phrases is intentionally narrow:
+/// - `prompt is too long`
+/// - `input is too long`
+/// - `context window`
+///
+/// An earlier version included a loose `maximum && (tokens || input
+/// length)` clause as a catch-all. It false-positived on Anthropic's
+/// output-cap validation error (`max_tokens: N > M, which is the
+/// maximum allowed number of output tokens`), which would have made
+/// a compaction-aware caller destroy history in response to an
+/// output-config error. Dropped — the three explicit phrases above
+/// cover the documented context-exceeded responses, and a near-miss
+/// falling through to `Error::Provider` is the safer default.
+fn is_anthropic_context_exceeded(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    (lower.contains("prompt is too long")
+        || lower.contains("input is too long")
+        || lower.contains("context window"))
+        && lower.contains("invalid_request_error")
+}
+
 /// Map an Anthropic `stop_reason` string onto our unified [`FinishReason`].
 ///
 /// Until [`FinishReason`] is extended (Phase 5), `stop_sequence` and
@@ -522,22 +559,34 @@ pub(crate) fn map_anthropic_stop_reason(reason: Option<&str>) -> FinishReason {
 
 /// Merge an Anthropic `usage` object into the running [`Usage`] tally.
 ///
-/// Anthropic's streaming protocol reports `input_tokens` once on
-/// `message_start` and a cumulative `output_tokens` on the final
-/// `message_delta`. We always overwrite with the latest non-`None` value so
-/// the `Done` event reflects the model's authoritative final counts.
+/// Anthropic's streaming protocol reports `input_tokens` and the
+/// cache fields together on `message_start`, and a cumulative
+/// `output_tokens` on the final `message_delta`. We always overwrite
+/// with the latest non-`None` value so the `Done` event reflects
+/// the model's authoritative final counts.
+///
+/// `input_tokens` on the wire is the UNCACHED remainder — Anthropic
+/// reports the cache fields as additive. The unified [`Usage`] type
+/// documents `input_tokens` as the total prompt (with cache_* fields
+/// as breakdowns / subsets), so this merge normalises by adding the
+/// cache fields when `input_tokens` is set.
 fn merge_anthropic_usage(target: &mut Usage, src: &AnthropicUsage) {
-    if let Some(t) = src.input_tokens {
-        target.input_tokens = t;
-    }
-    if let Some(t) = src.output_tokens {
-        target.output_tokens = t;
-    }
     if let Some(t) = src.cache_read_input_tokens {
         target.cache_read_input_tokens = Some(t);
     }
     if let Some(t) = src.cache_creation_input_tokens {
         target.cache_creation_input_tokens = Some(t);
+    }
+    if let Some(t) = src.input_tokens {
+        // Cache fields are always emitted alongside `input_tokens`
+        // at `message_start`, so reading them off `src` here gives
+        // the right total.
+        target.input_tokens = t
+            .saturating_add(src.cache_read_input_tokens.unwrap_or(0))
+            .saturating_add(src.cache_creation_input_tokens.unwrap_or(0));
+    }
+    if let Some(t) = src.output_tokens {
+        target.output_tokens = t;
     }
 }
 
@@ -704,6 +753,114 @@ mod tests {
     fn provider() -> AnthropicViaVertexProvider {
         AnthropicViaVertexProvider::new("p".to_string(), "us-east5".to_string(), "tok".to_string())
             .unwrap()
+    }
+
+    #[test]
+    fn detect_context_exceeded_in_invalid_request_error() {
+        // Documented Anthropic phrasing.
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;
+        assert!(is_anthropic_context_exceeded(body));
+
+        // Alternate phrasing.
+        let body2 = r#"{"type":"error","error":{"type":"invalid_request_error","message":"input is too long for the model's context window"}}"#;
+        assert!(is_anthropic_context_exceeded(body2));
+
+        // A *different* invalid_request_error must not match.
+        let body3 = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages must contain at least one item"}}"#;
+        assert!(!is_anthropic_context_exceeded(body3));
+
+        // An error from a different category must not match either.
+        let body4 = r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        assert!(!is_anthropic_context_exceeded(body4));
+    }
+
+    /// PR-review #3: the `max_tokens > model_max_output` validation
+    /// error contains `maximum`, `tokens`, and `invalid_request_error`
+    /// — under the loose conjunction `maximum && (tokens || input
+    /// length)` it false-positived as `ContextWindowExceeded`,
+    /// which would lead a compaction-aware caller to destroy
+    /// history in response to an *output*-config error and then
+    /// retry into the same failure. The detector must reject this.
+    #[test]
+    fn output_token_cap_error_is_not_context_exceeded() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 100000 > 64000, which is the maximum allowed number of output tokens for claude-sonnet-4-5"}}"#;
+        assert!(
+            !is_anthropic_context_exceeded(body),
+            "output-token-cap error must not classify as context-exceeded"
+        );
+    }
+
+    /// Pin the "context window" wording path — Anthropic documents
+    /// at least one variant that uses that exact phrase rather than
+    /// "input/prompt too long". The detector keeps that branch.
+    #[test]
+    fn context_window_phrase_still_matches() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"this request exceeds the model's context window"}}"#;
+        assert!(is_anthropic_context_exceeded(body));
+    }
+
+    /// PR-review #5. The streaming `merge_anthropic_usage` must
+    /// normalise `input_tokens` to be the union of uncached +
+    /// cache_read + cache_creation — matching the
+    /// `From<AnthropicUsage>` branch and the unified `Usage`
+    /// invariant.
+    #[test]
+    fn merge_normalises_cache_into_input_tokens() {
+        let mut target = Usage::default();
+        // message_start: input_tokens + cache fields.
+        let start = AnthropicUsage {
+            input_tokens: Some(5_000),
+            output_tokens: None,
+            cache_read_input_tokens: Some(150_000),
+            cache_creation_input_tokens: Some(10_000),
+        };
+        merge_anthropic_usage(&mut target, &start);
+        assert_eq!(
+            target.input_tokens, 165_000,
+            "merge must add cache_read + cache_creation to uncached input"
+        );
+        assert_eq!(target.cache_read_input_tokens, Some(150_000));
+        assert_eq!(target.cache_creation_input_tokens, Some(10_000));
+
+        // message_delta: only output_tokens. Must not clobber the
+        // normalised input_tokens.
+        let delta = AnthropicUsage {
+            input_tokens: None,
+            output_tokens: Some(2_000),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        };
+        merge_anthropic_usage(&mut target, &delta);
+        assert_eq!(target.input_tokens, 165_000, "input_tokens must persist");
+        assert_eq!(target.output_tokens, 2_000);
+    }
+
+    /// Bridge from #5 to the compaction threshold: a warm-cache
+    /// Anthropic Usage that pre-fix reported a context fraction of
+    /// ~0.035 must now correctly report ~0.785 against a 200k
+    /// window, so [`crate::Compactor::should_compact`] fires.
+    #[test]
+    fn warm_cache_usage_triggers_compaction_threshold() {
+        use crate::Capabilities;
+        let mut usage = Usage::default();
+        merge_anthropic_usage(
+            &mut usage,
+            &AnthropicUsage {
+                input_tokens: Some(5_000),
+                output_tokens: Some(2_000),
+                cache_read_input_tokens: Some(150_000),
+                cache_creation_input_tokens: None,
+            },
+        );
+        let caps = Capabilities {
+            context_window_tokens: 200_000,
+            ..Capabilities::default()
+        };
+        let fraction = caps.context_usage_fraction(&usage);
+        assert!(
+            fraction > 0.7,
+            "warm-cache usage should report >0.7 (got {fraction}); pre-fix this was ~0.035"
+        );
     }
 
     #[test]

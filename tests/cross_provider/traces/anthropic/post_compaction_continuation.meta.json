@@ -1,0 +1,16 @@
+{
+  "captured_at_unix": 1780913777,
+  "endpoint": "https://europe-west1-aiplatform.googleapis.com/v1/projects/platformed-dev/locations/europe-west1/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict?alt=sse",
+  "expect_failure": false,
+  "headers": {
+    "content-type": "text/event-stream"
+  },
+  "latency_ms": 0,
+  "model": "claude-sonnet-4-5",
+  "provider": "anthropic",
+  "response_bytes": 821,
+  "scenario": "post_compaction_continuation",
+  "status": 200,
+  "synthetic": true,
+  "synthetic_note": "The test project does not have Anthropic-on-Vertex enabled (live attempts 404 at the model-availability gate before reaching message validation). The request.json above is a real recording of what the lib's `convert_request` produces post-fix (memo as user turn, then live user turn — Anthropic merges consecutive same-role turns server-side). The response.sse is hand-authored in Anthropic's documented Messages streaming format (message_start → content_block_start/delta/stop → message_delta → message_stop) so the lib's parser can replay it deterministically. Replace with a real capture via `cargo run --example capture_traces -- anthropic post_compaction_continuation` when a project with Anthropic-on-Vertex access is available."
+}

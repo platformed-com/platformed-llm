@@ -97,6 +97,16 @@ struct Scenario {
     /// or `{"type":"json_schema","name":...,"schema":...,"strict":...}`.
     #[serde(default)]
     response_format: Option<ScenarioResponseFormat>,
+    /// If set, the last user message's `content` is expanded with
+    /// repeated filler text up to roughly this many UTF-8 bytes
+    /// before sending. Lets a scenario deliberately overflow a
+    /// model's context window without dragging multi-megabyte
+    /// strings into scenarios.json. Rough rule of thumb: English
+    /// text averages ~4 bytes per token, so e.g. `600_000` bytes
+    /// reliably exceeds OpenAI's 128k-token gpt-4o-mini context
+    /// window. Used by `context_window_exceeded`.
+    #[serde(default)]
+    oversize_user_content_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -126,6 +136,13 @@ struct ProviderOverride {
     /// any unknown key fails the scenario so the schema stays honest.
     #[serde(default)]
     extra_body: Option<Value>,
+    /// Override the scenario-level `oversize_user_content_bytes`.
+    /// Context-window sizes vary by 3 orders of magnitude across
+    /// providers (gpt-4 at 8k vs gemini-2.5 at 1M), so one
+    /// scenario-wide value would either skip the smaller models or
+    /// upload pointless megabytes to the larger ones.
+    #[serde(default)]
+    oversize_user_content_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -271,6 +288,25 @@ impl TransportImpl for RecordingTransport {
 // Scenario → (Prompt, Config) translation
 // ---------------------------------------------------------------------------
 
+/// Pad `seed` with repeated filler so the result is at least
+/// `target_bytes` UTF-8 bytes. Used by scenarios that deliberately
+/// overflow a model's context window — keeps multi-megabyte strings
+/// out of scenarios.json.
+///
+/// The filler is plain English (`"Lorem ipsum dolor sit amet, ..."`)
+/// so tokenization is realistic; each word is roughly one token, so
+/// `target_bytes` ≈ `4 * target_tokens` for the languages most
+/// frontier models train on.
+fn oversize_filler(seed: &str, target_bytes: usize) -> String {
+    const FILLER: &str = " Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.";
+    let mut out = String::with_capacity(target_bytes + seed.len());
+    out.push_str(seed);
+    while out.len() < target_bytes {
+        out.push_str(FILLER);
+    }
+    out
+}
+
 fn scenario_to_llm_request(
     scenario: &Scenario,
     model: &str,
@@ -318,7 +354,16 @@ fn scenario_to_llm_request(
                 use platformed_llm::UserPart;
                 let mut content: Vec<UserPart> = Vec::new();
                 if let Some(text) = m.content.as_ref().filter(|s| !s.is_empty()) {
-                    content.push(UserPart::Text(text.clone()));
+                    // Per-provider override wins; falls back to the
+                    // scenario-level value.
+                    let target = overrides
+                        .oversize_user_content_bytes
+                        .or(scenario.oversize_user_content_bytes);
+                    let payload = match target {
+                        Some(t) if t > text.len() => oversize_filler(text, t),
+                        _ => text.clone(),
+                    };
+                    content.push(UserPart::Text(payload));
                 }
                 for att in &m.attachments {
                     match att {

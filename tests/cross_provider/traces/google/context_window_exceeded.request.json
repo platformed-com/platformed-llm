@@ -1,0 +1,13 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "<<<oversized-prompt-elided>>>"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {}
+}

@@ -472,7 +472,16 @@ impl Provider for GoogleProvider {
             let body_text = String::from_utf8_lossy(&body_bytes);
             // Vertex 4xx envelopes carry `"status": "UNAUTHENTICATED"` /
             // `"NOT_FOUND"` / `"RESOURCE_EXHAUSTED"` — map them onto our
-            // typed variants where the mapping is clear.
+            // typed variants where the mapping is clear. Context-window
+            // exceeded is a 400 with INVALID_ARGUMENT and a free-form
+            // message; detect via wording match (no typed code from
+            // the upstream).
+            if status == 400 && is_google_context_exceeded(&body_text) {
+                return Err(Error::context_window_exceeded(
+                    "Google",
+                    body_text.to_string(),
+                ));
+            }
             return Err(match status {
                 401 | 403 => {
                     Error::auth_with_status(status, format!("Google {status}: {body_text}"))
@@ -700,6 +709,31 @@ impl GoogleStreamState {
     }
 }
 
+/// Heuristic match for Vertex's "input too long" 400. Vertex returns
+/// an `INVALID_ARGUMENT` envelope with a free-form message; we look
+/// for the documented wording. Conservative — a near-miss falls
+/// through to a generic provider error.
+///
+/// The accepted clauses all anchor on a token-specific phrase:
+/// - `token count` (matches "input token count exceeds the maximum")
+/// - `input token`
+/// - `context length`
+///
+/// An earlier version also matched a bare `exceeds the maximum`,
+/// which false-positived on unrelated `INVALID_ARGUMENT` parameter
+/// validation errors (`candidate_count exceeds the maximum allowed
+/// value of 8`, `max_output_tokens exceeds the maximum…`). Dropped —
+/// the three token-anchored clauses above cover the real
+/// context-exceeded shape, and matches Anthropic's detector
+/// requiring co-occurrence with a token word.
+fn is_google_context_exceeded(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("invalid_argument")
+        && (lower.contains("token count")
+            || lower.contains("input token")
+            || lower.contains("context length"))
+}
+
 /// Stateful per-chunk conversion. `pub(crate)` so unit tests can drive
 /// synthetic `GoogleResponse` values directly.
 pub(crate) fn convert_response_stateful(
@@ -878,6 +912,52 @@ pub(crate) fn convert_response_stateful(
 mod tests {
     use super::*;
     use crate::types::Config;
+
+    #[test]
+    fn detect_context_exceeded_in_invalid_argument_error() {
+        let body = r#"{"error":{"code":400,"message":"The input token count (1500000) exceeds the maximum number of tokens allowed (1000000).","status":"INVALID_ARGUMENT"}}"#;
+        assert!(is_google_context_exceeded(body));
+
+        let body2 = r#"{"error":{"code":400,"message":"context length 1100000 exceeds limit","status":"INVALID_ARGUMENT"}}"#;
+        assert!(is_google_context_exceeded(body2));
+
+        // Unrelated INVALID_ARGUMENT should not match.
+        let body3 =
+            r#"{"error":{"code":400,"message":"model not found","status":"INVALID_ARGUMENT"}}"#;
+        assert!(!is_google_context_exceeded(body3));
+
+        // Non-INVALID_ARGUMENT status should not match even with token-ish wording.
+        let body4 = r#"{"error":{"code":500,"message":"token count high","status":"INTERNAL"}}"#;
+        assert!(!is_google_context_exceeded(body4));
+    }
+
+    /// PR-review #4: the bare `exceeds the maximum` clause matched
+    /// unrelated `INVALID_ARGUMENT` parameter-validation errors —
+    /// e.g. a `candidate_count` cap or any other `> max allowed value`
+    /// shape Vertex surfaces. The detector must require co-occurrence
+    /// with a token-related word, matching the Anthropic detector's
+    /// `&& (tokens || input length)` shape.
+    #[test]
+    fn candidate_count_validation_error_is_not_context_exceeded() {
+        let body = r#"{"error":{"code":400,"message":"The value of candidate_count exceeds the maximum allowed value of 8.","status":"INVALID_ARGUMENT"}}"#;
+        assert!(
+            !is_google_context_exceeded(body),
+            "unrelated parameter-cap validation error must not classify as context-exceeded"
+        );
+    }
+
+    /// `max_output_tokens` validation errors mention `tokens` in the
+    /// parameter NAME, but they're an output-config issue, not a
+    /// context-window one. The detector must distinguish them from
+    /// real input-too-long errors.
+    #[test]
+    fn max_output_tokens_validation_error_is_not_context_exceeded() {
+        let body = r#"{"error":{"code":400,"message":"The value of max_output_tokens (200000) exceeds the maximum allowed value of 65536.","status":"INVALID_ARGUMENT"}}"#;
+        assert!(
+            !is_google_context_exceeded(body),
+            "output-token-cap validation error must not classify as context-exceeded"
+        );
+    }
 
     #[test]
     fn convert_simple_text_request() {

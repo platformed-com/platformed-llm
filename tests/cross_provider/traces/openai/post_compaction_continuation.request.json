@@ -1,0 +1,23 @@
+{
+  "input": [
+    {
+      "content": "You are a helpful assistant. Reply concisely.",
+      "role": "system",
+      "type": "message"
+    },
+    {
+      "content": "[Compacted memo of earlier conversation]\n\nI asked you what 2+2 was, and you said 4. I then asked what 3+3 was, and you said 6.",
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "content": "What's 4+4?",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 64,
+  "model": "gpt-4o-mini",
+  "store": false,
+  "stream": true
+}

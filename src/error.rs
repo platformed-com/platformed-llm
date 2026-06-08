@@ -64,6 +64,43 @@ pub enum Error {
     /// Model not available (typically a 404 on the model name).
     #[error("model not available: {0}")]
     ModelNotAvailable(String),
+
+    /// Request rejected because the prompt exceeded the model's
+    /// context window. Distinct from a generic
+    /// [`Self::Provider`] error so callers running long-lived
+    /// conversations can detect it cheaply and trigger compaction.
+    ///
+    /// Detection is best-effort: OpenAI reports this reliably via
+    /// `code: "context_length_exceeded"`; Anthropic and Google are
+    /// detected via message-string matching (their schemas don't
+    /// expose a stable typed code), so some context-exceeded errors
+    /// may still arrive as [`Self::Provider`] when the upstream
+    /// wording changes.
+    #[error("context window exceeded ({provider}): {message}")]
+    ContextWindowExceeded {
+        /// Short identifier of the provider that raised the error
+        /// (e.g. `"OpenAI"`, `"Anthropic"`, `"Google"`).
+        provider: &'static str,
+        /// Provider-supplied error description.
+        message: String,
+    },
+
+    /// Compaction couldn't produce a usable memo — the
+    /// summarisation model returned no usable text (empty, refusal,
+    /// pure tool-call, content-filtered) or was truncated by an
+    /// output-token budget mid-memo. The lib propagates rather
+    /// than committing a degenerate memo because the only
+    /// alternative is silently destroying history; the caller can
+    /// retry with a larger summarisation budget, switch the
+    /// summarisation model, surface to the user, etc. The original
+    /// prompt is untouched — `compact()` is transactional in the
+    /// failure case.
+    #[error("compaction failed: {reason}")]
+    Compaction {
+        /// Human-readable description of what went wrong (empty
+        /// summary, truncation, etc.).
+        reason: String,
+    },
 }
 
 impl Error {
@@ -127,6 +164,24 @@ impl Error {
         Error::RateLimit {
             retry_after: retry_after_seconds.map(Duration::from_secs),
             message: message.into(),
+        }
+    }
+
+    /// Build a context-window-exceeded error. Use this when a provider
+    /// 400 carries an unambiguous "too many tokens" signal.
+    pub fn context_window_exceeded(provider: &'static str, message: impl Into<String>) -> Self {
+        Error::ContextWindowExceeded {
+            provider,
+            message: message.into(),
+        }
+    }
+
+    /// Build a compaction failure error. Use when
+    /// `Compactor::compact` couldn't produce a usable memo (empty
+    /// summary, refusal, truncated).
+    pub fn compaction(reason: impl Into<String>) -> Self {
+        Error::Compaction {
+            reason: reason.into(),
         }
     }
 }

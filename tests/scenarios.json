@@ -150,6 +150,34 @@
     },
 
     {
+      "name": "context_window_exceeded",
+      "description": "Send a prompt deliberately larger than the model's context window so every provider surfaces its 'too many tokens' signal. Pins the wire shape that maps onto `Error::ContextWindowExceeded`. The `content` is a placeholder — `capture_traces` expands it to `oversize_user_content_bytes` UTF-8 bytes of Lorem ipsum filler (per provider, since context sizes vary by 3 orders of magnitude). Per-provider notes: OpenAI's Responses API returns HTTP 200 and emits the error inside the SSE stream as `event: error` with `code: context_length_exceeded` (gpt-4 used here — 8k context, so 80k bytes overflows safely); Google's Vertex returns HTTP 400 with `INVALID_ARGUMENT` and 'input token count exceeds maximum' (gemini-2.5-flash 1M context → 6MB filler); Anthropic via Vertex returns HTTP 400 with `invalid_request_error` and 'prompt is too long' wording — skipped here because the test project doesn't have Anthropic-on-Vertex enabled; the fixture under `traces/anthropic/` stays hand-authored from the documented schema and a maintainer with Anthropic Vertex access should re-capture it.",
+      "expect_failure": true,
+      "providers": {
+        "openai":    { "model": "gpt-4", "oversize_user_content_bytes": 80000 },
+        "google":    { "oversize_user_content_bytes": 6000000 },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "user", "content": "Hello." }
+      ]
+    },
+
+    {
+      "name": "post_compaction_continuation",
+      "description": "Mirror the wire shape `Compactor::compact(...).with_user(live)` produces: [system, user-memo, user-live]. Two consecutive user turns is the standard compaction shape — OpenAI accepts it as-is in the `input` array, Google's Vertex merges them client-side via `push_part`, and Anthropic's Messages API merges them server-side (consecutive same-role turns are documented as combined). The leading-`user` non-system item is load-bearing on Anthropic, which hoists `system` to a top-level field — without it the wire array would lead with `assistant` and 400. The assertion that compaction succeeds on every provider lives in `snapshot_traces.rs::post_compaction_continuation_succeeds_on_every_provider`. Anthropic is skipped from live capture because the test project lacks Anthropic-on-Vertex access; the fixture under `traces/anthropic/` is hand-authored from the lib's real recorded request shape plus a synthetic SSE success body in Anthropic's documented format, and a maintainer with access should re-capture against the real API.",
+      "max_tokens": 64,
+      "providers": {
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "system", "content": "You are a helpful assistant. Reply concisely." },
+        { "role": "user", "content": "[Compacted memo of earlier conversation]\n\nI asked you what 2+2 was, and you said 4. I then asked what 3+3 was, and you said 6." },
+        { "role": "user", "content": "What's 4+4?" }
+      ]
+    },
+
+    {
       "name": "model_not_found",
       "description": "Request a non-existent model. On OpenAI this is a 404 with `error.code = model_not_found`; on Vertex this is 404 with a structured google.rpc.Status body. Locks in the body shape so error-mapping tests can match against real responses.",
       "expect_failure": true,

@@ -14,6 +14,10 @@ pub mod accumulator;
 /// Per-model capability table consulted by middleware to decide which
 /// features can be requested natively vs. need a polyfill or drop.
 pub mod capabilities;
+/// Conversation compaction — summarize-and-rebuild support for
+/// long-running sessions that would otherwise blow past the model's
+/// context window. See [`compaction::Compactor`].
+pub mod compaction;
 /// Request/response middleware applied above the provider layer —
 /// polyfills, validation, and the top-level [`generate`] entry point.
 pub mod middleware;
@@ -48,6 +52,7 @@ mod types;
 // `pub` item to an internal module must not leak it.
 
 pub use capabilities::Capabilities;
+pub use compaction::Compactor;
 pub use error::Error;
 pub use factory::{ProviderConfig, ProviderFactory, ProviderType};
 pub use middleware::{generate, JsonCoercionMiddleware, Middleware};

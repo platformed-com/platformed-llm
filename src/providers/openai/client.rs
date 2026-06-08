@@ -362,6 +362,14 @@ pub(crate) fn parse_openai_error(
     let kind = parsed.as_ref().and_then(|e| e.kind).unwrap_or("");
     let code = parsed.as_ref().and_then(|e| e.code).unwrap_or("");
 
+    // Context-window detection: OpenAI reliably sets
+    // `code: "context_length_exceeded"` for this case; surface as a
+    // typed variant so callers driving long conversations can trigger
+    // compaction without parsing strings.
+    if code == "context_length_exceeded" {
+        return Error::context_window_exceeded("OpenAI", format!("HTTP {status}: {message}"));
+    }
+
     match status {
         401 => Error::auth_with_status(401, format!("OpenAI 401 ({kind} {code}): {message}")),
         429 => Error::rate_limit(
@@ -678,10 +686,25 @@ impl OpenAIStreamState {
     /// Process one OpenAI wire event into 0 or more `StreamEvent`s.
     pub(crate) fn process(&mut self, event: OpenAIStreamEvent) -> Result<Vec<StreamEvent>, Error> {
         match event {
-            OpenAIStreamEvent::Error { error } => Err(Error::provider(
-                "OpenAI",
-                format!("{}: {}", error.r#type, error.message),
-            )),
+            OpenAIStreamEvent::Error { error } => {
+                // OpenAI's Responses API returns 200 OK and emits the
+                // context-length error inside the SSE stream as an
+                // `event: error` frame with `code:
+                // context_length_exceeded`. Detect it here so callers
+                // driving long conversations get the typed
+                // `ContextWindowExceeded` variant instead of a generic
+                // streaming/provider error.
+                if error.code.as_deref() == Some("context_length_exceeded") {
+                    return Err(Error::context_window_exceeded(
+                        "OpenAI",
+                        format!("{}: {}", error.r#type, error.message),
+                    ));
+                }
+                Err(Error::provider(
+                    "OpenAI",
+                    format!("{}: {}", error.r#type, error.message),
+                ))
+            }
 
             // `response.id` is stable across created/in_progress/
             // completed frames — emit the Continuation part at
@@ -1121,6 +1144,78 @@ mod tests {
                 assert!(message.contains("rate_limit_error"));
             }
             other => panic!("expected RateLimit, got {other:?}"),
+        }
+    }
+
+    /// OpenAI reliably sets `code: "context_length_exceeded"` for
+    /// over-budget prompts — surface that as the typed
+    /// [`Error::ContextWindowExceeded`] so long-conversation callers
+    /// can branch without parsing strings.
+    #[test]
+    fn http_400_context_length_exceeded_is_typed() {
+        let body = r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        let err = parse_openai_error(400, None, body);
+        match err {
+            Error::ContextWindowExceeded { provider, message } => {
+                assert_eq!(provider, "OpenAI");
+                assert!(message.contains("maximum context length"));
+            }
+            other => panic!("expected ContextWindowExceeded, got {other:?}"),
+        }
+    }
+
+    /// OpenAI's Responses API doesn't always return a 4xx for
+    /// over-budget prompts — it can return HTTP 200 OK and emit the
+    /// failure inside the SSE stream as an `event: error` with
+    /// `code: "context_length_exceeded"`. The in-stream branch of
+    /// `OpenAIStreamState::process` must produce the same typed
+    /// `ContextWindowExceeded` variant as the HTTP-400 path.
+    #[test]
+    fn in_stream_context_length_exceeded_is_typed() {
+        use crate::providers::openai::types::ErrorDetails;
+        let mut state = OpenAIStreamState::new();
+        let err = state
+            .process(OpenAIStreamEvent::Error {
+                error: ErrorDetails {
+                    message: "Your input exceeds the context window of this model.".to_string(),
+                    r#type: "invalid_request_error".to_string(),
+                    param: Some("input".to_string()),
+                    code: Some("context_length_exceeded".to_string()),
+                },
+            })
+            .expect_err("Error event must produce an Err");
+        match err {
+            Error::ContextWindowExceeded { provider, message } => {
+                assert_eq!(provider, "OpenAI");
+                assert!(message.contains("context window"));
+            }
+            other => panic!("expected ContextWindowExceeded, got {other:?}"),
+        }
+    }
+
+    /// In-stream `Error` events with codes *other than*
+    /// `context_length_exceeded` must still fall through to the
+    /// generic `Error::Provider` path — the typed variant is reserved
+    /// for the one signal compaction callers care about.
+    #[test]
+    fn in_stream_unrelated_error_stays_generic_provider() {
+        use crate::providers::openai::types::ErrorDetails;
+        let mut state = OpenAIStreamState::new();
+        let err = state
+            .process(OpenAIStreamEvent::Error {
+                error: ErrorDetails {
+                    message: "model overloaded".to_string(),
+                    r#type: "server_error".to_string(),
+                    param: None,
+                    code: Some("server_overloaded".to_string()),
+                },
+            })
+            .expect_err("Error event must produce an Err");
+        match err {
+            Error::Provider {
+                provider: "OpenAI", ..
+            } => {}
+            other => panic!("expected Provider, got {other:?}"),
         }
     }
 

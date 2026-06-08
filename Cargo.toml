@@ -80,6 +80,13 @@ tokio = { version = "1.40", features = ["macros", "rt", "rt-multi-thread", "proc
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 dotenvy = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Self-reference enables the `mock` feature for every test/bench/example
+# target without forcing downstream consumers to pull it in. With this
+# in place, `cargo test`, `cargo test --no-default-features --features
+# openai`, and `cargo test --all-features` all see `MockProvider` —
+# unit tests in `src/` no longer need ad-hoc feature gates to import
+# `crate::providers::mock`. PR-review #7.
+platformed-llm = { path = ".", features = ["mock"] }
 
 [features]
 # Nothing is on by default — downstream consumers opt into the
@@ -108,7 +115,10 @@ llama-gguf = ["dep:llama-gguf", "dep:async-stream", "tokio/rt", "tokio/sync"]
 
 # In-process mock provider returning canned responses, for testing
 # downstream code without network or credentials. Pure core types — no
-# extra dependencies. Enable it under `[dev-dependencies]`.
+# extra dependencies. Always enabled when running this crate's own
+# tests/benches/examples via the self-reference in `[dev-dependencies]`;
+# downstream consumers opt in by adding `features = ["mock"]` under
+# `[dev-dependencies]`.
 mock = []
 
 # Internal: gate for the `fetch-test-models` binary. Pulls in

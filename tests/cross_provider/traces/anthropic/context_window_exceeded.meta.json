@@ -1,0 +1,16 @@
+{
+  "captured_at_unix": 1748793600,
+  "endpoint": "https://us-east5-aiplatform.googleapis.com/v1/projects/platformed-dev/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict?alt=sse",
+  "expect_failure": true,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "latency_ms": 0,
+  "model": "claude-sonnet-4-5",
+  "provider": "anthropic",
+  "response_bytes": 234,
+  "scenario": "context_window_exceeded",
+  "status": 400,
+  "synthetic": true,
+  "synthetic_note": "Hand-authored from Anthropic's documented `invalid_request_error` envelope for prompt-too-long (https://docs.anthropic.com/en/api/errors). Replace with a real capture by sending an oversized prompt through `cargo run --example capture_traces` when API access is available."
+}

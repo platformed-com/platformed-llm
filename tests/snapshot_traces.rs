@@ -124,14 +124,23 @@ fn load_all_traces() -> Vec<Trace> {
                 .unwrap_or("model")
                 .to_string();
             // Error captures don't have an SSE-shaped body. They're
-            // exercised by `error_traces_e2e` instead.
+            // exercised by `error_traces_e2e` instead. Skip any trace
+            // whose meta declares it a failure capture — covers both
+            // the obvious non-2xx case AND OpenAI's
+            // `context_window_exceeded` shape, which returns HTTP 200
+            // and emits the error inside the SSE stream.
             let meta = read_json(&dir.join(format!("{scenario}.meta.json")));
             let status = meta
                 .as_ref()
                 .and_then(|v| v.get("status"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(200);
-            if status != 200 {
+            let expect_failure = meta
+                .as_ref()
+                .and_then(|v| v.get("expect_failure"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if status != 200 || expect_failure {
                 continue;
             }
             let response_sse = fs::read(&path).unwrap();
@@ -448,6 +457,32 @@ fn validate_complete_response(
                 ));
             }
         }
+        // Post-compaction continuation: the rebuilt prompt is
+        // `[system, assistant-memo, user-live]` — the live question
+        // ("What's 4+4?") asks the model to continue the conversation
+        // captured in the memo. A successful capture means the
+        // provider accepted the leading-non-user-after-hoist shape AND
+        // the model answered the live question coherently. Pin both:
+        // finish reason is Stop (not Length / ContentFilter) and the
+        // text contains the arithmetic answer "8". This is the
+        // load-bearing contract — compaction is only "working" on a
+        // provider if a post-compaction turn drives the conversation
+        // forward.
+        "post_compaction_continuation" => {
+            if !matches!(complete.finish_reason, platformed_llm::FinishReason::Stop) {
+                return Err(format!(
+                    "{scenario}: expected FinishReason::Stop, got {:?}",
+                    complete.finish_reason,
+                ));
+            }
+            let text = complete.text();
+            if !text.contains('8') {
+                return Err(format!(
+                    "{scenario}: expected the model to answer the live question \
+                     (\"What's 4+4?\") with a response containing '8', got {text:?}",
+                ));
+            }
+        }
         // Web-search / google_search scenarios are prompted to cite
         // their sources — at least one url_citation annotation must
         // attach to the text part.
@@ -492,6 +527,71 @@ fn validate_complete_response(
         }
     }
     Ok(())
+}
+
+/// The compaction primitives are only useful if a post-compaction turn
+/// drives the conversation forward on **every** supported provider.
+/// Each provider's captured `post_compaction_continuation` trace is the
+/// evidence: a successful capture (HTTP 200, no `expect_failure`) means
+/// the provider accepted the lib's wire shape and the model answered
+/// the held-out user question. Anything else means compaction is
+/// producing a request the provider rejects.
+///
+/// Today this fails on Anthropic: `Compactor::compact` returns
+/// `[system, assistant-memo]`, the caller appends a user turn, and
+/// Anthropic — which hoists `system` to a top-level field — sees the
+/// wire `messages` array lead with `assistant` and 400s with
+/// `invalid_request_error: first message must use the "user" role`.
+/// The captured trace is the synthetic record of that rejection. Once
+/// the rebuild emits the memo as a user turn instead of an assistant
+/// turn and the trace is re-captured against the fixed code, this test
+/// flips green.
+#[test]
+fn post_compaction_continuation_succeeds_on_every_provider() {
+    let root = PathBuf::from(TRACES_ROOT);
+    let mut failures = Vec::<String>::new();
+    for provider in ["openai", "google", "anthropic"] {
+        let meta_path = root
+            .join(provider)
+            .join("post_compaction_continuation.meta.json");
+        if !meta_path.exists() {
+            failures.push(format!(
+                "{provider}: no post_compaction_continuation capture under {}",
+                meta_path.display()
+            ));
+            continue;
+        }
+        let meta = match read_json(&meta_path) {
+            Some(v) => v,
+            None => {
+                failures.push(format!("{provider}: meta.json is not valid JSON"));
+                continue;
+            }
+        };
+        let status = meta.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
+        let expect_failure = meta
+            .get("expect_failure")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !(200..300).contains(&status) || expect_failure {
+            let note = meta
+                .get("synthetic_note")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            failures.push(format!(
+                "{provider}: trace shows the lib's request shape was rejected \
+                 (status={status}, expect_failure={expect_failure}). Compaction \
+                 is broken on this provider — fix the rebuild and re-capture.\n    \
+                 note: {note}",
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        panic!(
+            "post-compaction must succeed on every provider:\n  {}",
+            failures.join("\n  ")
+        );
+    }
 }
 
 #[tokio::test]

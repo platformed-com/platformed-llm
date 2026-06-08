@@ -1,4 +1,4 @@
-#![cfg(all(feature = "openai", feature = "google"))]
+#![cfg(all(feature = "openai", feature = "google", feature = "anthropic-vertex"))]
 //! Replay captured 4xx/5xx traces through the matching provider's
 //! `generate()` and assert they map to the right typed [`Error`] variant.
 //!
@@ -18,7 +18,9 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::Stream;
-use platformed_llm::providers::{GoogleProvider, OpenAIProvider, VertexEndpoint};
+use platformed_llm::providers::{
+    AnthropicViaVertexProvider, GoogleProvider, OpenAIProvider, VertexEndpoint,
+};
 use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
 use platformed_llm::{generate, Config, Error, Prompt};
 use serde_json::Value;
@@ -51,6 +53,7 @@ const TRACES_ROOT: &str = "tests/cross_provider/traces";
 enum Provider {
     OpenAI,
     Google,
+    Anthropic,
 }
 
 impl Provider {
@@ -58,12 +61,14 @@ impl Provider {
         match self {
             Provider::OpenAI => "openai",
             Provider::Google => "google",
+            Provider::Anthropic => "anthropic",
         }
     }
     fn from_dir_name(name: &str) -> Option<Provider> {
         match name {
             "openai" => Some(Provider::OpenAI),
             "google" => Some(Provider::Google),
+            "anthropic" => Some(Provider::Anthropic),
             _ => None,
         }
     }
@@ -114,7 +119,16 @@ fn load_error_traces() -> Vec<ErrorTrace> {
                 Err(_) => continue,
             };
             let status = meta.get("status").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
-            if (200..300).contains(&status) {
+            let expect_failure = meta
+                .get("expect_failure")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // Skip 2xx captures unless the scenario explicitly expects
+            // failure — some providers (notably OpenAI's Responses API)
+            // return 200 OK and surface errors inside the SSE stream
+            // (e.g. `event: error` with `code:
+            // context_length_exceeded`), and those still belong here.
+            if (200..300).contains(&status) && !expect_failure {
                 continue;
             }
             let body = fs::read(&path).unwrap();
@@ -136,17 +150,19 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
     });
     let prompt = Prompt::user("hi");
     let cfg = Config::builder("model").build();
-    match trace.provider {
+    // `generate()` can succeed even on captures we expect to fail —
+    // OpenAI's Responses API returns 200 OK and surfaces the error
+    // inside the SSE stream, so the error only materializes when the
+    // caller drains the response. Run the full pipeline (generate +
+    // buffer) so both paths land in this `Error` result.
+    let outcome = match trace.provider {
         Provider::OpenAI => {
             let p = OpenAIProvider::with_transport(
                 "test".to_string(),
                 "http://placeholder".to_string(),
                 transport,
             );
-            generate(&p, &prompt, &cfg)
-                .await
-                .err()
-                .expect("4xx must produce an error")
+            generate_and_drain(&p, &prompt, &cfg).await
         }
         Provider::Google => {
             let endpoint = VertexEndpoint::with_access_token(
@@ -155,12 +171,31 @@ async fn replay_error(trace: &ErrorTrace) -> Error {
                 "tok".to_string(),
             );
             let p = GoogleProvider::with_transport(endpoint, transport);
-            generate(&p, &prompt, &cfg)
-                .await
-                .err()
-                .expect("4xx must produce an error")
+            generate_and_drain(&p, &prompt, &cfg).await
         }
+        Provider::Anthropic => {
+            let endpoint = VertexEndpoint::with_access_token(
+                "p".to_string(),
+                "us-east5".to_string(),
+                "tok".to_string(),
+            );
+            let p = AnthropicViaVertexProvider::with_transport(endpoint, transport);
+            generate_and_drain(&p, &prompt, &cfg).await
+        }
+    };
+    match outcome {
+        Ok(()) => panic!("captured failure must produce an error"),
+        Err(e) => e,
     }
+}
+
+async fn generate_and_drain(
+    provider: &dyn platformed_llm::Provider,
+    prompt: &Prompt,
+    cfg: &Config,
+) -> Result<(), Error> {
+    let response = generate(provider, prompt, cfg).await?;
+    response.buffer().await.map(|_| ())
 }
 
 /// For each captured error response, assert the typed [`Error`] variant
@@ -183,28 +218,52 @@ async fn captured_error_bodies_map_to_typed_errors() {
             trace.status
         );
         let err = replay_error(trace).await;
-        let ok = match (trace.provider, trace.status, &err) {
-            // 401 → Auth on both providers, now that Vertex maps it.
+        let ok = match (trace.provider, trace.status, &err, trace.scenario.as_str()) {
+            // 401 → Auth on every provider, now that Vertex maps it.
             (
-                Provider::OpenAI,
+                _,
                 401,
                 Error::Auth {
                     status: Some(401), ..
                 },
+                _,
+            ) => true,
+            // 429 → RateLimit (OpenAI; Vertex doesn't typically 429 on
+            // streamGenerateContent, but accept it on every provider if
+            // it happens).
+            (_, 429, Error::RateLimit { .. }, _) => true,
+            // 404 → ModelNotAvailable on Vertex.
+            (Provider::Google, 404, Error::ModelNotAvailable(_), _) => true,
+            (Provider::Anthropic, 404, Error::ModelNotAvailable(_), _) => true,
+            // The `context_window_exceeded` scenario must surface as the
+            // typed `ContextWindowExceeded` on every provider — that's
+            // the load-bearing contract for compaction-aware callers.
+            (
+                Provider::OpenAI,
+                _,
+                Error::ContextWindowExceeded {
+                    provider: "OpenAI", ..
+                },
+                "context_window_exceeded",
             ) => true,
             (
                 Provider::Google,
-                401,
-                Error::Auth {
-                    status: Some(401), ..
+                _,
+                Error::ContextWindowExceeded {
+                    provider: "Google", ..
                 },
+                "context_window_exceeded",
             ) => true,
-            // 429 → RateLimit (OpenAI-side; Vertex doesn't typically 429
-            // on the streaming endpoint, but if it does, accept either).
-            (_, 429, Error::RateLimit { .. }) => true,
-            // 404 → ModelNotAvailable on Vertex.
-            (Provider::Google, 404, Error::ModelNotAvailable(_)) => true,
-            // Any other 4xx/5xx on either provider → Provider with the
+            (
+                Provider::Anthropic,
+                _,
+                Error::ContextWindowExceeded {
+                    provider: "Anthropic",
+                    ..
+                },
+                "context_window_exceeded",
+            ) => true,
+            // Any other 4xx/5xx on any provider → Provider with the
             // correct provider name and a matching status code.
             (
                 Provider::OpenAI,
@@ -214,6 +273,7 @@ async fn captured_error_bodies_map_to_typed_errors() {
                     status: Some(_),
                     ..
                 },
+                _,
             ) => true,
             (
                 Provider::Google,
@@ -223,6 +283,17 @@ async fn captured_error_bodies_map_to_typed_errors() {
                     status: Some(_),
                     ..
                 },
+                _,
+            ) => true,
+            (
+                Provider::Anthropic,
+                _,
+                Error::Provider {
+                    provider: "Anthropic",
+                    status: Some(_),
+                    ..
+                },
+                _,
             ) => true,
             _ => false,
         };

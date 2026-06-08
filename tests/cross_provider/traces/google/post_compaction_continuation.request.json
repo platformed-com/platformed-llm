@@ -1,0 +1,26 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "[Compacted memo of earlier conversation]\n\nI asked you what 2+2 was, and you said 4. I then asked what 3+3 was, and you said 6."
+        },
+        {
+          "text": "What's 4+4?"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 64
+  },
+  "systemInstruction": {
+    "parts": [
+      {
+        "text": "You are a helpful assistant. Reply concisely."
+      }
+    ],
+    "role": "system"
+  }
+}
