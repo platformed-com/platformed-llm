@@ -1126,6 +1126,7 @@ dependencies = [
  "ijson",
  "llama-gguf",
  "memchr",
+ "platformed-llm",
  "reqwest",
  "serde",
  "serde_json",

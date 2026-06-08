@@ -1,7 +1,6 @@
 //! Integration test exercising the public `mock` provider the way a
 //! downstream crate would: drive a tool-call loop against canned
 //! responses, then assert on what was sent.
-#![cfg(feature = "mock")]
 
 use platformed_llm::providers::mock::{Chunking, MockProvider, MockResponse};
 use platformed_llm::{generate, Config, FunctionCall, InputItem, Prompt, UserPart};
