@@ -10,7 +10,7 @@ use crate::types::{
 use crate::{Error, RawConfig, Response, StreamEvent};
 use futures_util::StreamExt as _;
 use std::sync::{Arc, Mutex};
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// OpenAI provider implementation.
 pub struct OpenAIProvider {
@@ -1040,8 +1040,13 @@ impl Provider for OpenAIProvider {
         openai_request.stream = Some(true);
 
         debug!(
-            request = ?openai_request,
+            model = %openai_request.model,
+            messages = openai_request.input.len(),
             "sending OpenAI Responses API request"
+        );
+        trace!(
+            request = ?openai_request,
+            "full OpenAI request body"
         );
 
         let body = serde_json::to_vec(&openai_request)?;
@@ -1081,7 +1086,7 @@ impl Provider for OpenAIProvider {
             .sse_events()
             .map(move |sse_result| -> Result<Vec<StreamEvent>, Error> {
                 let sse_event = sse_result?;
-                debug!(event = ?sse_event, "received OpenAI SSE event");
+                trace!(event = ?sse_event, "received OpenAI SSE event");
                 let stream_event = serde_json::from_str::<OpenAIStreamEvent>(&sse_event.data)?;
                 // A poisoned lock means `process` panicked on a prior
                 // event; surface it as a stream error instead of
