@@ -5,7 +5,7 @@ use crate::providers::GoogleProvider;
 #[cfg(feature = "openai")]
 use crate::providers::OpenAIProvider;
 use crate::{Error, Provider};
-use std::env;
+use std::{env, fmt};
 
 /// Supported LLM providers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +34,7 @@ impl ProviderType {
 /// can build inconsistent states (e.g. `provider_type: OpenAI` paired
 /// with `access_token: Some(_)`) which [`ProviderFactory::create`]
 /// will then surface as a missing-credential error.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProviderConfig {
     /// Which backend to instantiate.
     pub provider_type: ProviderType,
@@ -173,6 +173,26 @@ impl ProviderConfig {
                 "Invalid PROVIDER_TYPE '{other}'. Valid values are: openai, google, anthropic"
             ))),
         }
+    }
+}
+
+impl fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            provider_type,
+            api_key,
+            project_id,
+            location,
+            access_token,
+        } = self;
+
+        f.debug_struct("ProviderConfig")
+            .field("provider_type", &provider_type)
+            .field("api_key", &api_key.as_ref().map(|_| "[redacted]"))
+            .field("project_id", &project_id)
+            .field("location", &location)
+            .field("access_token", &access_token.as_ref().map(|_| "[redacted]"))
+            .finish()
     }
 }
 
@@ -656,5 +676,48 @@ mod tests {
             err.to_string().contains("PROVIDER_TYPE"),
             "error should mention PROVIDER_TYPE, got: {err}"
         );
+    }
+
+    #[test]
+    fn openai_config_debug_redacts_secrets() {
+        let config = ProviderConfig::openai("sk-super-secret-123".to_string());
+        let log_entry = format!("{:?}", config);
+        assert!(
+            log_entry.contains(r#"api_key: Some("[redacted]")"#),
+            "api_key should be redacted, got: {log_entry}"
+        );
+        assert!(
+            !log_entry.contains("super-secret"),
+            "api_key should not leak the supplied key, got: {log_entry}"
+        );
+        assert!(
+            log_entry.contains(r#"access_token: None"#),
+            "access_token should be None, got: {log_entry}"
+        );
+    }
+
+    #[test]
+    fn vertex_config_debug_redacts_secrets() -> Result<(), Error> {
+        let config = ProviderConfig::vertex(
+            ProviderType::Google,
+            "123".to_string(),
+            "eu1".to_string(),
+            "sk-super-secret-456".to_string(),
+        )?;
+        let log_entry = format!("{:?}", config);
+        assert!(
+            log_entry.contains(r#"api_key: None"#),
+            "api_key should be None, got: {log_entry}"
+        );
+        assert!(
+            !log_entry.contains("super-secret"),
+            "access_token should not leak the supplied token, got: {log_entry}"
+        );
+        assert!(
+            log_entry.contains(r#"access_token: Some("[redacted]")"#),
+            "access_token should be redacted, got: {log_entry}"
+        );
+
+        Ok(())
     }
 }
