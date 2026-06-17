@@ -40,8 +40,18 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use futures_util::StreamExt as _;
+
+/// Bounds the time spent establishing the connection — fail fast on a
+/// dead host rather than hanging until the CI job is killed.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounds the gap *between* body chunks (not the whole transfer, which
+/// for a ~150 MB model is legitimately long on a slow link) so a
+/// stalled CDN mid-download fails fast instead of hanging.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One downloadable test model: a cached `filename` and the public URL
 /// to fetch it from on a cache miss.
@@ -82,9 +92,11 @@ pub const MODELS: &[TestModel] = &[SMOLLM2_135M_INSTRUCT_Q8];
 ///
 /// A download failure is a hard error — the returned `Err` is meant to
 /// be `.expect`ed so the test fails. `PLATFORMED_LLM_TEST_MODEL_PATH`
-/// short-circuits to a verbatim path. Concurrent callers are safe: the
-/// download writes to a `.partial` file and atomically renames on
-/// success, so a half-written file is never observed as cached.
+/// short-circuits to a verbatim path. Concurrent callers are safe: each
+/// download writes to its own uniquely-named temp file, is length-
+/// checked against `Content-Length`, and is atomically renamed into
+/// place — so a half-written or truncated file is never observed as
+/// cached, even with parallel `cargo test` processes on a cold cache.
 pub async fn ensure(model: TestModel) -> Result<PathBuf, String> {
     if let Some(p) = override_path()? {
         eprintln!(
@@ -147,34 +159,71 @@ fn override_path() -> Result<Option<PathBuf>, String> {
     }
 }
 
-/// Stream-to-disk download. Writes to `<dest>.partial` first and
-/// renames on success so a `Ctrl-C` mid-fetch (or a concurrent reader)
-/// never observes a corrupt cache entry. Returns the byte count.
+/// Stream-to-disk download. Writes to a uniquely-named temp file first
+/// and renames on success, so a `Ctrl-C` mid-fetch (or a concurrent
+/// reader) never observes a corrupt cache entry, and two parallel
+/// downloads of the same model don't truncate each other's partial.
+/// The transfer is length-checked against `Content-Length` so a
+/// silently truncated body isn't cached as a valid model. Returns the
+/// byte count.
 async fn download_to(url: &str, dest: &Path) -> Result<u64, String> {
+    // Per-call temp name (pid + a process-local counter) so concurrent
+    // downloads of the same model write to distinct files; the atomic
+    // rename below then publishes exactly one complete file.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let partial = dest.with_extension(format!(
-        "{}.partial",
-        dest.extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("download")
+        "partial.{}.{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
 
-    let response = reqwest::get(url)
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()
+        .map_err(|e| format!("build HTTP client: {e}"))?;
+    let response = client
+        .get(url)
+        .send()
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
     if !response.status().is_success() {
         return Err(format!("HTTP {} from {url}", response.status()));
     }
+    let content_length = response.content_length();
 
     let mut file = std::fs::File::create(&partial)
         .map_err(|e| format!("create {}: {e}", partial.display()))?;
     let mut stream = response.bytes_stream();
     let mut written: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("read chunk: {e}"))?;
-        file.write_all(&chunk)
-            .map_err(|e| format!("write {}: {e}", partial.display()))?;
-        written += chunk.len() as u64;
+    let result = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("read chunk: {e}"))?;
+            file.write_all(&chunk)
+                .map_err(|e| format!("write {}: {e}", partial.display()))?;
+            written += chunk.len() as u64;
+        }
+        // A connection dropped mid-body still ends the stream with
+        // `None`, so length-check the result: without this, a short
+        // transfer is fsync'd and renamed in, then reused on every
+        // later run via the `dest.exists()` fast path.
+        if let Some(expected) = content_length {
+            if written != expected {
+                return Err(format!(
+                    "incomplete download from {url}: got {written} bytes, expected {expected}"
+                ));
+            }
+        }
+        Ok(())
     }
+    .await;
+
+    if let Err(e) = result {
+        drop(file);
+        let _ = std::fs::remove_file(&partial);
+        return Err(e);
+    }
+
     file.sync_all().ok();
     drop(file);
 
