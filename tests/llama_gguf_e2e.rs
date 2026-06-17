@@ -6,41 +6,32 @@
 //!
 //! ## Setup
 //!
-//! Models must be downloaded first via:
+//! The model is downloaded into the shared cache on first run via
+//! [`test_util::ensure`]. To pre-populate the cache (e.g. before an
+//! offline run):
 //!
 //! ```text
-//! cargo run --bin fetch-test-models --features fetch-test-models
+//! cargo run --bin fetch-test-models --features test-util
 //! ```
 //!
 //! Or supply a local file ad-hoc:
 //!
 //! ```text
 //! PLATFORMED_LLM_TEST_MODEL_PATH=~/path/to/model.gguf \
-//!   cargo test --features llama-gguf --test llama_gguf_e2e
+//!   cargo test --features llama-gguf,test-util --test llama_gguf_e2e
 //! ```
-//!
-//! The test reports `skip: <reason>` and exits cleanly when no model
-//! is available — so this file is safe to leave enabled in CI runs
-//! that haven't populated the cache.
 
-#![cfg(feature = "llama-gguf")]
-
-mod common;
+#![cfg(all(feature = "llama-gguf", feature = "test-util"))]
 
 use platformed_llm::providers::LlamaGgufProvider;
+use platformed_llm::test_util;
 use platformed_llm::{generate, Config, Prompt};
-
-use common::test_models;
 
 #[tokio::test]
 async fn local_generation_smoke_test() {
-    let model_path = match test_models::require(test_models::SMOLLM2_135M_INSTRUCT_Q8) {
-        Ok(p) => p,
-        Err(reason) => {
-            eprintln!("skip: {reason}");
-            return;
-        }
-    };
+    let model_path = test_util::ensure(test_util::SMOLLM2_135M_INSTRUCT_Q8)
+        .await
+        .expect("fetch test model");
     eprintln!("using GGUF model at {}", model_path.display());
 
     let provider = match LlamaGgufProvider::from_gguf(model_path.to_string_lossy().into_owned()) {

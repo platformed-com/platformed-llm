@@ -38,12 +38,12 @@ llama-gguf = { version = "0.14", optional = true, default-features = false }
 async-stream = { version = "0.3", optional = true }
 
 # Pre-test downloader for GGUF models the integration suite consumes.
-# Gated behind `fetch-test-models` so it doesn't drag TLS into the lib
-# build by default.
+# Gated behind `test-util` (which carries the TLS + runtime deps) so it
+# doesn't drag TLS into the lib build by default.
 [[bin]]
 name = "fetch-test-models"
 path = "src/bin/fetch_test_models.rs"
-required-features = ["fetch-test-models"]
+required-features = ["test-util"]
 
 # Every example demonstrates a specific provider, so they're each
 # gated on the matching feature. With no default features, a bare
@@ -121,11 +121,14 @@ llama-gguf = ["dep:llama-gguf", "dep:async-stream", "tokio/rt", "tokio/sync"]
 # `[dev-dependencies]`.
 mock = []
 
-# Internal: gate for the `fetch-test-models` binary. Pulls in
-# `rustls-tls` + a multi-thread Tokio runtime so the bin can make
-# real HTTPS downloads. Off by default — the lib itself never picks
-# a TLS backend (downstream's call).
-fetch-test-models = [
+# Public test helpers (`platformed_llm::test_util`) for locating and
+# auto-downloading the GGUF models the integration suite runs against,
+# plus the `fetch-test-models` binary that backs onto them. Downstream
+# crates enable this under `[dev-dependencies]` to reuse the same
+# models in their own tests. Pulls in `rustls-tls` + a multi-thread
+# Tokio runtime for the self-contained downloads — off by default, so
+# the lib itself never picks a TLS backend (downstream's call).
+test-util = [
     "dep:reqwest",
     "reqwest/rustls-tls",
     "tokio/rt-multi-thread",
