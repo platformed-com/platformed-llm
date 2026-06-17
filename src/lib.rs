@@ -34,6 +34,13 @@ pub mod sse_stream;
 /// fault injection.
 pub mod transport;
 
+// Test-only helpers for locating/downloading the integration suite's
+// GGUF models, for reuse by downstream crates. Documented via its own
+// module-level docs (`//!` in `test_util.rs`) so intra-doc links there
+// resolve in the module's scope.
+#[cfg(feature = "test-util")]
+pub mod test_util;
+
 // Internal modules — every public item below is re-exported at the
 // crate root, so there's no value in users importing through the
 // submodule path. Keep them private to keep the rustdoc table of

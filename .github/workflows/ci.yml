@@ -71,6 +71,7 @@ jobs:
           - "--no-default-features --features google"
           - "--no-default-features --features anthropic-vertex"
           - "--no-default-features --features llama-gguf"
+          - "--no-default-features --features test-util"
           - "--all-features"
     steps:
       - uses: actions/checkout@v4
@@ -79,9 +80,10 @@ jobs:
         run: cargo build --lib ${{ matrix.features }}
 
   # End-to-end smoke test for the local llama-gguf provider. The
-  # `fetch_test_models` example populates `target/test-models/` with
-  # the small (~150MB) public GGUF model the test consumes; results
-  # are cached across runs.
+  # `fetch-test-models` binary populates `target/test-models/` with the
+  # small (~150MB) public GGUF model the test consumes; results are
+  # cached across runs. (The test would auto-download via
+  # `test_util::ensure` anyway — this step just warms the actions/cache.)
   llama-gguf-e2e:
     name: llama-gguf smoke test
     runs-on: ubuntu-latest
@@ -94,9 +96,9 @@ jobs:
           path: target/test-models
           key: llama-gguf-models-v1-smollm2-135m-q8
       - name: Fetch test models (cache miss only)
-        run: cargo run --bin fetch-test-models --features fetch-test-models
-      - name: cargo test --features llama-gguf
-        run: cargo test --no-default-features --features llama-gguf --test llama_gguf_e2e -- --nocapture
+        run: cargo run --bin fetch-test-models --features test-util
+      - name: cargo test --features llama-gguf,test-util
+        run: cargo test --no-default-features --features llama-gguf,test-util --test llama_gguf_e2e -- --nocapture
       # The llama-gguf cross-provider variant lives inside the
       # `cross_provider_tests` binary, which is also gated on the
       # three hosted-provider features. Enable all four so the
