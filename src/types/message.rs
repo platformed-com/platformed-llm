@@ -382,10 +382,23 @@ pub struct FunctionCall {
     /// provider emits one. Currently carries Gemini 2.5+ thinking models'
     /// `thoughtSignature` — a cryptographic blob bound to the call that the
     /// provider may require echoed back to preserve thinking continuity.
-    /// Populated by the Google response parser and echoed back by the
-    /// Google request serializer; dropped on cross-provider switches the
-    /// same way [`AssistantPart::Reasoning::signature`] is. `None` for
-    /// providers that don't emit one.
+    /// Populated by the Google response parser and echoed back verbatim,
+    /// **unconditionally**, by the Google request serializer.
+    ///
+    /// There is no provenance tracking: the field records neither the
+    /// provider nor the model that produced it, and it is never cleared
+    /// from history. It crosses a provider switch only *emergently* — the
+    /// OpenAI and Anthropic tool-call serializers read `call_id` / `name` /
+    /// `arguments` and ignore this field, so it is simply not transmitted
+    /// to them (mirroring how [`AssistantPart::Reasoning`]'s `signature` is
+    /// dropped because those providers drop the whole reasoning part). The
+    /// value still lives on the call in history, so switching away from
+    /// Gemini and back re-echoes the original signature, and switching
+    /// between Gemini models echoes a signature a different model produced.
+    /// Gemini currently tolerates a stale or absent `thoughtSignature`, so
+    /// neither is rejected today; if that changes this needs an origin
+    /// (provider + model) guard before echo. `None` for providers that
+    /// don't emit one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_signature: Option<String>,
 }

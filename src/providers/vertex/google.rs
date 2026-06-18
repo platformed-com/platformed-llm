@@ -110,13 +110,10 @@ impl GoogleProvider {
         let (cached_content, start_index) = find_latest_gemini_continuation(messages);
         let active_messages = &messages[start_index..];
 
-        // Gemini enforces that every model turn with K `functionCall`
-        // parts is immediately followed by a user turn with exactly K
-        // `functionResponse` parts; an unmatched pairing surfaces only
-        // as an opaque 400 at the HTTP layer. Catch it here, before the
-        // round trip, with a typed error that points at the offending
-        // turn.
-        validate_gemini_tool_pairing(active_messages)?;
+        // The function_call / function_response pairing invariant Gemini
+        // enforces is checked provider-agnostically in
+        // [`crate::middleware::validate_prompt`] (every provider requires
+        // it), so it is not re-validated here.
 
         // First pass: collect the assistant turns' tool_call name + id
         // pairs so we can echo them back on the corresponding user
@@ -420,22 +417,12 @@ impl GoogleProvider {
 
         // `cached_content` was extracted up-front from the message
         // history; nothing more to do here.
-
-        // Gemini splits the system prompt into a top-level
-        // `system_instruction` and requires at least one `contents`
-        // entry (a user or model turn). A prompt that carries only
-        // `System` items — or only items that don't translate to a
-        // Gemini turn — leaves `contents` empty and gets a 400 ("at
-        // least one contents field is required"). Surface it as a typed
-        // error before the round trip. A `cached_content` continuation
-        // references prior turns server-side, so empty `contents`
-        // alongside one is left to the API rather than rejected here.
-        if contents.is_empty() && cached_content.is_none() {
-            return Err(Error::invalid_prompt(
-                "Gemini requires at least one user or assistant turn; the prompt contained \
-                 only system or non-content items",
-            ));
-        }
+        //
+        // The "prompt must contain at least one user/assistant turn"
+        // requirement is enforced provider-agnostically in
+        // [`crate::middleware::validate_prompt`], so a system-only prompt
+        // is rejected uniformly across providers before reaching here —
+        // it is not re-checked at this layer.
 
         let google_request = GoogleRequest {
             contents,
@@ -469,58 +456,25 @@ fn encode_function_output(output: &str) -> IValue {
     }
 }
 
-/// Validate that the prompt satisfies Gemini's function call / response
-/// pairing rule: each model turn with K `functionCall` parts must be
-/// immediately followed by a user turn with K `functionResponse` parts.
-///
-/// Runs on the items actually being sent (post-continuation elision), so
-/// a continuation that elides the assistant turn carrying a call — while
-/// keeping its result — doesn't false-positive (a lone user `ToolResult`
-/// with no preceding assistant turn isn't flagged). Only the
-/// forward direction (assistant calls → matching results) is checked;
-/// orphaned results are handled separately by the request builder, which
-/// drops them with a warning per the model-switching contract.
-fn validate_gemini_tool_pairing(messages: &[crate::types::InputItem]) -> Result<(), Error> {
-    for (i, item) in messages.iter().enumerate() {
-        let InputItem::Assistant { content } = item else {
-            continue;
-        };
-        let call_count = content
-            .iter()
-            .filter(|p| matches!(p, AssistantPart::ToolCall(_)))
-            .count();
-        if call_count == 0 {
-            continue;
-        }
-        let result_count = match messages.get(i + 1) {
-            Some(InputItem::User { content }) => content
-                .iter()
-                .filter(|p| matches!(p, UserPart::ToolResult { .. }))
-                .count(),
-            _ => 0,
-        };
-        if result_count != call_count {
-            return Err(Error::invalid_prompt(format!(
-                "Gemini requires each assistant turn's function_call count to match the \
-                 following user turn's function_response count: assistant turn at index {i} \
-                 has {call_count} tool call(s) but the following turn has {result_count} tool \
-                 result(s)"
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Normalise a function tool's JSON-Schema `parameters` into the subset
 /// Gemini's `functionDeclarations[].parameters` accepts. Gemini takes
 /// only the property keywords of JSON Schema and rejects the meta-fields
 /// `$schema`, `$ref`, and `$defs` with a 400, so we:
 ///
-/// - drop root/nested meta-fields (`$schema`, `$id`, `$comment`,
-///   `$anchor`, `$defs`, `definitions`), and
+/// - drop meta-fields (`$schema`, `$id`, `$comment`, `$anchor`, `$defs`,
+///   `definitions`) wherever they appear in *schema* position, and
 /// - inline every local `$ref` (`#/$defs/Name` or `#/definitions/Name`)
-///   against the collected definitions, merging any sibling keywords
-///   over the resolved definition.
+///   against the definitions in scope, merging any sibling keywords over
+///   the resolved definition.
+///
+/// The walk is **position-aware**: it descends only into keywords that
+/// actually hold subschemas (`properties`, `items`, `additionalProperties`,
+/// `allOf`/`anyOf`/`oneOf`, `$defs`, …) and copies every other keyword
+/// verbatim. So data that merely *looks* like schema — a `const` /
+/// `default` / `enum` value that happens to contain a `$ref` key, or a
+/// property literally named `$defs` — is left untouched rather than being
+/// silently mangled. `$defs` are collected lexically (root *and* nested),
+/// so a ref to a definition nested inside a subschema still resolves.
 ///
 /// Recursive `$ref` cycles can't be expressed in Gemini's flattened
 /// schema; they degrade to a permissive open object with a warning.
@@ -529,23 +483,13 @@ fn validate_gemini_tool_pairing(messages: &[crate::types::InputItem]) -> Result<
 fn normalize_gemini_tool_schema(raw: &RawValue) -> std::borrow::Cow<'static, RawValue> {
     use serde_json::Value;
 
-    let Ok(mut value) = serde_json::from_str::<Value>(raw.get()) else {
+    let Ok(value) = serde_json::from_str::<Value>(raw.get()) else {
         return std::borrow::Cow::Owned(raw.to_owned());
     };
 
-    // Collect `$defs` / `definitions` off the root so refs can resolve
-    // against them after they're stripped from the output.
-    let mut defs = serde_json::Map::new();
-    if let Some(obj) = value.as_object_mut() {
-        for key in ["$defs", "definitions"] {
-            if let Some(Value::Object(map)) = obj.remove(key) {
-                defs.extend(map);
-            }
-        }
-    }
-
+    let empty = serde_json::Map::new();
     let mut stack: Vec<String> = Vec::new();
-    let resolved = resolve_and_strip_schema(value, &defs, &mut stack);
+    let resolved = normalize_schema(value, &empty, &mut stack);
 
     match serde_json::value::to_raw_value(&resolved) {
         Ok(rv) => std::borrow::Cow::Owned(rv),
@@ -560,80 +504,195 @@ fn schema_ref_name(reference: &str) -> Option<&str> {
         .or_else(|| reference.strip_prefix("#/definitions/"))
 }
 
-/// Recursively strip JSON-Schema meta-fields and inline local `$ref`s.
-/// `stack` holds the ref names currently being resolved, to break cycles.
-fn resolve_and_strip_schema(
+/// Keywords whose value is a *single* subschema (or, for
+/// `additionalProperties` / `items`, possibly a boolean — copied as-is).
+const SINGLE_SUBSCHEMA_KEYS: &[&str] = &[
+    "additionalProperties",
+    "additionalItems",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "contains",
+    "propertyNames",
+    "if",
+    "then",
+    "else",
+    "not",
+];
+
+/// Keywords whose value is an array of subschemas.
+const SUBSCHEMA_ARRAY_KEYS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
+
+/// Keywords whose value is a `{ name -> subschema }` map (the map keys are
+/// arbitrary names, not schema keywords, so they're preserved verbatim).
+const SUBSCHEMA_MAP_KEYS: &[&str] = &["properties", "patternProperties", "dependentSchemas"];
+
+/// Normalise one JSON-Schema node. `defs_in_scope` are the definitions
+/// visible here (root + every enclosing `$defs`); `stack` holds the ref
+/// names currently being expanded, to break cycles.
+fn normalize_schema(
     value: serde_json::Value,
-    defs: &serde_json::Map<String, serde_json::Value>,
+    defs_in_scope: &serde_json::Map<String, serde_json::Value>,
     stack: &mut Vec<String>,
 ) -> serde_json::Value {
     use serde_json::Value;
 
-    match value {
-        Value::Object(mut obj) => {
-            for key in [
-                "$schema",
-                "$id",
-                "$comment",
-                "$anchor",
-                "$defs",
-                "definitions",
-            ] {
-                obj.remove(key);
-            }
+    let Value::Object(obj) = value else {
+        // Non-objects in schema position (e.g. a boolean schema) pass
+        // through unchanged.
+        return value;
+    };
 
-            if let Some(Value::String(reference)) = obj.remove("$ref") {
-                let Some(name) = schema_ref_name(&reference) else {
-                    tracing::warn!(%reference, "Gemini: dropping non-local $ref from tool schema");
-                    return resolve_object_children(obj, defs, stack);
-                };
-                if stack.iter().any(|n| n == name) {
-                    tracing::warn!(
-                        %reference,
-                        "Gemini: dropping recursive $ref from tool schema; inlining as open object",
-                    );
-                    return serde_json::json!({ "type": "object" });
-                }
-                let Some(def) = defs.get(name) else {
-                    tracing::warn!(%reference, "Gemini: unresolved $ref in tool schema; dropping");
-                    return resolve_object_children(obj, defs, stack);
-                };
-                stack.push(name.to_string());
-                let resolved = resolve_and_strip_schema(def.clone(), defs, stack);
-                stack.pop();
-                // Merge any sibling keywords over the resolved definition
-                // (siblings win), recursing into each.
-                if let Value::Object(mut resolved_obj) = resolved {
-                    for (k, v) in obj {
-                        resolved_obj.insert(k, resolve_and_strip_schema(v, defs, stack));
-                    }
-                    return Value::Object(resolved_obj);
-                }
-                return resolved;
+    // Extend the scope with this node's local `$defs` / `definitions` so
+    // refs anywhere in this subtree (including sibling defs) resolve.
+    let mut local = serde_json::Map::new();
+    for key in ["$defs", "definitions"] {
+        if let Some(Value::Object(map)) = obj.get(key) {
+            for (k, v) in map {
+                local.insert(k.clone(), v.clone());
             }
-
-            resolve_object_children(obj, defs, stack)
         }
-        Value::Array(arr) => Value::Array(
+    }
+    let scope: std::borrow::Cow<serde_json::Map<String, Value>> = if local.is_empty() {
+        std::borrow::Cow::Borrowed(defs_in_scope)
+    } else {
+        let mut merged = defs_in_scope.clone();
+        merged.extend(local);
+        std::borrow::Cow::Owned(merged)
+    };
+    let defs = scope.as_ref();
+
+    if let Some(Value::String(reference)) = obj.get("$ref") {
+        let reference = reference.clone();
+        return resolve_ref(&reference, &obj, defs, stack);
+    }
+
+    Value::Object(normalize_schema_keys(obj, defs, stack))
+}
+
+/// Rebuild a schema object minus meta-fields, recursing only into
+/// subschema-bearing keywords and copying everything else verbatim.
+/// Assumes any `$ref` has already been handled by the caller.
+fn normalize_schema_keys(
+    obj: serde_json::Map<String, serde_json::Value>,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    stack: &mut Vec<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::Value;
+
+    let mut out = serde_json::Map::new();
+    for (k, v) in obj {
+        match k.as_str() {
+            // Meta-fields and definition blocks: stripped from the output
+            // (defs were already lifted into scope by the caller).
+            "$schema" | "$id" | "$comment" | "$anchor" | "$defs" | "definitions" | "$ref" => {}
+            _ if SUBSCHEMA_MAP_KEYS.contains(&k.as_str()) => {
+                let mapped = match v {
+                    Value::Object(m) => Value::Object(
+                        m.into_iter()
+                            .map(|(name, sub)| (name, normalize_schema(sub, defs, stack)))
+                            .collect(),
+                    ),
+                    other => other,
+                };
+                out.insert(k, mapped);
+            }
+            _ if SUBSCHEMA_ARRAY_KEYS.contains(&k.as_str()) => {
+                out.insert(k, map_subschema_array(v, defs, stack));
+            }
+            // `items` is a single subschema in 2020-12 but an array of
+            // subschemas in draft-07; handle both shapes.
+            "items" => {
+                let mapped = match v {
+                    Value::Array(_) => map_subschema_array(v, defs, stack),
+                    Value::Object(_) => normalize_schema(v, defs, stack),
+                    other => other,
+                };
+                out.insert(k, mapped);
+            }
+            _ if SINGLE_SUBSCHEMA_KEYS.contains(&k.as_str()) => {
+                // Subschema, or a bare bool (e.g. `additionalProperties:
+                // false`) which is copied as-is.
+                let mapped = match v {
+                    Value::Object(_) => normalize_schema(v, defs, stack),
+                    other => other,
+                };
+                out.insert(k, mapped);
+            }
+            // Data / scalar validation keyword (`type`, `enum`, `const`,
+            // `default`, `examples`, `required`, `format`, …): copy
+            // verbatim — never strip or resolve inside a data position.
+            _ => {
+                out.insert(k, v);
+            }
+        }
+    }
+    out
+}
+
+/// Map [`normalize_schema`] over an array of subschemas.
+fn map_subschema_array(
+    value: serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    stack: &mut Vec<String>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
             arr.into_iter()
-                .map(|v| resolve_and_strip_schema(v, defs, stack))
+                .map(|s| normalize_schema(s, defs, stack))
                 .collect(),
         ),
         other => other,
     }
 }
 
-/// Recurse into the children of an already-meta-stripped object.
-fn resolve_object_children(
-    obj: serde_json::Map<String, serde_json::Value>,
+/// Resolve a `$ref` against `defs`, inlining the (normalised) definition
+/// and merging any sibling keywords of the `$ref` object over it.
+fn resolve_ref(
+    reference: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
     defs: &serde_json::Map<String, serde_json::Value>,
     stack: &mut Vec<String>,
 ) -> serde_json::Value {
-    let mut out = serde_json::Map::new();
-    for (k, v) in obj {
-        out.insert(k, resolve_and_strip_schema(v, defs, stack));
+    use serde_json::Value;
+
+    let drop_ref_and_normalize = |stack: &mut Vec<String>| {
+        let mut without_ref = obj.clone();
+        without_ref.remove("$ref");
+        Value::Object(normalize_schema_keys(without_ref, defs, stack))
+    };
+
+    let Some(name) = schema_ref_name(reference) else {
+        tracing::warn!(%reference, "Gemini: dropping non-local $ref from tool schema");
+        return drop_ref_and_normalize(stack);
+    };
+    if stack.iter().any(|n| n == name) {
+        tracing::warn!(
+            %reference,
+            "Gemini: dropping recursive $ref from tool schema; inlining as open object",
+        );
+        return serde_json::json!({ "type": "object" });
     }
-    serde_json::Value::Object(out)
+    let Some(def) = defs.get(name) else {
+        tracing::warn!(%reference, "Gemini: unresolved $ref in tool schema; dropping");
+        return drop_ref_and_normalize(stack);
+    };
+
+    stack.push(name.to_string());
+    let resolved = normalize_schema(def.clone(), defs, stack);
+    stack.pop();
+
+    // Merge sibling keywords (everything but `$ref`) over the resolved
+    // definition — siblings win, matching draft 2020-12 where `$ref` is an
+    // applicator that composes with adjacent keywords.
+    let Value::Object(mut resolved_obj) = resolved else {
+        return resolved;
+    };
+    let mut without_ref = obj.clone();
+    without_ref.remove("$ref");
+    for (k, v) in normalize_schema_keys(without_ref, defs, stack) {
+        resolved_obj.insert(k, v);
+    }
+    Value::Object(resolved_obj)
 }
 
 #[async_trait::async_trait]
@@ -1497,6 +1556,18 @@ mod tests {
         crate::types::Tool::function("f", None, Cow::Owned(raw))
     }
 
+    /// Run a tool-parameter schema through the full request conversion and
+    /// return the normalised `parameters` object Gemini would receive.
+    fn normalized_params(schema: &str) -> serde_json::Value {
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::builder("gemini")
+            .tools(vec![tool_with_schema(schema)])
+            .build();
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        json["tools"][0]["functionDeclarations"][0]["parameters"].clone()
+    }
+
     /// #1: Gemini rejects `$schema` / `$ref` / `$defs` meta-fields in
     /// tool parameters. The Google provider must strip the meta-fields
     /// and inline local `$ref`s against `$defs` before sending.
@@ -1550,39 +1621,159 @@ mod tests {
         assert!(params.get("$defs").is_none());
     }
 
-    /// #2: a prompt with only a system instruction (no user/assistant
-    /// turn) leaves Gemini's `contents` empty; surface a typed
-    /// `InvalidPrompt` before the round trip instead of a raw 400.
+    /// Review finding #1: a `$ref` to a definition nested inside a
+    /// subschema (not at the root) must still resolve — `$defs` are
+    /// collected lexically, root and nested.
     #[test]
-    fn system_only_prompt_is_rejected_with_typed_error() {
-        let prompt = crate::Prompt::system("you are helpful");
-        let cfg = Config::builder("gemini").build();
-        let err = provider()
-            .convert_request(&prompt, cfg.raw())
-            .expect_err("system-only prompt must be rejected");
-        assert!(matches!(err, Error::InvalidPrompt(_)), "got {err:?}");
+    fn tool_schema_nested_defs_resolve() {
+        let schema = r##"{
+            "type": "object",
+            "properties": {
+                "outer": {
+                    "type": "object",
+                    "$defs": { "Inner": { "type": "string", "format": "uuid" } },
+                    "properties": { "id": { "$ref": "#/$defs/Inner" } }
+                }
+            }
+        }"##;
+        let params = normalized_params(schema);
+        let inner = &params["properties"]["outer"]["properties"]["id"];
+        assert_eq!(
+            inner["type"], "string",
+            "nested $ref must resolve: {params}"
+        );
+        assert_eq!(inner["format"], "uuid");
+        assert!(inner.get("$ref").is_none());
+        assert!(params["properties"]["outer"].get("$defs").is_none());
     }
 
-    /// #3: an assistant turn whose tool call has no matching tool result
-    /// in the following user turn violates Gemini's pairing rule. Caught
-    /// before the round trip as a typed error.
+    /// Review finding #6: meta-field *names* used as ordinary property
+    /// keys (or keys inside `const` / `default` data) must NOT be stripped
+    /// — only schema-position meta-fields are. A property literally named
+    /// `$defs` / `$ref` survives.
     #[test]
-    fn unmatched_tool_call_is_rejected_with_typed_error() {
-        use crate::types::FunctionCall;
-        let prompt = crate::Prompt::user("hi").with_assistant_tool_call(FunctionCall {
-            call_id: "c1".into(),
-            name: "f".into(),
-            arguments: "{}".into(),
-            provider_signature: None,
-        });
-        let cfg = Config::builder("gemini").build();
-        let err = provider()
-            .convert_request(&prompt, cfg.raw())
-            .expect_err("unmatched tool call must be rejected");
-        assert!(matches!(err, Error::InvalidPrompt(_)), "got {err:?}");
+    fn tool_schema_preserves_data_named_like_meta_fields() {
+        let schema = r##"{
+            "type": "object",
+            "properties": {
+                "$ref": { "type": "string" },
+                "$defs": { "type": "number" },
+                "config": {
+                    "type": "object",
+                    "default": { "$ref": "literal-data", "$schema": "also-data" },
+                    "const": { "$defs": "still-data" }
+                }
+            }
+        }"##;
+        let params = normalized_params(schema);
+        let props = &params["properties"];
+        // Properties whose *names* collide with meta-fields are real
+        // properties, not schema keywords — they must remain.
+        assert_eq!(props["$ref"]["type"], "string", "got: {params}");
+        assert_eq!(props["$defs"]["type"], "number");
+        // `default` / `const` are data positions: their contents are
+        // copied verbatim, meta-looking keys and all.
+        assert_eq!(props["config"]["default"]["$ref"], "literal-data");
+        assert_eq!(props["config"]["default"]["$schema"], "also-data");
+        assert_eq!(props["config"]["const"]["$defs"], "still-data");
     }
 
-    /// A matched tool call / result pair passes validation.
+    /// `enum` values are data and pass through untouched.
+    #[test]
+    fn tool_schema_preserves_enum_values() {
+        let schema = r##"{ "type": "string", "enum": ["a", "b", "c"] }"##;
+        let params = normalized_params(schema);
+        assert_eq!(params["enum"], serde_json::json!(["a", "b", "c"]));
+    }
+
+    /// Sibling keywords on a `$ref` object merge over the resolved
+    /// definition (siblings win).
+    #[test]
+    fn tool_schema_ref_siblings_merge_over_definition() {
+        let schema = r##"{
+            "type": "object",
+            "properties": {
+                "x": { "$ref": "#/$defs/Base", "description": "the x field" }
+            },
+            "$defs": { "Base": { "type": "integer", "description": "base desc" } }
+        }"##;
+        let params = normalized_params(schema);
+        let x = &params["properties"]["x"];
+        assert_eq!(x["type"], "integer", "resolved def type kept: {params}");
+        assert_eq!(x["description"], "the x field", "sibling overrides def");
+        assert!(x.get("$ref").is_none());
+    }
+
+    /// `additionalProperties` as a subschema with a `$ref` resolves; as a
+    /// bare boolean it is copied unchanged.
+    #[test]
+    fn tool_schema_additional_properties_handled() {
+        let schema_ref = r##"{
+            "type": "object",
+            "additionalProperties": { "$ref": "#/$defs/V" },
+            "$defs": { "V": { "type": "boolean" } }
+        }"##;
+        let params = normalized_params(schema_ref);
+        assert_eq!(params["additionalProperties"]["type"], "boolean");
+        assert!(params.get("$defs").is_none());
+
+        let schema_bool = r##"{ "type": "object", "additionalProperties": false }"##;
+        let params = normalized_params(schema_bool);
+        assert_eq!(params["additionalProperties"], serde_json::json!(false));
+    }
+
+    /// `allOf` / `anyOf` arrays and array `items` recurse and resolve refs.
+    #[test]
+    fn tool_schema_combinators_and_items_recurse() {
+        let schema = r##"{
+            "type": "object",
+            "properties": {
+                "tags": { "type": "array", "items": { "$ref": "#/$defs/Tag" } },
+                "either": { "anyOf": [ { "$ref": "#/$defs/Tag" }, { "type": "null" } ] }
+            },
+            "$defs": { "Tag": { "type": "string", "minLength": 1 } }
+        }"##;
+        let params = normalized_params(schema);
+        assert_eq!(params["properties"]["tags"]["items"]["type"], "string");
+        assert_eq!(params["properties"]["tags"]["items"]["minLength"], 1);
+        assert_eq!(params["properties"]["either"]["anyOf"][0]["type"], "string");
+        assert_eq!(params["properties"]["either"]["anyOf"][1]["type"], "null");
+        assert!(params.get("$defs").is_none());
+    }
+
+    /// An unresolvable / non-local `$ref` degrades gracefully: the `$ref`
+    /// is dropped (so Gemini doesn't 400 on it) and sibling keywords are
+    /// retained, rather than crashing.
+    #[test]
+    fn tool_schema_unresolved_ref_drops_gracefully() {
+        let schema = r##"{
+            "type": "object",
+            "properties": {
+                "a": { "$ref": "https://example.com/external", "type": "string" },
+                "b": { "$ref": "#/$defs/Missing", "title": "B" }
+            }
+        }"##;
+        let params = normalized_params(schema);
+        // Non-local ref dropped, sibling `type` kept.
+        assert_eq!(params["properties"]["a"]["type"], "string");
+        assert!(params["properties"]["a"].get("$ref").is_none());
+        // Unresolved local ref dropped, sibling `title` kept.
+        assert_eq!(params["properties"]["b"]["title"], "B");
+        assert!(params["properties"]["b"].get("$ref").is_none());
+    }
+
+    /// Malformed (non-JSON) parameters are passed through unchanged rather
+    /// than blocking the request.
+    #[test]
+    fn tool_schema_non_json_passes_through() {
+        let raw = serde_json::value::RawValue::from_string("true".to_string()).unwrap();
+        let out = normalize_gemini_tool_schema(&raw);
+        assert_eq!(out.get(), "true");
+    }
+
+    /// A matched tool call / result pair converts cleanly. (The pairing
+    /// invariant itself is enforced provider-agnostically in
+    /// `crate::middleware::validate_prompt`.)
     #[test]
     fn matched_tool_call_and_result_passes() {
         use crate::types::FunctionCall;
