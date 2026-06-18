@@ -46,6 +46,18 @@ pub enum Error {
     #[error("invalid configuration: {0}")]
     Config(String),
 
+    /// The prompt is structurally invalid for the target provider, caught
+    /// client-side before the HTTP round trip. Lets the caller learn the
+    /// rule from a typed error instead of decoding an opaque provider 400.
+    ///
+    /// Raised for provider-specific prompt-shape requirements that aren't
+    /// expressible in the type system — e.g. Gemini requires at least one
+    /// user/assistant turn, and requires each assistant turn's
+    /// `functionCall` count to match the following user turn's
+    /// `functionResponse` count.
+    #[error("invalid prompt: {0}")]
+    InvalidPrompt(String),
+
     /// Mid-stream / SSE parsing failure.
     #[error("streaming error: {0}")]
     Streaming(String),
@@ -135,6 +147,12 @@ impl Error {
     /// Build a configuration error (invalid env, missing required field, etc.).
     pub fn config(message: impl Into<String>) -> Self {
         Error::Config(message.into())
+    }
+
+    /// Build an invalid-prompt error — the prompt's structure violates a
+    /// provider requirement that can be detected before sending.
+    pub fn invalid_prompt(message: impl Into<String>) -> Self {
+        Error::InvalidPrompt(message.into())
     }
 
     /// Build an auth error with no observed HTTP status.
@@ -299,6 +317,15 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn invalid_prompt_constructor_renders_prefix_and_message() {
+        let err = Error::invalid_prompt("only system items");
+        assert!(matches!(err, Error::InvalidPrompt(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("invalid prompt"));
+        assert!(msg.contains("only system items"));
     }
 
     #[test]

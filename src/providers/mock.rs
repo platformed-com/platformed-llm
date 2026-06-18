@@ -708,6 +708,7 @@ mod tests {
                 call_id: "call_1".into(),
                 name: "get_weather".into(),
                 arguments: r#"{"city":"Paris"}"#.into(),
+                provider_signature: None,
             }))
             .build();
         let complete = provider
@@ -787,6 +788,7 @@ mod tests {
                     call_id: "c1".into(),
                     name: "lookup".into(),
                     arguments: "{}".into(),
+                    provider_signature: None,
                 })
             }
         });

@@ -694,6 +694,7 @@ mod tests {
                 call_id: "call_old".into(),
                 name: "search".into(),
                 arguments: r#"{"q":"old"}"#.into(),
+                provider_signature: None,
             })
             .with_tool_result("call_old", "old result")
             .with_assistant("here you go")
@@ -702,6 +703,7 @@ mod tests {
                 call_id: "call_pending".into(),
                 name: "search".into(),
                 arguments: r#"{"q":"new"}"#.into(),
+                provider_signature: None,
             })
             .with_tool_result("call_pending", "fresh result");
 
@@ -771,11 +773,13 @@ mod tests {
                     call_id: "call_a".into(),
                     name: "get_weather".into(),
                     arguments: r#"{"city":"Paris"}"#.into(),
+                    provider_signature: None,
                 }),
                 AssistantPart::ToolCall(FunctionCall {
                     call_id: "call_b".into(),
                     name: "get_weather".into(),
                     arguments: r#"{"city":"London"}"#.into(),
+                    provider_signature: None,
                 }),
             ],
         };

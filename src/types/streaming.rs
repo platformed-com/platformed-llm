@@ -102,8 +102,11 @@ pub enum PartKind {
 /// Metadata update for a streaming part.
 #[derive(Debug, Clone)]
 pub enum PartUpdate {
-    /// Anthropic thinking signature, arriving after the last reasoning
-    /// delta.
+    /// Opaque provider signature for the part being updated. On a
+    /// [`PartKind::Reasoning`] part it carries Anthropic's thinking
+    /// signature (arriving after the last reasoning delta); on a
+    /// [`PartKind::ToolCall`] part it carries Gemini's `thoughtSignature`.
+    /// Lands on the corresponding part's signature field.
     Signature(String),
     /// Citation / annotation on the text up to this point.
     Annotation(Annotation),

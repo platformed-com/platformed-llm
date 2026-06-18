@@ -122,9 +122,16 @@ pub struct GoogleFileData {
 
 /// Google function call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleFunctionCall {
     pub name: String,
     pub args: IValue,
+    /// Gemini 2.5+ thinking models attach an opaque `thoughtSignature`
+    /// to each `functionCall`. Captured on parse and echoed back on the
+    /// request side to preserve thinking continuity. Absent for
+    /// non-thinking models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Google function response.

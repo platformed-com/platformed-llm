@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
 use ijson::{ijson, IValue};
+use serde_json::value::RawValue;
 use uuid::Uuid;
 
 use super::endpoint::VertexEndpoint;
@@ -108,6 +109,14 @@ impl GoogleProvider {
         // for other providers are ignored.
         let (cached_content, start_index) = find_latest_gemini_continuation(messages);
         let active_messages = &messages[start_index..];
+
+        // Gemini enforces that every model turn with K `functionCall`
+        // parts is immediately followed by a user turn with exactly K
+        // `functionResponse` parts; an unmatched pairing surfaces only
+        // as an opaque 400 at the HTTP layer. Catch it here, before the
+        // round trip, with a typed error that points at the offending
+        // turn.
+        validate_gemini_tool_pairing(active_messages)?;
 
         // First pass: collect the assistant turns' tool_call name + id
         // pairs so we can echo them back on the corresponding user
@@ -282,6 +291,7 @@ impl GoogleProvider {
                                         function_call: GoogleFunctionCall {
                                             name: call.name.clone(),
                                             args,
+                                            thought_signature: call.provider_signature.clone(),
                                         },
                                     },
                                 );
@@ -343,7 +353,13 @@ impl GoogleProvider {
                     Tool::Function(f) => function_decls.push(GoogleFunctionDeclaration {
                         name: f.name.clone(),
                         description: f.description.clone().unwrap_or_default(),
-                        parameters: f.parameters.clone(),
+                        // Gemini's `functionDeclarations[].parameters` accepts
+                        // only the property keywords of JSON Schema — it
+                        // rejects the meta-fields `$schema`, `$ref`, and
+                        // `$defs` with a 400. Normalise before sending:
+                        // drop the meta-fields and inline any `$ref`s against
+                        // the schema's `$defs` / `definitions`.
+                        parameters: normalize_gemini_tool_schema(&f.parameters),
                     }),
                     Tool::Builtin(ProviderBuiltin::GoogleSearch) => {
                         entries.push(GoogleTool::GoogleSearch {
@@ -405,6 +421,22 @@ impl GoogleProvider {
         // `cached_content` was extracted up-front from the message
         // history; nothing more to do here.
 
+        // Gemini splits the system prompt into a top-level
+        // `system_instruction` and requires at least one `contents`
+        // entry (a user or model turn). A prompt that carries only
+        // `System` items — or only items that don't translate to a
+        // Gemini turn — leaves `contents` empty and gets a 400 ("at
+        // least one contents field is required"). Surface it as a typed
+        // error before the round trip. A `cached_content` continuation
+        // references prior turns server-side, so empty `contents`
+        // alongside one is left to the API rather than rejected here.
+        if contents.is_empty() && cached_content.is_none() {
+            return Err(Error::invalid_prompt(
+                "Gemini requires at least one user or assistant turn; the prompt contained \
+                 only system or non-content items",
+            ));
+        }
+
         let google_request = GoogleRequest {
             contents,
             generation_config,
@@ -435,6 +467,173 @@ fn encode_function_output(output: &str) -> IValue {
         Ok(value) => ijson!({ "result": value }),
         Err(_) => ijson!({ "result": output }),
     }
+}
+
+/// Validate that the prompt satisfies Gemini's function call / response
+/// pairing rule: each model turn with K `functionCall` parts must be
+/// immediately followed by a user turn with K `functionResponse` parts.
+///
+/// Runs on the items actually being sent (post-continuation elision), so
+/// a continuation that elides the assistant turn carrying a call — while
+/// keeping its result — doesn't false-positive (a lone user `ToolResult`
+/// with no preceding assistant turn isn't flagged). Only the
+/// forward direction (assistant calls → matching results) is checked;
+/// orphaned results are handled separately by the request builder, which
+/// drops them with a warning per the model-switching contract.
+fn validate_gemini_tool_pairing(messages: &[crate::types::InputItem]) -> Result<(), Error> {
+    for (i, item) in messages.iter().enumerate() {
+        let InputItem::Assistant { content } = item else {
+            continue;
+        };
+        let call_count = content
+            .iter()
+            .filter(|p| matches!(p, AssistantPart::ToolCall(_)))
+            .count();
+        if call_count == 0 {
+            continue;
+        }
+        let result_count = match messages.get(i + 1) {
+            Some(InputItem::User { content }) => content
+                .iter()
+                .filter(|p| matches!(p, UserPart::ToolResult { .. }))
+                .count(),
+            _ => 0,
+        };
+        if result_count != call_count {
+            return Err(Error::invalid_prompt(format!(
+                "Gemini requires each assistant turn's function_call count to match the \
+                 following user turn's function_response count: assistant turn at index {i} \
+                 has {call_count} tool call(s) but the following turn has {result_count} tool \
+                 result(s)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Normalise a function tool's JSON-Schema `parameters` into the subset
+/// Gemini's `functionDeclarations[].parameters` accepts. Gemini takes
+/// only the property keywords of JSON Schema and rejects the meta-fields
+/// `$schema`, `$ref`, and `$defs` with a 400, so we:
+///
+/// - drop root/nested meta-fields (`$schema`, `$id`, `$comment`,
+///   `$anchor`, `$defs`, `definitions`), and
+/// - inline every local `$ref` (`#/$defs/Name` or `#/definitions/Name`)
+///   against the collected definitions, merging any sibling keywords
+///   over the resolved definition.
+///
+/// Recursive `$ref` cycles can't be expressed in Gemini's flattened
+/// schema; they degrade to a permissive open object with a warning.
+/// Anything that fails to parse or re-serialise is passed through
+/// unchanged — normalisation is best-effort and never blocks the request.
+fn normalize_gemini_tool_schema(raw: &RawValue) -> std::borrow::Cow<'static, RawValue> {
+    use serde_json::Value;
+
+    let Ok(mut value) = serde_json::from_str::<Value>(raw.get()) else {
+        return std::borrow::Cow::Owned(raw.to_owned());
+    };
+
+    // Collect `$defs` / `definitions` off the root so refs can resolve
+    // against them after they're stripped from the output.
+    let mut defs = serde_json::Map::new();
+    if let Some(obj) = value.as_object_mut() {
+        for key in ["$defs", "definitions"] {
+            if let Some(Value::Object(map)) = obj.remove(key) {
+                defs.extend(map);
+            }
+        }
+    }
+
+    let mut stack: Vec<String> = Vec::new();
+    let resolved = resolve_and_strip_schema(value, &defs, &mut stack);
+
+    match serde_json::value::to_raw_value(&resolved) {
+        Ok(rv) => std::borrow::Cow::Owned(rv),
+        Err(_) => std::borrow::Cow::Owned(raw.to_owned()),
+    }
+}
+
+/// The name component of a local definition `$ref`, if it is one.
+fn schema_ref_name(reference: &str) -> Option<&str> {
+    reference
+        .strip_prefix("#/$defs/")
+        .or_else(|| reference.strip_prefix("#/definitions/"))
+}
+
+/// Recursively strip JSON-Schema meta-fields and inline local `$ref`s.
+/// `stack` holds the ref names currently being resolved, to break cycles.
+fn resolve_and_strip_schema(
+    value: serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    stack: &mut Vec<String>,
+) -> serde_json::Value {
+    use serde_json::Value;
+
+    match value {
+        Value::Object(mut obj) => {
+            for key in [
+                "$schema",
+                "$id",
+                "$comment",
+                "$anchor",
+                "$defs",
+                "definitions",
+            ] {
+                obj.remove(key);
+            }
+
+            if let Some(Value::String(reference)) = obj.remove("$ref") {
+                let Some(name) = schema_ref_name(&reference) else {
+                    tracing::warn!(%reference, "Gemini: dropping non-local $ref from tool schema");
+                    return resolve_object_children(obj, defs, stack);
+                };
+                if stack.iter().any(|n| n == name) {
+                    tracing::warn!(
+                        %reference,
+                        "Gemini: dropping recursive $ref from tool schema; inlining as open object",
+                    );
+                    return serde_json::json!({ "type": "object" });
+                }
+                let Some(def) = defs.get(name) else {
+                    tracing::warn!(%reference, "Gemini: unresolved $ref in tool schema; dropping");
+                    return resolve_object_children(obj, defs, stack);
+                };
+                stack.push(name.to_string());
+                let resolved = resolve_and_strip_schema(def.clone(), defs, stack);
+                stack.pop();
+                // Merge any sibling keywords over the resolved definition
+                // (siblings win), recursing into each.
+                if let Value::Object(mut resolved_obj) = resolved {
+                    for (k, v) in obj {
+                        resolved_obj.insert(k, resolve_and_strip_schema(v, defs, stack));
+                    }
+                    return Value::Object(resolved_obj);
+                }
+                return resolved;
+            }
+
+            resolve_object_children(obj, defs, stack)
+        }
+        Value::Array(arr) => Value::Array(
+            arr.into_iter()
+                .map(|v| resolve_and_strip_schema(v, defs, stack))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Recurse into the children of an already-meta-stripped object.
+fn resolve_object_children(
+    obj: serde_json::Map<String, serde_json::Value>,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    stack: &mut Vec<String>,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (k, v) in obj {
+        out.insert(k, resolve_and_strip_schema(v, defs, stack));
+    }
+    serde_json::Value::Object(out)
 }
 
 #[async_trait::async_trait]
@@ -682,16 +881,18 @@ impl GoogleStreamState {
         call_id: String,
         name: String,
         mut arguments: String,
+        mut signature: Option<String>,
     ) {
         let events = self.tracker.open_one_shot(PartKind::ToolCall {
             call_id,
             name: name.clone(),
         });
         // open_one_shot emits PartStart then PartEnd; splice the
-        // arguments Delta in right after the PartStart. Forward each
-        // event and inject once, without depending (via panicking
-        // `expect`/`unreachable!`) on the exact event count — a
-        // future PartTracker change shouldn't crash the stream.
+        // arguments Delta (and Gemini's thoughtSignature, if any) in
+        // right after the PartStart. Forward each event and inject once,
+        // without depending (via panicking `expect`/`unreachable!`) on
+        // the exact event count — a future PartTracker change shouldn't
+        // crash the stream.
         for ev in events {
             if let StreamEvent::PartStart { index, .. } = &ev {
                 let index = *index;
@@ -700,6 +901,12 @@ impl GoogleStreamState {
                     out.push(StreamEvent::Delta {
                         index,
                         delta: std::mem::take(&mut arguments),
+                    });
+                }
+                if let Some(sig) = signature.take() {
+                    out.push(StreamEvent::PartUpdate {
+                        index,
+                        update: PartUpdate::Signature(sig),
                     });
                 }
             } else {
@@ -772,6 +979,7 @@ pub(crate) fn convert_response_stateful(
                         call_id,
                         function_call.name.clone(),
                         arguments,
+                        function_call.thought_signature.clone(),
                     );
                 }
                 GooglePart::ExecutableCode { executable_code } => {
@@ -1281,5 +1489,161 @@ mod tests {
         } else {
             panic!("expected text part, got {:?}", body.contents[0].parts[0]);
         }
+    }
+
+    fn tool_with_schema(schema: &str) -> crate::types::Tool {
+        use std::borrow::Cow;
+        let raw = serde_json::value::RawValue::from_string(schema.to_string()).unwrap();
+        crate::types::Tool::function("f", None, Cow::Owned(raw))
+    }
+
+    /// #1: Gemini rejects `$schema` / `$ref` / `$defs` meta-fields in
+    /// tool parameters. The Google provider must strip the meta-fields
+    /// and inline local `$ref`s against `$defs` before sending.
+    #[test]
+    fn tool_schema_meta_fields_stripped_and_refs_inlined() {
+        let schema = r##"{
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": { "source": { "$ref": "#/$defs/SourceId" } },
+            "$defs": { "SourceId": { "type": "string", "format": "uuid" } }
+        }"##;
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::builder("gemini")
+            .tools(vec![tool_with_schema(schema)])
+            .build();
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let params = &json["tools"][0]["functionDeclarations"][0]["parameters"];
+
+        assert!(params.get("$schema").is_none(), "$schema must be stripped");
+        assert!(params.get("$defs").is_none(), "$defs must be stripped");
+        // The `$ref` is inlined to the resolved definition.
+        assert_eq!(params["properties"]["source"]["type"], "string");
+        assert_eq!(params["properties"]["source"]["format"], "uuid");
+        assert!(
+            params["properties"]["source"].get("$ref").is_none(),
+            "$ref must be resolved away"
+        );
+    }
+
+    /// A recursive `$ref` can't be expressed in Gemini's flattened
+    /// schema; normalisation must terminate (not stack-overflow) and
+    /// degrade the cycle to a permissive object.
+    #[test]
+    fn tool_schema_recursive_ref_terminates() {
+        let schema = r##"{
+            "type": "object",
+            "properties": { "child": { "$ref": "#/$defs/Node" } },
+            "$defs": { "Node": { "type": "object", "properties": { "next": { "$ref": "#/$defs/Node" } } } }
+        }"##;
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::builder("gemini")
+            .tools(vec![tool_with_schema(schema)])
+            .build();
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let params = &json["tools"][0]["functionDeclarations"][0]["parameters"];
+        // First level inlines; the recursive self-reference degrades to
+        // an open object rather than looping forever.
+        assert_eq!(params["properties"]["child"]["type"], "object");
+        assert!(params.get("$defs").is_none());
+    }
+
+    /// #2: a prompt with only a system instruction (no user/assistant
+    /// turn) leaves Gemini's `contents` empty; surface a typed
+    /// `InvalidPrompt` before the round trip instead of a raw 400.
+    #[test]
+    fn system_only_prompt_is_rejected_with_typed_error() {
+        let prompt = crate::Prompt::system("you are helpful");
+        let cfg = Config::builder("gemini").build();
+        let err = provider()
+            .convert_request(&prompt, cfg.raw())
+            .expect_err("system-only prompt must be rejected");
+        assert!(matches!(err, Error::InvalidPrompt(_)), "got {err:?}");
+    }
+
+    /// #3: an assistant turn whose tool call has no matching tool result
+    /// in the following user turn violates Gemini's pairing rule. Caught
+    /// before the round trip as a typed error.
+    #[test]
+    fn unmatched_tool_call_is_rejected_with_typed_error() {
+        use crate::types::FunctionCall;
+        let prompt = crate::Prompt::user("hi").with_assistant_tool_call(FunctionCall {
+            call_id: "c1".into(),
+            name: "f".into(),
+            arguments: "{}".into(),
+            provider_signature: None,
+        });
+        let cfg = Config::builder("gemini").build();
+        let err = provider()
+            .convert_request(&prompt, cfg.raw())
+            .expect_err("unmatched tool call must be rejected");
+        assert!(matches!(err, Error::InvalidPrompt(_)), "got {err:?}");
+    }
+
+    /// A matched tool call / result pair passes validation.
+    #[test]
+    fn matched_tool_call_and_result_passes() {
+        use crate::types::FunctionCall;
+        let prompt = crate::Prompt::user("hi")
+            .with_assistant_tool_call(FunctionCall {
+                call_id: "c1".into(),
+                name: "f".into(),
+                arguments: "{}".into(),
+                provider_signature: None,
+            })
+            .with_tool_result("c1", "ok");
+        let cfg = Config::builder("gemini").build();
+        assert!(provider().convert_request(&prompt, cfg.raw()).is_ok());
+    }
+
+    /// #4 (request side): a tool call carrying a `provider_signature` is
+    /// echoed back as Gemini's `thoughtSignature` on the wire.
+    #[test]
+    fn provider_signature_echoed_as_thought_signature() {
+        use crate::types::FunctionCall;
+        let prompt = crate::Prompt::user("hi")
+            .with_assistant_tool_call(FunctionCall {
+                call_id: "c1".into(),
+                name: "f".into(),
+                arguments: "{}".into(),
+                provider_signature: Some("sig_xyz".into()),
+            })
+            .with_tool_result("c1", "ok");
+        let cfg = Config::builder("gemini").build();
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        // contents: [user "hi", model [functionCall], user [functionResponse]]
+        assert_eq!(
+            json["contents"][1]["parts"][0]["functionCall"]["thoughtSignature"],
+            "sig_xyz",
+        );
+    }
+
+    /// #4 (response side): Gemini's `thoughtSignature` on a `functionCall`
+    /// part is captured and surfaced via a `PartUpdate::Signature`, which
+    /// the accumulator lands on `FunctionCall::provider_signature`.
+    #[test]
+    fn thought_signature_parsed_into_provider_signature() {
+        let chunk = r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Paris"},"thoughtSignature":"sig_abc"}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}}"#;
+        let mut state = GoogleStreamState::default();
+        let r: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let events = convert_response_stateful(r, &mut state).unwrap();
+
+        let mut acc = crate::accumulator::ResponseAccumulator::new();
+        for ev in events {
+            acc.process_event(ev).unwrap();
+        }
+        let resp = acc.finalize().unwrap();
+        let call = resp
+            .content
+            .iter()
+            .find_map(|p| match p {
+                AssistantPart::ToolCall(c) => Some(c),
+                _ => None,
+            })
+            .expect("expected a tool call");
+        assert_eq!(call.provider_signature.as_deref(), Some("sig_abc"));
     }
 }

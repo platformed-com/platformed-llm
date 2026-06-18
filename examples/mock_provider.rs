@@ -40,6 +40,7 @@ async fn main() -> Result<(), platformed_llm::Error> {
             call_id: "call_1".into(),
             name: "get_weather".into(),
             arguments: r#"{"city":"Paris"}"#.into(),
+            provider_signature: None,
         }))
         .reply("It is sunny in Paris.")
         .build();

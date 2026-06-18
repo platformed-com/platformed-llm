@@ -130,6 +130,7 @@ fn open_part(kind: PartKind) -> AssistantPart {
             call_id,
             name,
             arguments: String::new(),
+            provider_signature: None,
         }),
         PartKind::BuiltinToolCall { kind } => AssistantPart::BuiltinToolCall {
             kind,
@@ -157,6 +158,9 @@ fn apply_update(part: &mut AssistantPart, update: PartUpdate) {
     match (part, update) {
         (AssistantPart::Reasoning { signature, .. }, PartUpdate::Signature(sig)) => {
             *signature = Some(sig);
+        }
+        (AssistantPart::ToolCall(call), PartUpdate::Signature(sig)) => {
+            call.provider_signature = Some(sig);
         }
         (AssistantPart::Text { annotations, .. }, PartUpdate::Annotation(ann)) => {
             annotations.push(ann);
@@ -267,6 +271,37 @@ mod tests {
             }
             _ => panic!("wrong part"),
         }
+    }
+
+    #[test]
+    fn tool_call_signature_lands_on_provider_signature() {
+        // Gemini's thoughtSignature arrives as a PartUpdate::Signature on
+        // the open ToolCall part; it must land on provider_signature.
+        let mut acc = ResponseAccumulator::new();
+        acc.process_event(StreamEvent::PartStart {
+            index: 0,
+            kind: PartKind::ToolCall {
+                call_id: "c1".into(),
+                name: "f".into(),
+            },
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::Delta {
+            index: 0,
+            delta: "{}".into(),
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::PartUpdate {
+            index: 0,
+            update: PartUpdate::Signature("sig_abc".into()),
+        })
+        .unwrap();
+        acc.process_event(StreamEvent::PartEnd { index: 0 })
+            .unwrap();
+
+        let calls = acc.completed_function_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].provider_signature.as_deref(), Some("sig_abc"));
     }
 
     #[test]

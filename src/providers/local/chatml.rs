@@ -442,6 +442,7 @@ mod tests {
             call_id: "call_0".into(),
             name: "get_weather".into(),
             arguments: r#"{"city":"Paris"}"#.into(),
+            provider_signature: None,
         };
         let p = Prompt::user("hi")
             .with_item(InputItem::assistant_tool_call(call))
