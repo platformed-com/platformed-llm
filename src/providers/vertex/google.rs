@@ -322,9 +322,15 @@ impl GoogleProvider {
             Some(crate::types::ResponseFormat::JsonObject) => {
                 (Some("application/json".to_string()), None)
             }
-            Some(crate::types::ResponseFormat::JsonSchema { schema, .. }) => {
-                (Some("application/json".to_string()), Some(schema.clone()))
-            }
+            // Vertex's `generationConfig.responseSchema` uses the same
+            // OpenAPI-subset dialect as `functionDeclarations[].parameters`
+            // — it rejects `$schema` / `$ref` / `$defs` with a 400. Run
+            // the same normaliser so a typed-struct response schema
+            // doesn't reach the wire raw.
+            Some(crate::types::ResponseFormat::JsonSchema { schema, .. }) => (
+                Some("application/json".to_string()),
+                Some(normalize_gemini_tool_schema(schema)),
+            ),
             // ResponseFormat::Text or None — leave unset.
             Some(crate::types::ResponseFormat::Text) | None => (None, None),
         };
@@ -1441,6 +1447,53 @@ mod tests {
             "application/json",
         );
         assert_eq!(json["generationConfig"]["responseSchema"]["type"], "object");
+    }
+
+    /// Vertex's `generationConfig.responseSchema` uses the same OpenAPI-
+    /// subset dialect as `functionDeclarations[].parameters` — it rejects
+    /// `$schema` / `$ref` / `$defs` with a 400. A response schema built
+    /// from a typed struct (the same `$ref`-emitting shape the tool-param
+    /// normaliser was added for) must flow through the same normaliser
+    /// rather than reaching the wire raw.
+    #[test]
+    fn response_format_json_schema_is_normalized() {
+        use crate::types::ResponseFormat;
+        use std::borrow::Cow;
+        let schema_raw = serde_json::value::RawValue::from_string(
+            r##"{
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": { "source": { "$ref": "#/$defs/SourceId" } },
+                "$defs": { "SourceId": { "type": "string", "format": "uuid" } }
+            }"##
+            .to_string(),
+        )
+        .unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::builder("gemini")
+            .response_format(ResponseFormat::JsonSchema {
+                name: "Out".to_string(),
+                schema: Cow::Owned(schema_raw),
+                strict: true,
+            })
+            .build();
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let schema = &json["generationConfig"]["responseSchema"];
+        assert!(
+            schema.get("$schema").is_none(),
+            "responseSchema must have $schema stripped: {schema}",
+        );
+        assert!(
+            schema.get("$defs").is_none(),
+            "responseSchema must have $defs stripped: {schema}",
+        );
+        assert_eq!(schema["properties"]["source"]["type"], "string");
+        assert_eq!(schema["properties"]["source"]["format"], "uuid");
+        assert!(
+            schema["properties"]["source"].get("$ref").is_none(),
+            "responseSchema must have $ref inlined: {schema}",
+        );
     }
 
     /// An OpenAI continuation part is ignored by Gemini — the
