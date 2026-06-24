@@ -534,8 +534,7 @@ mod tests {
                     content: vec![UserPart::Text("ok".into())],
                 }],
             });
-        validate_prompt(&prompt)
-            .expect("System between call and result must not break pairing");
+        validate_prompt(&prompt).expect("System between call and result must not break pairing");
     }
 
     /// Pairing must match the `call_id` set, not just cardinality. Two
