@@ -340,6 +340,7 @@ fn scenario_to_llm_request(
                         call_id: tc.id.clone(),
                         name: tc.name.clone(),
                         arguments: tc.arguments.clone(),
+                        provider_signature: None,
                     }));
                 }
                 prompt = prompt.with_item(InputItem::Assistant { content });

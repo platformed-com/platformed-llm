@@ -357,13 +357,50 @@ pub struct ComputerUseConfig {
 /// A tool call emitted by the assistant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionCall {
-    /// Identifier the model assigns to this call; echoed back in the
-    /// matching `UserPart::ToolResult`.
+    /// Identifier correlating this call to its
+    /// [`UserPart::ToolResult`]. **Opaque and provider-specific** —
+    /// correlate by this value (or by position within the assistant
+    /// turn), never parse it or assume it maps to a provider-side
+    /// identifier:
+    ///
+    /// - OpenAI / Anthropic carry a stable id on the wire; it round-trips
+    ///   unchanged.
+    /// - Gemini's `functionCall` parts have **no** id on the wire, so the
+    ///   Google provider synthesizes a fresh `call_<uuid>` per parsed call
+    ///   and rebuilds a `call_id → name` map from assistant history on each
+    ///   request. Such an id is meaningful only within the round trip that
+    ///   produced it; on echo, Gemini matches by function *name* and
+    ///   position, not by this id. Duplicate-named calls in one turn are
+    ///   therefore matched positionally — preserve `(ToolCall, ToolResult)`
+    ///   ordering in the event log.
     pub call_id: String,
     /// Name of the tool the model is invoking.
     pub name: String,
     /// JSON-encoded argument object.
     pub arguments: String,
+    /// Opaque provider-specific signature attached to this call, when the
+    /// provider emits one. Currently carries Gemini 2.5+ thinking models'
+    /// `thoughtSignature` — a cryptographic blob bound to the call that the
+    /// provider may require echoed back to preserve thinking continuity.
+    /// Populated by the Google response parser and echoed back verbatim,
+    /// **unconditionally**, by the Google request serializer.
+    ///
+    /// There is no provenance tracking: the field records neither the
+    /// provider nor the model that produced it, and it is never cleared
+    /// from history. It crosses a provider switch only *emergently* — the
+    /// OpenAI and Anthropic tool-call serializers read `call_id` / `name` /
+    /// `arguments` and ignore this field, so it is simply not transmitted
+    /// to them (mirroring how [`AssistantPart::Reasoning`]'s `signature` is
+    /// dropped because those providers drop the whole reasoning part). The
+    /// value still lives on the call in history, so switching away from
+    /// Gemini and back re-echoes the original signature, and switching
+    /// between Gemini models echoes a signature a different model produced.
+    /// Gemini currently tolerates a stale or absent `thoughtSignature`, so
+    /// neither is rejected today; if that changes this needs an origin
+    /// (provider + model) guard before echo. `None` for providers that
+    /// don't emit one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_signature: Option<String>,
 }
 
 /// Why the model stopped generating.

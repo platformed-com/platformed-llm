@@ -397,11 +397,13 @@ mod tests {
                     call_id: "call_1".to_string(),
                     name: "get_weather".to_string(),
                     arguments: "{}".to_string(),
+                    provider_signature: None,
                 }),
                 AssistantPart::ToolCall(FunctionCall {
                     call_id: "call_2".to_string(),
                     name: "get_news".to_string(),
                     arguments: "{}".to_string(),
+                    provider_signature: None,
                 }),
             ],
             finish_reason: FinishReason::ToolCalls,

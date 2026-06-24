@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
 use ijson::{ijson, IValue};
+use serde_json::value::RawValue;
 use uuid::Uuid;
 
 use super::endpoint::VertexEndpoint;
@@ -108,6 +109,11 @@ impl GoogleProvider {
         // for other providers are ignored.
         let (cached_content, start_index) = find_latest_gemini_continuation(messages);
         let active_messages = &messages[start_index..];
+
+        // The function_call / function_response pairing invariant Gemini
+        // enforces is checked provider-agnostically in
+        // [`crate::middleware::validate_prompt`] (every provider requires
+        // it), so it is not re-validated here.
 
         // First pass: collect the assistant turns' tool_call name + id
         // pairs so we can echo them back on the corresponding user
@@ -282,6 +288,7 @@ impl GoogleProvider {
                                         function_call: GoogleFunctionCall {
                                             name: call.name.clone(),
                                             args,
+                                            thought_signature: call.provider_signature.clone(),
                                         },
                                     },
                                 );
@@ -315,9 +322,15 @@ impl GoogleProvider {
             Some(crate::types::ResponseFormat::JsonObject) => {
                 (Some("application/json".to_string()), None)
             }
-            Some(crate::types::ResponseFormat::JsonSchema { schema, .. }) => {
-                (Some("application/json".to_string()), Some(schema.clone()))
-            }
+            // Vertex's `generationConfig.responseSchema` uses the same
+            // OpenAPI-subset dialect as `functionDeclarations[].parameters`
+            // — it rejects `$schema` / `$ref` / `$defs` with a 400. Run
+            // the same normaliser so a typed-struct response schema
+            // doesn't reach the wire raw.
+            Some(crate::types::ResponseFormat::JsonSchema { schema, .. }) => (
+                Some("application/json".to_string()),
+                Some(normalize_gemini_tool_schema(schema)),
+            ),
             // ResponseFormat::Text or None — leave unset.
             Some(crate::types::ResponseFormat::Text) | None => (None, None),
         };
@@ -343,7 +356,13 @@ impl GoogleProvider {
                     Tool::Function(f) => function_decls.push(GoogleFunctionDeclaration {
                         name: f.name.clone(),
                         description: f.description.clone().unwrap_or_default(),
-                        parameters: f.parameters.clone(),
+                        // Gemini's `functionDeclarations[].parameters` accepts
+                        // only the property keywords of JSON Schema — it
+                        // rejects the meta-fields `$schema`, `$ref`, and
+                        // `$defs` with a 400. Normalise before sending:
+                        // drop the meta-fields and inline any `$ref`s against
+                        // the schema's `$defs` / `definitions`.
+                        parameters: normalize_gemini_tool_schema(&f.parameters),
                     }),
                     Tool::Builtin(ProviderBuiltin::GoogleSearch) => {
                         entries.push(GoogleTool::GoogleSearch {
@@ -404,6 +423,12 @@ impl GoogleProvider {
 
         // `cached_content` was extracted up-front from the message
         // history; nothing more to do here.
+        //
+        // The "prompt must contain at least one user/assistant turn"
+        // requirement is enforced provider-agnostically in
+        // [`crate::middleware::validate_prompt`], so a system-only prompt
+        // is rejected uniformly across providers before reaching here —
+        // it is not re-checked at this layer.
 
         let google_request = GoogleRequest {
             contents,
@@ -435,6 +460,245 @@ fn encode_function_output(output: &str) -> IValue {
         Ok(value) => ijson!({ "result": value }),
         Err(_) => ijson!({ "result": output }),
     }
+}
+
+/// Normalise a function tool's JSON-Schema `parameters` into the subset
+/// Gemini's `functionDeclarations[].parameters` accepts. Gemini takes
+/// only the property keywords of JSON Schema and rejects the meta-fields
+/// `$schema`, `$ref`, and `$defs` with a 400, so we:
+///
+/// - drop meta-fields (`$schema`, `$id`, `$comment`, `$anchor`, `$defs`,
+///   `definitions`) wherever they appear in *schema* position, and
+/// - inline every local `$ref` (`#/$defs/Name` or `#/definitions/Name`)
+///   against the definitions in scope, merging any sibling keywords over
+///   the resolved definition.
+///
+/// The walk is **position-aware**: it descends only into keywords that
+/// actually hold subschemas (`properties`, `items`, `additionalProperties`,
+/// `allOf`/`anyOf`/`oneOf`, `$defs`, …) and copies every other keyword
+/// verbatim. So data that merely *looks* like schema — a `const` /
+/// `default` / `enum` value that happens to contain a `$ref` key, or a
+/// property literally named `$defs` — is left untouched rather than being
+/// silently mangled. `$defs` are collected lexically (root *and* nested),
+/// so a ref to a definition nested inside a subschema still resolves.
+///
+/// Recursive `$ref` cycles can't be expressed in Gemini's flattened
+/// schema; they degrade to a permissive open object with a warning.
+/// Anything that fails to parse or re-serialise is passed through
+/// unchanged — normalisation is best-effort and never blocks the request.
+fn normalize_gemini_tool_schema(raw: &RawValue) -> std::borrow::Cow<'static, RawValue> {
+    use serde_json::Value;
+
+    let Ok(value) = serde_json::from_str::<Value>(raw.get()) else {
+        return std::borrow::Cow::Owned(raw.to_owned());
+    };
+
+    let empty = serde_json::Map::new();
+    let mut stack: Vec<String> = Vec::new();
+    let resolved = normalize_schema(value, &empty, &mut stack);
+
+    match serde_json::value::to_raw_value(&resolved) {
+        Ok(rv) => std::borrow::Cow::Owned(rv),
+        Err(_) => std::borrow::Cow::Owned(raw.to_owned()),
+    }
+}
+
+/// The name component of a local definition `$ref`, if it is one.
+fn schema_ref_name(reference: &str) -> Option<&str> {
+    reference
+        .strip_prefix("#/$defs/")
+        .or_else(|| reference.strip_prefix("#/definitions/"))
+}
+
+/// Keywords whose value is a *single* subschema (or, for
+/// `additionalProperties` / `items`, possibly a boolean — copied as-is).
+const SINGLE_SUBSCHEMA_KEYS: &[&str] = &[
+    "additionalProperties",
+    "additionalItems",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "contains",
+    "propertyNames",
+    "if",
+    "then",
+    "else",
+    "not",
+];
+
+/// Keywords whose value is an array of subschemas.
+const SUBSCHEMA_ARRAY_KEYS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
+
+/// Keywords whose value is a `{ name -> subschema }` map (the map keys are
+/// arbitrary names, not schema keywords, so they're preserved verbatim).
+const SUBSCHEMA_MAP_KEYS: &[&str] = &["properties", "patternProperties", "dependentSchemas"];
+
+/// Normalise one JSON-Schema node. `defs_in_scope` are the definitions
+/// visible here (root + every enclosing `$defs`); `stack` holds the ref
+/// names currently being expanded, to break cycles.
+fn normalize_schema(
+    value: serde_json::Value,
+    defs_in_scope: &serde_json::Map<String, serde_json::Value>,
+    stack: &mut Vec<String>,
+) -> serde_json::Value {
+    use serde_json::Value;
+
+    let Value::Object(obj) = value else {
+        // Non-objects in schema position (e.g. a boolean schema) pass
+        // through unchanged.
+        return value;
+    };
+
+    // Extend the scope with this node's local `$defs` / `definitions` so
+    // refs anywhere in this subtree (including sibling defs) resolve.
+    let mut local = serde_json::Map::new();
+    for key in ["$defs", "definitions"] {
+        if let Some(Value::Object(map)) = obj.get(key) {
+            for (k, v) in map {
+                local.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let scope: std::borrow::Cow<serde_json::Map<String, Value>> = if local.is_empty() {
+        std::borrow::Cow::Borrowed(defs_in_scope)
+    } else {
+        let mut merged = defs_in_scope.clone();
+        merged.extend(local);
+        std::borrow::Cow::Owned(merged)
+    };
+    let defs = scope.as_ref();
+
+    if let Some(Value::String(reference)) = obj.get("$ref") {
+        let reference = reference.clone();
+        return resolve_ref(&reference, &obj, defs, stack);
+    }
+
+    Value::Object(normalize_schema_keys(obj, defs, stack))
+}
+
+/// Rebuild a schema object minus meta-fields, recursing only into
+/// subschema-bearing keywords and copying everything else verbatim.
+/// Assumes any `$ref` has already been handled by the caller.
+fn normalize_schema_keys(
+    obj: serde_json::Map<String, serde_json::Value>,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    stack: &mut Vec<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::Value;
+
+    let mut out = serde_json::Map::new();
+    for (k, v) in obj {
+        match k.as_str() {
+            // Meta-fields and definition blocks: stripped from the output
+            // (defs were already lifted into scope by the caller).
+            "$schema" | "$id" | "$comment" | "$anchor" | "$defs" | "definitions" | "$ref" => {}
+            _ if SUBSCHEMA_MAP_KEYS.contains(&k.as_str()) => {
+                let mapped = match v {
+                    Value::Object(m) => Value::Object(
+                        m.into_iter()
+                            .map(|(name, sub)| (name, normalize_schema(sub, defs, stack)))
+                            .collect(),
+                    ),
+                    other => other,
+                };
+                out.insert(k, mapped);
+            }
+            _ if SUBSCHEMA_ARRAY_KEYS.contains(&k.as_str()) => {
+                out.insert(k, map_subschema_array(v, defs, stack));
+            }
+            // `items` is a single subschema in 2020-12 but an array of
+            // subschemas in draft-07; handle both shapes.
+            "items" => {
+                let mapped = match v {
+                    Value::Array(_) => map_subschema_array(v, defs, stack),
+                    Value::Object(_) => normalize_schema(v, defs, stack),
+                    other => other,
+                };
+                out.insert(k, mapped);
+            }
+            _ if SINGLE_SUBSCHEMA_KEYS.contains(&k.as_str()) => {
+                // Subschema, or a bare bool (e.g. `additionalProperties:
+                // false`) which is copied as-is.
+                let mapped = match v {
+                    Value::Object(_) => normalize_schema(v, defs, stack),
+                    other => other,
+                };
+                out.insert(k, mapped);
+            }
+            // Data / scalar validation keyword (`type`, `enum`, `const`,
+            // `default`, `examples`, `required`, `format`, …): copy
+            // verbatim — never strip or resolve inside a data position.
+            _ => {
+                out.insert(k, v);
+            }
+        }
+    }
+    out
+}
+
+/// Map [`normalize_schema`] over an array of subschemas.
+fn map_subschema_array(
+    value: serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    stack: &mut Vec<String>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.into_iter()
+                .map(|s| normalize_schema(s, defs, stack))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Resolve a `$ref` against `defs`, inlining the (normalised) definition
+/// and merging any sibling keywords of the `$ref` object over it.
+fn resolve_ref(
+    reference: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    stack: &mut Vec<String>,
+) -> serde_json::Value {
+    use serde_json::Value;
+
+    let drop_ref_and_normalize = |stack: &mut Vec<String>| {
+        let mut without_ref = obj.clone();
+        without_ref.remove("$ref");
+        Value::Object(normalize_schema_keys(without_ref, defs, stack))
+    };
+
+    let Some(name) = schema_ref_name(reference) else {
+        tracing::warn!(%reference, "Gemini: dropping non-local $ref from tool schema");
+        return drop_ref_and_normalize(stack);
+    };
+    if stack.iter().any(|n| n == name) {
+        tracing::warn!(
+            %reference,
+            "Gemini: dropping recursive $ref from tool schema; inlining as open object",
+        );
+        return serde_json::json!({ "type": "object" });
+    }
+    let Some(def) = defs.get(name) else {
+        tracing::warn!(%reference, "Gemini: unresolved $ref in tool schema; dropping");
+        return drop_ref_and_normalize(stack);
+    };
+
+    stack.push(name.to_string());
+    let resolved = normalize_schema(def.clone(), defs, stack);
+    stack.pop();
+
+    // Merge sibling keywords (everything but `$ref`) over the resolved
+    // definition — siblings win, matching draft 2020-12 where `$ref` is an
+    // applicator that composes with adjacent keywords.
+    let Value::Object(mut resolved_obj) = resolved else {
+        return resolved;
+    };
+    let mut without_ref = obj.clone();
+    without_ref.remove("$ref");
+    for (k, v) in normalize_schema_keys(without_ref, defs, stack) {
+        resolved_obj.insert(k, v);
+    }
+    Value::Object(resolved_obj)
 }
 
 #[async_trait::async_trait]
@@ -682,16 +946,18 @@ impl GoogleStreamState {
         call_id: String,
         name: String,
         mut arguments: String,
+        mut signature: Option<String>,
     ) {
         let events = self.tracker.open_one_shot(PartKind::ToolCall {
             call_id,
             name: name.clone(),
         });
         // open_one_shot emits PartStart then PartEnd; splice the
-        // arguments Delta in right after the PartStart. Forward each
-        // event and inject once, without depending (via panicking
-        // `expect`/`unreachable!`) on the exact event count — a
-        // future PartTracker change shouldn't crash the stream.
+        // arguments Delta (and Gemini's thoughtSignature, if any) in
+        // right after the PartStart. Forward each event and inject once,
+        // without depending (via panicking `expect`/`unreachable!`) on
+        // the exact event count — a future PartTracker change shouldn't
+        // crash the stream.
         for ev in events {
             if let StreamEvent::PartStart { index, .. } = &ev {
                 let index = *index;
@@ -700,6 +966,12 @@ impl GoogleStreamState {
                     out.push(StreamEvent::Delta {
                         index,
                         delta: std::mem::take(&mut arguments),
+                    });
+                }
+                if let Some(sig) = signature.take() {
+                    out.push(StreamEvent::PartUpdate {
+                        index,
+                        update: PartUpdate::Signature(sig),
                     });
                 }
             } else {
@@ -772,6 +1044,7 @@ pub(crate) fn convert_response_stateful(
                         call_id,
                         function_call.name.clone(),
                         arguments,
+                        function_call.thought_signature.clone(),
                     );
                 }
                 GooglePart::ExecutableCode { executable_code } => {
@@ -1176,6 +1449,53 @@ mod tests {
         assert_eq!(json["generationConfig"]["responseSchema"]["type"], "object");
     }
 
+    /// Vertex's `generationConfig.responseSchema` uses the same OpenAPI-
+    /// subset dialect as `functionDeclarations[].parameters` — it rejects
+    /// `$schema` / `$ref` / `$defs` with a 400. A response schema built
+    /// from a typed struct (the same `$ref`-emitting shape the tool-param
+    /// normaliser was added for) must flow through the same normaliser
+    /// rather than reaching the wire raw.
+    #[test]
+    fn response_format_json_schema_is_normalized() {
+        use crate::types::ResponseFormat;
+        use std::borrow::Cow;
+        let schema_raw = serde_json::value::RawValue::from_string(
+            r##"{
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": { "source": { "$ref": "#/$defs/SourceId" } },
+                "$defs": { "SourceId": { "type": "string", "format": "uuid" } }
+            }"##
+            .to_string(),
+        )
+        .unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::builder("gemini")
+            .response_format(ResponseFormat::JsonSchema {
+                name: "Out".to_string(),
+                schema: Cow::Owned(schema_raw),
+                strict: true,
+            })
+            .build();
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let schema = &json["generationConfig"]["responseSchema"];
+        assert!(
+            schema.get("$schema").is_none(),
+            "responseSchema must have $schema stripped: {schema}",
+        );
+        assert!(
+            schema.get("$defs").is_none(),
+            "responseSchema must have $defs stripped: {schema}",
+        );
+        assert_eq!(schema["properties"]["source"]["type"], "string");
+        assert_eq!(schema["properties"]["source"]["format"], "uuid");
+        assert!(
+            schema["properties"]["source"].get("$ref").is_none(),
+            "responseSchema must have $ref inlined: {schema}",
+        );
+    }
+
     /// An OpenAI continuation part is ignored by Gemini — the
     /// model-switching contract: hints from the wrong provider degrade
     /// silently to a full-history request.
@@ -1281,5 +1601,293 @@ mod tests {
         } else {
             panic!("expected text part, got {:?}", body.contents[0].parts[0]);
         }
+    }
+
+    fn tool_with_schema(schema: &str) -> crate::types::Tool {
+        use std::borrow::Cow;
+        let raw = serde_json::value::RawValue::from_string(schema.to_string()).unwrap();
+        crate::types::Tool::function("f", None, Cow::Owned(raw))
+    }
+
+    /// Run a tool-parameter schema through the full request conversion and
+    /// return the normalised `parameters` object Gemini would receive.
+    fn normalized_params(schema: &str) -> serde_json::Value {
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::builder("gemini")
+            .tools(vec![tool_with_schema(schema)])
+            .build();
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        json["tools"][0]["functionDeclarations"][0]["parameters"].clone()
+    }
+
+    /// #1: Gemini rejects `$schema` / `$ref` / `$defs` meta-fields in
+    /// tool parameters. The Google provider must strip the meta-fields
+    /// and inline local `$ref`s against `$defs` before sending.
+    #[test]
+    fn tool_schema_meta_fields_stripped_and_refs_inlined() {
+        let schema = r##"{
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": { "source": { "$ref": "#/$defs/SourceId" } },
+            "$defs": { "SourceId": { "type": "string", "format": "uuid" } }
+        }"##;
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::builder("gemini")
+            .tools(vec![tool_with_schema(schema)])
+            .build();
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let params = &json["tools"][0]["functionDeclarations"][0]["parameters"];
+
+        assert!(params.get("$schema").is_none(), "$schema must be stripped");
+        assert!(params.get("$defs").is_none(), "$defs must be stripped");
+        // The `$ref` is inlined to the resolved definition.
+        assert_eq!(params["properties"]["source"]["type"], "string");
+        assert_eq!(params["properties"]["source"]["format"], "uuid");
+        assert!(
+            params["properties"]["source"].get("$ref").is_none(),
+            "$ref must be resolved away"
+        );
+    }
+
+    /// A recursive `$ref` can't be expressed in Gemini's flattened
+    /// schema; normalisation must terminate (not stack-overflow) and
+    /// degrade the cycle to a permissive object.
+    #[test]
+    fn tool_schema_recursive_ref_terminates() {
+        let schema = r##"{
+            "type": "object",
+            "properties": { "child": { "$ref": "#/$defs/Node" } },
+            "$defs": { "Node": { "type": "object", "properties": { "next": { "$ref": "#/$defs/Node" } } } }
+        }"##;
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::builder("gemini")
+            .tools(vec![tool_with_schema(schema)])
+            .build();
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let params = &json["tools"][0]["functionDeclarations"][0]["parameters"];
+        // First level inlines; the recursive self-reference degrades to
+        // an open object rather than looping forever.
+        assert_eq!(params["properties"]["child"]["type"], "object");
+        assert!(params.get("$defs").is_none());
+    }
+
+    /// Review finding #1: a `$ref` to a definition nested inside a
+    /// subschema (not at the root) must still resolve — `$defs` are
+    /// collected lexically, root and nested.
+    #[test]
+    fn tool_schema_nested_defs_resolve() {
+        let schema = r##"{
+            "type": "object",
+            "properties": {
+                "outer": {
+                    "type": "object",
+                    "$defs": { "Inner": { "type": "string", "format": "uuid" } },
+                    "properties": { "id": { "$ref": "#/$defs/Inner" } }
+                }
+            }
+        }"##;
+        let params = normalized_params(schema);
+        let inner = &params["properties"]["outer"]["properties"]["id"];
+        assert_eq!(
+            inner["type"], "string",
+            "nested $ref must resolve: {params}"
+        );
+        assert_eq!(inner["format"], "uuid");
+        assert!(inner.get("$ref").is_none());
+        assert!(params["properties"]["outer"].get("$defs").is_none());
+    }
+
+    /// Review finding #6: meta-field *names* used as ordinary property
+    /// keys (or keys inside `const` / `default` data) must NOT be stripped
+    /// — only schema-position meta-fields are. A property literally named
+    /// `$defs` / `$ref` survives.
+    #[test]
+    fn tool_schema_preserves_data_named_like_meta_fields() {
+        let schema = r##"{
+            "type": "object",
+            "properties": {
+                "$ref": { "type": "string" },
+                "$defs": { "type": "number" },
+                "config": {
+                    "type": "object",
+                    "default": { "$ref": "literal-data", "$schema": "also-data" },
+                    "const": { "$defs": "still-data" }
+                }
+            }
+        }"##;
+        let params = normalized_params(schema);
+        let props = &params["properties"];
+        // Properties whose *names* collide with meta-fields are real
+        // properties, not schema keywords — they must remain.
+        assert_eq!(props["$ref"]["type"], "string", "got: {params}");
+        assert_eq!(props["$defs"]["type"], "number");
+        // `default` / `const` are data positions: their contents are
+        // copied verbatim, meta-looking keys and all.
+        assert_eq!(props["config"]["default"]["$ref"], "literal-data");
+        assert_eq!(props["config"]["default"]["$schema"], "also-data");
+        assert_eq!(props["config"]["const"]["$defs"], "still-data");
+    }
+
+    /// `enum` values are data and pass through untouched.
+    #[test]
+    fn tool_schema_preserves_enum_values() {
+        let schema = r##"{ "type": "string", "enum": ["a", "b", "c"] }"##;
+        let params = normalized_params(schema);
+        assert_eq!(params["enum"], serde_json::json!(["a", "b", "c"]));
+    }
+
+    /// Sibling keywords on a `$ref` object merge over the resolved
+    /// definition (siblings win).
+    #[test]
+    fn tool_schema_ref_siblings_merge_over_definition() {
+        let schema = r##"{
+            "type": "object",
+            "properties": {
+                "x": { "$ref": "#/$defs/Base", "description": "the x field" }
+            },
+            "$defs": { "Base": { "type": "integer", "description": "base desc" } }
+        }"##;
+        let params = normalized_params(schema);
+        let x = &params["properties"]["x"];
+        assert_eq!(x["type"], "integer", "resolved def type kept: {params}");
+        assert_eq!(x["description"], "the x field", "sibling overrides def");
+        assert!(x.get("$ref").is_none());
+    }
+
+    /// `additionalProperties` as a subschema with a `$ref` resolves; as a
+    /// bare boolean it is copied unchanged.
+    #[test]
+    fn tool_schema_additional_properties_handled() {
+        let schema_ref = r##"{
+            "type": "object",
+            "additionalProperties": { "$ref": "#/$defs/V" },
+            "$defs": { "V": { "type": "boolean" } }
+        }"##;
+        let params = normalized_params(schema_ref);
+        assert_eq!(params["additionalProperties"]["type"], "boolean");
+        assert!(params.get("$defs").is_none());
+
+        let schema_bool = r##"{ "type": "object", "additionalProperties": false }"##;
+        let params = normalized_params(schema_bool);
+        assert_eq!(params["additionalProperties"], serde_json::json!(false));
+    }
+
+    /// `allOf` / `anyOf` arrays and array `items` recurse and resolve refs.
+    #[test]
+    fn tool_schema_combinators_and_items_recurse() {
+        let schema = r##"{
+            "type": "object",
+            "properties": {
+                "tags": { "type": "array", "items": { "$ref": "#/$defs/Tag" } },
+                "either": { "anyOf": [ { "$ref": "#/$defs/Tag" }, { "type": "null" } ] }
+            },
+            "$defs": { "Tag": { "type": "string", "minLength": 1 } }
+        }"##;
+        let params = normalized_params(schema);
+        assert_eq!(params["properties"]["tags"]["items"]["type"], "string");
+        assert_eq!(params["properties"]["tags"]["items"]["minLength"], 1);
+        assert_eq!(params["properties"]["either"]["anyOf"][0]["type"], "string");
+        assert_eq!(params["properties"]["either"]["anyOf"][1]["type"], "null");
+        assert!(params.get("$defs").is_none());
+    }
+
+    /// An unresolvable / non-local `$ref` degrades gracefully: the `$ref`
+    /// is dropped (so Gemini doesn't 400 on it) and sibling keywords are
+    /// retained, rather than crashing.
+    #[test]
+    fn tool_schema_unresolved_ref_drops_gracefully() {
+        let schema = r##"{
+            "type": "object",
+            "properties": {
+                "a": { "$ref": "https://example.com/external", "type": "string" },
+                "b": { "$ref": "#/$defs/Missing", "title": "B" }
+            }
+        }"##;
+        let params = normalized_params(schema);
+        // Non-local ref dropped, sibling `type` kept.
+        assert_eq!(params["properties"]["a"]["type"], "string");
+        assert!(params["properties"]["a"].get("$ref").is_none());
+        // Unresolved local ref dropped, sibling `title` kept.
+        assert_eq!(params["properties"]["b"]["title"], "B");
+        assert!(params["properties"]["b"].get("$ref").is_none());
+    }
+
+    /// Malformed (non-JSON) parameters are passed through unchanged rather
+    /// than blocking the request.
+    #[test]
+    fn tool_schema_non_json_passes_through() {
+        let raw = serde_json::value::RawValue::from_string("true".to_string()).unwrap();
+        let out = normalize_gemini_tool_schema(&raw);
+        assert_eq!(out.get(), "true");
+    }
+
+    /// A matched tool call / result pair converts cleanly. (The pairing
+    /// invariant itself is enforced provider-agnostically in
+    /// `crate::middleware::validate_prompt`.)
+    #[test]
+    fn matched_tool_call_and_result_passes() {
+        use crate::types::FunctionCall;
+        let prompt = crate::Prompt::user("hi")
+            .with_assistant_tool_call(FunctionCall {
+                call_id: "c1".into(),
+                name: "f".into(),
+                arguments: "{}".into(),
+                provider_signature: None,
+            })
+            .with_tool_result("c1", "ok");
+        let cfg = Config::builder("gemini").build();
+        assert!(provider().convert_request(&prompt, cfg.raw()).is_ok());
+    }
+
+    /// #4 (request side): a tool call carrying a `provider_signature` is
+    /// echoed back as Gemini's `thoughtSignature` on the wire.
+    #[test]
+    fn provider_signature_echoed_as_thought_signature() {
+        use crate::types::FunctionCall;
+        let prompt = crate::Prompt::user("hi")
+            .with_assistant_tool_call(FunctionCall {
+                call_id: "c1".into(),
+                name: "f".into(),
+                arguments: "{}".into(),
+                provider_signature: Some("sig_xyz".into()),
+            })
+            .with_tool_result("c1", "ok");
+        let cfg = Config::builder("gemini").build();
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        // contents: [user "hi", model [functionCall], user [functionResponse]]
+        assert_eq!(
+            json["contents"][1]["parts"][0]["functionCall"]["thoughtSignature"],
+            "sig_xyz",
+        );
+    }
+
+    /// #4 (response side): Gemini's `thoughtSignature` on a `functionCall`
+    /// part is captured and surfaced via a `PartUpdate::Signature`, which
+    /// the accumulator lands on `FunctionCall::provider_signature`.
+    #[test]
+    fn thought_signature_parsed_into_provider_signature() {
+        let chunk = r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Paris"},"thoughtSignature":"sig_abc"}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}}"#;
+        let mut state = GoogleStreamState::default();
+        let r: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let events = convert_response_stateful(r, &mut state).unwrap();
+
+        let mut acc = crate::accumulator::ResponseAccumulator::new();
+        for ev in events {
+            acc.process_event(ev).unwrap();
+        }
+        let resp = acc.finalize().unwrap();
+        let call = resp
+            .content
+            .iter()
+            .find_map(|p| match p {
+                AssistantPart::ToolCall(c) => Some(c),
+                _ => None,
+            })
+            .expect("expected a tool call");
+        assert_eq!(call.provider_signature.as_deref(), Some("sig_abc"));
     }
 }

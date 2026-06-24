@@ -13,6 +13,7 @@ async fn drives_a_tool_call_loop() {
             call_id: "call_1".into(),
             name: "lookup".into(),
             arguments: r#"{"q":"answer"}"#.into(),
+            provider_signature: None,
         }))
         .reply("The answer is 42.")
         .build();

@@ -151,6 +151,109 @@ pub fn validate(config: &RawConfig, caps: &Capabilities) -> Result<(), Error> {
     Ok(())
 }
 
+/// Validate that the prompt is structurally usable, independent of the
+/// target provider. This enforces the minimal cross-provider contract so
+/// the same prompt behaves the same everywhere — rather than letting one
+/// provider's wire requirement (e.g. Gemini's "at least one `contents`
+/// entry") surface as a divergent provider-specific error while other
+/// providers silently accept the same shape.
+///
+/// Enforces two cross-provider invariants:
+///
+/// 1. **At least one user or assistant turn.** A system-instruction-only
+///    prompt is not a valid request on any provider in this library.
+///    (Provider continuation markers live in an assistant turn, so a
+///    cached-content resumption prompt still passes.)
+///
+/// 2. **Tool-call / tool-result pairing by `call_id`.** Every assistant
+///    turn that emits tool calls must be followed by a user turn whose
+///    tool results carry exactly the same multiset of `call_id`s.
+///    OpenAI, Anthropic, and Gemini all reject an unanswered tool call,
+///    so an unmatched pairing — a common conversation-log bug (e.g.
+///    concurrent writers racing the event log, or a crashed dispatch
+///    leaving a dangling call) — is caught here uniformly instead of
+///    surfacing as an opaque provider 400. Matching by `call_id`
+///    (rather than count alone) catches the case where the counts
+///    agree but the ids don't — two calls `c1`/`c2` answered by two
+///    results both tagged `c1`, leaving `c2` unanswered.
+///    `System` items between the assistant turn and its results are
+///    transparently skipped: the Gemini serializer hoists `System` to
+///    `system_instruction` regardless of position, so a `System`
+///    sitting between a call and its result is a valid wire shape.
+///    Only the forward direction is checked: an orphaned tool result
+///    (no matching call) is left to each provider's model-switching
+///    "drop what doesn't translate" contract.
+pub fn validate_prompt(prompt: &Prompt) -> Result<(), Error> {
+    use crate::types::{AssistantPart, InputItem, UserPart};
+    use std::collections::HashMap;
+
+    let items = prompt.items();
+
+    let has_turn = items
+        .iter()
+        .any(|item| matches!(item, InputItem::User { .. } | InputItem::Assistant { .. }));
+    if !has_turn {
+        return Err(Error::invalid_prompt(
+            "a prompt must contain at least one user or assistant turn \
+             (a system instruction alone is not a valid request)",
+        ));
+    }
+
+    let format_ids = |m: &HashMap<&str, usize>| {
+        let mut entries: Vec<(&&str, &usize)> = m.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        entries
+            .into_iter()
+            .map(|(id, count)| {
+                if *count == 1 {
+                    (*id).to_string()
+                } else {
+                    format!("{id}*{count}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    for (i, item) in items.iter().enumerate() {
+        let InputItem::Assistant { content } = item else {
+            continue;
+        };
+        let mut call_ids: HashMap<&str, usize> = HashMap::new();
+        for part in content {
+            if let AssistantPart::ToolCall(call) = part {
+                *call_ids.entry(call.call_id.as_str()).or_default() += 1;
+            }
+        }
+        if call_ids.is_empty() {
+            continue;
+        }
+        let paired = items
+            .iter()
+            .skip(i + 1)
+            .find(|it| !matches!(it, InputItem::System(_)));
+        let mut result_ids: HashMap<&str, usize> = HashMap::new();
+        if let Some(InputItem::User { content }) = paired {
+            for part in content {
+                if let UserPart::ToolResult { call_id, .. } = part {
+                    *result_ids.entry(call_id.as_str()).or_default() += 1;
+                }
+            }
+        }
+        if call_ids != result_ids {
+            return Err(Error::invalid_prompt(format!(
+                "each assistant turn's tool-call ids must match the following user turn's \
+                 tool-result ids: assistant turn at index {i} has calls [{calls}] but the \
+                 following turn has results [{results}]",
+                calls = format_ids(&call_ids),
+                results = format_ids(&result_ids),
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Top-level entry point. Threads `prompt` and `config.raw()` through
 /// the middleware chain (as `Cow`s, so pass-through is free),
 /// validates the post-middleware request against the baked-in
@@ -190,6 +293,7 @@ pub async fn generate(
     }
 
     validate(&raw_cow, &capabilities)?;
+    validate_prompt(&prompt_cow)?;
 
     let response = provider.generate(&prompt_cow, &raw_cow).await?;
 
@@ -369,6 +473,153 @@ mod tests {
             !provider.was_called(),
             "provider must not be called after middleware error"
         );
+    }
+
+    /// A system-instruction-only prompt (no user/assistant turn) is
+    /// rejected uniformly for every provider — not just the one whose
+    /// wire format happens to require a turn. The provider is never
+    /// called.
+    #[tokio::test]
+    async fn generate_rejects_system_only_prompt_for_any_provider() {
+        let provider = MockProvider::new(Vec::new());
+        let prompt = Prompt::system("you are helpful");
+        let config = Config::builder("claude-sonnet-4-5").build();
+        let err = match generate(&provider, &prompt, &config).await {
+            Ok(_) => panic!("system-only prompt must be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::InvalidPrompt(_)), "got: {err}");
+        assert!(
+            !provider.was_called(),
+            "provider must not be called after prompt validation fails"
+        );
+    }
+
+    /// An assistant tool call with no matching tool result is rejected
+    /// uniformly — for every provider, not just Gemini.
+    #[test]
+    fn validate_prompt_rejects_unmatched_tool_call() {
+        use crate::types::{FunctionCall, InputItem};
+        let prompt = Prompt::user("hi").with_item(InputItem::assistant_tool_call(FunctionCall {
+            call_id: "c1".into(),
+            name: "f".into(),
+            arguments: "{}".into(),
+            provider_signature: None,
+        }));
+        let err = validate_prompt(&prompt).expect_err("unmatched tool call must be rejected");
+        assert!(matches!(err, Error::InvalidPrompt(_)), "got: {err}");
+    }
+
+    /// A `System` item sitting between the assistant tool-call turn and
+    /// its user tool-result turn is serialised as `system_instruction`
+    /// (the Gemini serializer hoists it regardless of position) — so
+    /// `[Assistant(call), System, User(result)]` is a valid wire shape.
+    /// The validator must skip past `System` items when looking for the
+    /// paired user turn rather than treating the `System` as a turn
+    /// boundary.
+    #[test]
+    fn validate_prompt_accepts_system_between_call_and_result() {
+        use crate::types::{FunctionCall, InputItem, UserPart};
+        let prompt = Prompt::user("hi")
+            .with_assistant_tool_call(FunctionCall {
+                call_id: "c1".into(),
+                name: "f".into(),
+                arguments: "{}".into(),
+                provider_signature: None,
+            })
+            .with_item(InputItem::System("aside".into()))
+            .with_item(InputItem::User {
+                content: vec![UserPart::ToolResult {
+                    call_id: "c1".into(),
+                    content: vec![UserPart::Text("ok".into())],
+                }],
+            });
+        validate_prompt(&prompt).expect("System between call and result must not break pairing");
+    }
+
+    /// Pairing must match the `call_id` set, not just cardinality. Two
+    /// calls `c1`/`c2` answered by two results both tagged `c1` would
+    /// pass a count-only check (2 == 2) though `c2` is unanswered and
+    /// `c1` is doubly-answered — exactly the racing-event-log / crashed-
+    /// dispatch shape the gate is meant to catch.
+    #[test]
+    fn validate_prompt_rejects_id_mismatch_with_equal_counts() {
+        use crate::types::{AssistantPart, FunctionCall, InputItem, UserPart};
+        let call = |id: &str| FunctionCall {
+            call_id: id.into(),
+            name: "f".into(),
+            arguments: "{}".into(),
+            provider_signature: None,
+        };
+        let prompt = Prompt::user("hi")
+            .with_item(InputItem::Assistant {
+                content: vec![
+                    AssistantPart::ToolCall(call("c1")),
+                    AssistantPart::ToolCall(call("c2")),
+                ],
+            })
+            .with_item(InputItem::User {
+                content: vec![
+                    UserPart::ToolResult {
+                        call_id: "c1".into(),
+                        content: vec![UserPart::Text("ok".into())],
+                    },
+                    UserPart::ToolResult {
+                        call_id: "c1".into(),
+                        content: vec![UserPart::Text("ok".into())],
+                    },
+                ],
+            });
+        let err = validate_prompt(&prompt)
+            .expect_err("id-mismatched results must be rejected even with equal counts");
+        assert!(matches!(err, Error::InvalidPrompt(_)), "got: {err}");
+    }
+
+    /// Parallel tool calls answered by one user turn with the matching
+    /// number of results pass.
+    #[test]
+    fn validate_prompt_accepts_matched_parallel_tool_calls() {
+        use crate::types::{AssistantPart, FunctionCall, InputItem, UserPart};
+        let call = |id: &str| FunctionCall {
+            call_id: id.into(),
+            name: "f".into(),
+            arguments: "{}".into(),
+            provider_signature: None,
+        };
+        let prompt = Prompt::user("hi")
+            .with_item(InputItem::Assistant {
+                content: vec![
+                    AssistantPart::ToolCall(call("c1")),
+                    AssistantPart::ToolCall(call("c2")),
+                ],
+            })
+            .with_item(InputItem::User {
+                content: vec![
+                    UserPart::ToolResult {
+                        call_id: "c1".into(),
+                        content: vec![UserPart::Text("ok".into())],
+                    },
+                    UserPart::ToolResult {
+                        call_id: "c2".into(),
+                        content: vec![UserPart::Text("ok".into())],
+                    },
+                ],
+            });
+        validate_prompt(&prompt).expect("matched parallel tool calls are valid");
+    }
+
+    #[test]
+    fn validate_prompt_accepts_continuation_only_prompt() {
+        use crate::types::ProviderContinuation;
+        // A cached-content resumption prompt has no plain user/assistant
+        // text but does carry an assistant turn (the continuation
+        // marker), so it must pass.
+        let prompt = Prompt::default().with_item(crate::types::InputItem::assistant_continuation(
+            ProviderContinuation::Gemini {
+                cached_content: "cached/x".to_string(),
+            },
+        ));
+        validate_prompt(&prompt).expect("continuation-only prompt is valid");
     }
 
     #[tokio::test]
