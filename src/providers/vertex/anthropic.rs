@@ -263,8 +263,8 @@ fn build_user_blocks(model: &str, parts: &[UserPart]) -> Result<Vec<AnthropicCon
 
 /// Map a unified [`UserPart::File`] to an Anthropic content block,
 /// gating on the model's file capabilities. Claude accepts only image
-/// and document inputs (no audio / video), so an unsupported modality is
-/// an error rather than a silent drop — file payload is never dropped.
+/// and document inputs (no audio / video), so an unsupported modality
+/// errors — files are payload and are never silently dropped.
 ///
 /// - [`FileSource::Bytes`] → `{"type":"base64",...}` source with the
 ///   real mime.
@@ -1043,9 +1043,8 @@ mod tests {
         }
     }
 
-    /// Claude doesn't accept audio — under the old code this was a
-    /// silent `debug!`-drop. It must now ERROR (file payload is not
-    /// dropped).
+    /// Claude doesn't accept audio, so an audio file must error — files
+    /// are payload and are never silently dropped.
     #[test]
     fn anthropic_audio_modality_errors() {
         let err = anthropic_file_block(

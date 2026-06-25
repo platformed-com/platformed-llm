@@ -225,10 +225,9 @@ pub enum AnnotationKind {
 /// A file input to the model — image, audio, video, or document.
 ///
 /// `mime_type` is top-level and authoritative: every provider mapping
-/// carries it onto the wire verbatim, so a `gs://` or HTTP URL is no
-/// longer forced to a hard-coded MIME the way the old per-kind `Url`
-/// variants were. The modality (image / audio / video / document) is
-/// derived from it via [`modality_from_mime`].
+/// carries it onto the wire verbatim, so a `gs://` or HTTP URL is sent
+/// with its true MIME. The modality (image / audio / video / document)
+/// is derived from it via [`modality_from_mime`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInput {
     /// The file's MIME type (e.g. `image/png`, `audio/mpeg`,

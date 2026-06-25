@@ -1121,6 +1121,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "base64",
  "bytes",
  "dotenvy",
  "futures",

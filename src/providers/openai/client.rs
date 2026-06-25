@@ -1196,7 +1196,7 @@ impl Provider for OpenAIProvider {
     /// Upload `bytes` to OpenAI's Files API
     /// (`POST {base_url}/files`, `multipart/form-data` with `file` +
     /// `purpose` fields) and return the assigned `file-…` id stamped
-    /// [`ProviderType::OpenAI`].
+    /// `ProviderType::OpenAI`.
     ///
     /// `purpose` is `user_data` — OpenAI's recommended purpose for files
     /// passed as model inputs to the Responses API.
@@ -2071,8 +2071,8 @@ mod tests {
         assert!(err.to_string().contains("inline"), "{err}");
     }
 
-    /// A video file targets a modality OpenAI doesn't accept — must
-    /// error rather than silently drop (files are payload).
+    /// A video file targets a modality OpenAI doesn't accept, so it
+    /// errors — files are payload and are never silently dropped.
     #[test]
     fn openai_video_modality_errors() {
         let err = file_part_json(
@@ -2196,18 +2196,5 @@ mod tests {
             .await
             .expect_err("401 must surface as an error");
         assert!(matches!(err, Error::Auth { .. }), "got: {err:?}");
-    }
-
-    #[test]
-    fn base64_encode_matches_known_vectors() {
-        use crate::providers::base64_encode;
-        // RFC 4648 test vectors.
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 }
