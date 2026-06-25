@@ -1,4 +1,4 @@
-use crate::{Capabilities, Error, Prompt, RawConfig, Response};
+use crate::{Capabilities, Error, Prompt, ProviderFileRef, RawConfig, Response};
 
 /// A trait for LLM providers that can generate text responses.
 ///
@@ -22,6 +22,31 @@ pub trait Provider: Send + Sync + 'static {
     /// (Internally always streams; the result is a [`Response`] you can
     /// consume token-by-token or buffer.)
     async fn generate(&self, prompt: &Prompt, config: &RawConfig) -> Result<Response, Error>;
+
+    /// Upload `bytes` to this provider's Files API and return a
+    /// [`ProviderFileRef`] stamped with this provider's
+    /// [`ProviderType`](crate::ProviderType). The returned reference can
+    /// then be sent as a [`crate::FileSource::Uploaded`] file input.
+    ///
+    /// `file_name` is an optional hint some Files APIs accept for the
+    /// stored object's filename.
+    ///
+    /// The default implementation returns [`Error::config`] — providers
+    /// without a usable Files API (the in-process mock, local GGUF, and
+    /// the Vertex-hosted Gemini / Claude providers, whose upstreams
+    /// expose no Files API on Vertex) inherit it. Hosted providers with
+    /// a real Files API override this.
+    async fn upload(
+        &self,
+        bytes: bytes::Bytes,
+        mime_type: &str,
+        file_name: Option<&str>,
+    ) -> Result<ProviderFileRef, Error> {
+        let _ = (bytes, mime_type, file_name);
+        Err(Error::config(
+            "this provider does not support file uploads (no Files API)",
+        ))
+    }
 
     /// Report the [`Capabilities`] of `model` as understood by this
     /// provider. Called by [`crate::generate`] at request time to

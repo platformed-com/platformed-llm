@@ -127,6 +127,46 @@ pub struct Capabilities {
     /// `max_tokens` higher than this is a caller error that will
     /// surface server-side.
     pub max_output_tokens: u32,
+    /// File-input support — which modalities the model accepts and
+    /// whether the provider exposes a Files API for uploads. Consulted
+    /// by each provider's part mapping: a [`crate::UserPart::File`]
+    /// whose mime-derived modality is `false` here is an error (files
+    /// are payload), not a silent drop.
+    pub files: FileCapabilities,
+}
+
+/// Per-model file-input capability flags.
+///
+/// `upload` reports whether [`crate::Provider::upload`] can hit a real
+/// Files API for this provider; the four modality flags report which
+/// kinds of [`crate::UserPart::File`] the model accepts as input. All
+/// default to `false` (the most-restrictive stance — unknown models
+/// support nothing) to match [`Capabilities::default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileCapabilities {
+    /// Provider exposes a Files API that [`crate::Provider::upload`] can
+    /// use. `false` means `upload` returns an unsupported error.
+    pub upload: bool,
+    /// Model accepts `image/*` inputs.
+    pub image: bool,
+    /// Model accepts `audio/*` inputs.
+    pub audio: bool,
+    /// Model accepts `video/*` inputs.
+    pub video: bool,
+    /// Model accepts document inputs (PDF and other non-media types).
+    pub document: bool,
+}
+
+impl FileCapabilities {
+    /// Whether the given [`crate::Modality`] is accepted as input.
+    pub fn accepts(&self, modality: crate::Modality) -> bool {
+        match modality {
+            crate::Modality::Image => self.image,
+            crate::Modality::Audio => self.audio,
+            crate::Modality::Video => self.video,
+            crate::Modality::Document => self.document,
+        }
+    }
 }
 
 impl Default for Capabilities {
@@ -144,6 +184,13 @@ impl Default for Capabilities {
             response_schema_with_tools: false,
             context_window_tokens: 4096,
             max_output_tokens: 1024,
+            files: FileCapabilities {
+                upload: false,
+                image: false,
+                audio: false,
+                video: false,
+                document: false,
+            },
         }
     }
 }
@@ -660,5 +707,66 @@ mod tests {
         assert!(!is_openai_o_series("opus"));
         assert!(!is_openai_o_series("o"));
         assert!(!is_openai_o_series("openai-thing"));
+    }
+
+    #[test]
+    fn default_files_all_false() {
+        let f = Capabilities::default().files;
+        assert!(!f.upload);
+        assert!(!f.image);
+        assert!(!f.audio);
+        assert!(!f.video);
+        assert!(!f.document);
+    }
+
+    /// OpenAI: real Files API + image / audio / document inputs; no video.
+    #[test]
+    fn openai_files_caps() {
+        for m in ["gpt-4o", "gpt-5", "o4-mini"] {
+            let f = Capabilities::openai(m).files;
+            assert!(f.upload, "{m}: upload");
+            assert!(f.image, "{m}: image");
+            assert!(f.audio, "{m}: audio");
+            assert!(f.document, "{m}: document");
+            assert!(!f.video, "{m}: video unsupported");
+        }
+    }
+
+    /// Gemini (via Vertex): multimodal inputs but NO upload (no Vertex
+    /// Files API — files go by `gs://` URL).
+    #[test]
+    fn google_files_caps() {
+        for m in ["gemini-2.5-pro", "gemini-3-flash"] {
+            let f = Capabilities::google(m).files;
+            assert!(!f.upload, "{m}: no Vertex Files API");
+            assert!(f.image, "{m}: image");
+            assert!(f.audio, "{m}: audio");
+            assert!(f.video, "{m}: video");
+            assert!(f.document, "{m}: document");
+        }
+    }
+
+    /// Anthropic (via Vertex): image + document only, no audio/video, no
+    /// upload (Files API not on Vertex).
+    #[test]
+    fn anthropic_files_caps() {
+        for m in ["claude-sonnet-4-5", "claude-opus-4-8"] {
+            let f = Capabilities::anthropic(m).files;
+            assert!(!f.upload, "{m}: no Vertex Files API");
+            assert!(f.image, "{m}: image");
+            assert!(f.document, "{m}: document");
+            assert!(!f.audio, "{m}: audio unsupported");
+            assert!(!f.video, "{m}: video unsupported");
+        }
+    }
+
+    #[test]
+    fn file_capabilities_accepts_maps_modalities() {
+        use crate::Modality;
+        let f = Capabilities::anthropic("claude-sonnet-4-5").files;
+        assert!(f.accepts(Modality::Image));
+        assert!(f.accepts(Modality::Document));
+        assert!(!f.accepts(Modality::Audio));
+        assert!(!f.accepts(Modality::Video));
     }
 }

@@ -6,11 +6,19 @@
 //! support schema-constrained output but **not** in combination with
 //! tools.
 
-use super::{Capabilities, ModelEntry, ModelMatch};
+use super::{Capabilities, FileCapabilities, ModelEntry, ModelMatch};
 use ModelMatch::Prefix;
 
 /// Build a Gemini capabilities entry with the supplied feature /
 /// limit combination.
+///
+/// File support: Gemini is natively multimodal — image / audio / video
+/// / document are all accepted. `upload` is `false`: this crate's
+/// Gemini provider runs **via Vertex AI**, which has no `files.upload`
+/// Files API (that surface is AI Studio's
+/// `generativelanguage.googleapis.com`); Vertex references files by
+/// `gs://` Cloud Storage URI through `fileData.fileUri` instead — i.e.
+/// [`crate::FileSource::Url`], not an upload.
 const fn caps(schema_with_tools: bool, context: u32, output: u32) -> Capabilities {
     Capabilities {
         native_json_mode: true,
@@ -18,6 +26,13 @@ const fn caps(schema_with_tools: bool, context: u32, output: u32) -> Capabilitie
         response_schema_with_tools: schema_with_tools,
         context_window_tokens: context,
         max_output_tokens: output,
+        files: FileCapabilities {
+            upload: false,
+            image: true,
+            audio: true,
+            video: true,
+            document: true,
+        },
     }
 }
 

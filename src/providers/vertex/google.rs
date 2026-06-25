@@ -191,61 +191,8 @@ impl GoogleProvider {
                                     },
                                 );
                             }
-                            UserPart::Image(src) => {
-                                let part = match src {
-                                    crate::types::ImageSource::Base64 { data, media_type } => {
-                                        GooglePart::InlineData {
-                                            inline_data: GoogleInlineData {
-                                                mime_type: media_type.clone(),
-                                                data: data.clone(),
-                                            },
-                                        }
-                                    }
-                                    crate::types::ImageSource::Url(u) => GooglePart::FileData {
-                                        file_data: GoogleFileData {
-                                            mime_type: "image/*".to_string(),
-                                            file_uri: u.clone(),
-                                        },
-                                    },
-                                };
-                                push_part(&mut contents, "user", part);
-                            }
-                            UserPart::Audio(src) => {
-                                let part = match src {
-                                    crate::types::AudioSource::Base64 { data, media_type } => {
-                                        GooglePart::InlineData {
-                                            inline_data: GoogleInlineData {
-                                                mime_type: media_type.clone(),
-                                                data: data.clone(),
-                                            },
-                                        }
-                                    }
-                                    crate::types::AudioSource::Url(u) => GooglePart::FileData {
-                                        file_data: GoogleFileData {
-                                            mime_type: "audio/*".to_string(),
-                                            file_uri: u.clone(),
-                                        },
-                                    },
-                                };
-                                push_part(&mut contents, "user", part);
-                            }
-                            UserPart::Document(src) => {
-                                let part = match src {
-                                    crate::types::DocumentSource::Base64 { data, media_type } => {
-                                        GooglePart::InlineData {
-                                            inline_data: GoogleInlineData {
-                                                mime_type: media_type.clone(),
-                                                data: data.clone(),
-                                            },
-                                        }
-                                    }
-                                    crate::types::DocumentSource::Url(u) => GooglePart::FileData {
-                                        file_data: GoogleFileData {
-                                            mime_type: "application/pdf".to_string(),
-                                            file_uri: u.clone(),
-                                        },
-                                    },
-                                };
+                            UserPart::File(file) => {
+                                let part = map_google_file(&config.model, file)?;
                                 push_part(&mut contents, "user", part);
                             }
                             UserPart::CacheBreakpoint => {
@@ -444,6 +391,50 @@ impl GoogleProvider {
 }
 
 use crate::providers::flatten_user_parts_to_text;
+
+/// Map a unified [`UserPart::File`] to a Gemini wire part, gating on the
+/// model's file capabilities (an unsupported modality is an error — file
+/// payload is never silently dropped).
+///
+/// - [`FileSource::Bytes`] → `inlineData` (base64) with the real mime.
+/// - [`FileSource::Url`] → `fileData.fileUri` with the real mime; this
+///   is where `gs://` Cloud Storage URIs land.
+/// - [`FileSource::Uploaded`] → unsupported: Gemini-via-Vertex has no
+///   Files API, so no valid `ProviderFileRef` can be sent here.
+fn map_google_file(model: &str, file: &crate::FileInput) -> Result<GooglePart, Error> {
+    let modality = file.modality();
+    if !crate::Capabilities::google(model).files.accepts(modality) {
+        return Err(Error::provider(
+            "Google",
+            format!(
+                "model {model} does not accept {modality:?} file input (mime {})",
+                file.mime_type
+            ),
+        ));
+    }
+    match &file.source {
+        crate::FileSource::Bytes(bytes) => Ok(GooglePart::InlineData {
+            inline_data: GoogleInlineData {
+                mime_type: file.mime_type.clone(),
+                data: crate::providers::base64_encode(bytes),
+            },
+        }),
+        crate::FileSource::Url(u) => Ok(GooglePart::FileData {
+            file_data: GoogleFileData {
+                mime_type: file.mime_type.clone(),
+                file_uri: u.clone(),
+            },
+        }),
+        crate::FileSource::Uploaded(file_ref) => Err(Error::provider(
+            "Google",
+            format!(
+                "uploaded file reference (provider {:?}, id {}) cannot be sent to \
+                 Gemini-via-Vertex, which has no Files API",
+                file_ref.provider, file_ref.id
+            ),
+        )),
+    }
+}
 
 /// Shape a tool's output for Gemini's `functionResponse.response` field,
 /// which the API requires to be a JSON object.
@@ -1889,5 +1880,76 @@ mod tests {
             })
             .expect("expected a tool call");
         assert_eq!(call.provider_signature.as_deref(), Some("sig_abc"));
+    }
+
+    // ---------------------------------------------------------------
+    // File-input mapping (UserPart::File).
+    // ---------------------------------------------------------------
+
+    use crate::{FileInput, ProviderFileRef, ProviderType, UserPart};
+
+    /// Serialize a one-file user prompt and return the user content's
+    /// first part JSON.
+    fn google_file_part(model: &str, file: FileInput) -> Result<serde_json::Value, Error> {
+        let prompt = crate::Prompt::new().with_item(InputItem::User {
+            content: vec![UserPart::File(file)],
+        });
+        let cfg = Config::builder(model).build();
+        let body = provider().convert_request(&prompt, cfg.raw())?;
+        let json = serde_json::to_value(&body).unwrap();
+        Ok(json["contents"][0]["parts"][0].clone())
+    }
+
+    #[test]
+    fn google_image_bytes_maps_to_inline_data_with_real_mime() {
+        let part = google_file_part(
+            "gemini-2.5-pro",
+            FileInput::bytes("image/png", bytes::Bytes::from_static(b"PNGDATA")),
+        )
+        .unwrap();
+        assert_eq!(part["inlineData"]["mimeType"], "image/png");
+        // "PNGDATA" base64.
+        assert_eq!(part["inlineData"]["data"], "UE5HREFUQQ==");
+    }
+
+    /// The mime-top-level bug fix: a `gs://` URL carries the REAL mime
+    /// onto `fileData.mimeType`, not a hard-coded `image/*`.
+    #[test]
+    fn google_url_carries_real_mime_not_hardcoded() {
+        let part = google_file_part(
+            "gemini-2.5-pro",
+            FileInput::url("audio/mpeg", "gs://bucket/clip.mp3"),
+        )
+        .unwrap();
+        assert_eq!(part["fileData"]["fileUri"], "gs://bucket/clip.mp3");
+        assert_eq!(part["fileData"]["mimeType"], "audio/mpeg");
+    }
+
+    #[test]
+    fn google_video_url_supported() {
+        let part = google_file_part(
+            "gemini-3-pro",
+            FileInput::url("video/mp4", "gs://bucket/movie.mp4"),
+        )
+        .unwrap();
+        assert_eq!(part["fileData"]["mimeType"], "video/mp4");
+    }
+
+    /// Gemini-via-Vertex has no Files API, so an uploaded reference can't
+    /// be mapped — must error rather than emit a bad part.
+    #[test]
+    fn google_uploaded_reference_errors() {
+        let err = google_file_part(
+            "gemini-2.5-pro",
+            FileInput::uploaded(
+                "image/png",
+                ProviderFileRef {
+                    provider: ProviderType::Google,
+                    id: "files/abc".into(),
+                },
+            ),
+        )
+        .expect_err("uploaded ref has no Vertex mapping");
+        assert!(err.to_string().contains("no Files API"), "{err}");
     }
 }

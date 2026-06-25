@@ -93,7 +93,7 @@ impl AnthropicViaVertexProvider {
                     system_message = Some(content.clone());
                 }
                 InputItem::User { content } => {
-                    let blocks = build_user_blocks(content)?;
+                    let blocks = build_user_blocks(&config.model, content)?;
                     if blocks.is_empty() {
                         continue;
                     }
@@ -238,7 +238,7 @@ impl AnthropicViaVertexProvider {
 /// Translate user-side parts into Anthropic content blocks. A
 /// `CacheBreakpoint` attaches `cache_control: {type: "ephemeral"}` to
 /// the most recently emitted block.
-fn build_user_blocks(parts: &[UserPart]) -> Result<Vec<AnthropicContentBlock>, Error> {
+fn build_user_blocks(model: &str, parts: &[UserPart]) -> Result<Vec<AnthropicContentBlock>, Error> {
     let mut blocks = Vec::new();
     for part in parts {
         match part {
@@ -246,23 +246,7 @@ fn build_user_blocks(parts: &[UserPart]) -> Result<Vec<AnthropicContentBlock>, E
                 text: s.clone(),
                 cache_control: None,
             }),
-            UserPart::Image(src) => {
-                let source = match src {
-                    crate::types::ImageSource::Url(u) => ijson::ijson!({
-                        "type": "url",
-                        "url": u.clone(),
-                    }),
-                    crate::types::ImageSource::Base64 { data, media_type } => ijson::ijson!({
-                        "type": "base64",
-                        "media_type": media_type.clone(),
-                        "data": data.clone(),
-                    }),
-                };
-                blocks.push(AnthropicContentBlock::Image {
-                    source,
-                    cache_control: None,
-                });
-            }
+            UserPart::File(file) => blocks.push(map_anthropic_file(model, file)?),
             UserPart::ToolResult { call_id, content } => {
                 let text = flatten_user_parts_to_text(content);
                 blocks.push(AnthropicContentBlock::ToolResult {
@@ -271,30 +255,74 @@ fn build_user_blocks(parts: &[UserPart]) -> Result<Vec<AnthropicContentBlock>, E
                     is_error: None,
                 });
             }
-            UserPart::Audio(_) => {
-                tracing::debug!("Anthropic provider does not support audio input; dropping");
-            }
-            UserPart::Document(src) => {
-                let source = match src {
-                    crate::types::DocumentSource::Url(u) => ijson::ijson!({
-                        "type": "url",
-                        "url": u.clone(),
-                    }),
-                    crate::types::DocumentSource::Base64 { data, media_type } => ijson::ijson!({
-                        "type": "base64",
-                        "media_type": media_type.clone(),
-                        "data": data.clone(),
-                    }),
-                };
-                blocks.push(AnthropicContentBlock::Document {
-                    source,
-                    cache_control: None,
-                });
-            }
             UserPart::CacheBreakpoint => attach_cache_control(blocks.last_mut()),
         }
     }
     Ok(blocks)
+}
+
+/// Map a unified [`UserPart::File`] to an Anthropic content block,
+/// gating on the model's file capabilities. Claude accepts only image
+/// and document inputs (no audio / video), so an unsupported modality is
+/// an error rather than a silent drop — file payload is never dropped.
+///
+/// - [`FileSource::Bytes`] → `{"type":"base64",...}` source with the
+///   real mime.
+/// - [`FileSource::Url`] → `{"type":"url",...}` source.
+/// - [`FileSource::Uploaded`] → unsupported: the Files API is not
+///   available on Vertex AI, so no valid Anthropic `ProviderFileRef` can
+///   be sent here.
+fn map_anthropic_file(
+    model: &str,
+    file: &crate::FileInput,
+) -> Result<AnthropicContentBlock, Error> {
+    use crate::Modality;
+    let modality = file.modality();
+    if !crate::Capabilities::anthropic(model)
+        .files
+        .accepts(modality)
+    {
+        return Err(Error::provider(
+            "Anthropic",
+            format!(
+                "model {model} does not accept {modality:?} file input (mime {})",
+                file.mime_type
+            ),
+        ));
+    }
+    let source = match &file.source {
+        crate::FileSource::Bytes(bytes) => ijson::ijson!({
+            "type": "base64",
+            "media_type": file.mime_type.clone(),
+            "data": crate::providers::base64_encode(bytes),
+        }),
+        crate::FileSource::Url(u) => ijson::ijson!({
+            "type": "url",
+            "url": u.clone(),
+        }),
+        crate::FileSource::Uploaded(file_ref) => {
+            return Err(Error::provider(
+                "Anthropic",
+                format!(
+                    "uploaded file reference (provider {:?}, id {}) cannot be sent to \
+                     Claude-via-Vertex, which has no Files API",
+                    file_ref.provider, file_ref.id
+                ),
+            ));
+        }
+    };
+    Ok(match modality {
+        Modality::Image => AnthropicContentBlock::Image {
+            source,
+            cache_control: None,
+        },
+        // Document is the only other capability-accepted modality
+        // (audio / video are gated off above for Claude).
+        _ => AnthropicContentBlock::Document {
+            source,
+            cache_control: None,
+        },
+    })
 }
 
 /// Attach a `cache_control: {type: "ephemeral"}` hint to the most-
@@ -947,5 +975,102 @@ mod tests {
             }
             other => panic!("expected PartStart(ToolCall), got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // File-input mapping (UserPart::File).
+    // ---------------------------------------------------------------
+
+    use crate::{FileInput, FileSource, ProviderFileRef, ProviderType};
+
+    /// Map a single file via `build_user_blocks` for `model` and return
+    /// the one resulting block.
+    fn anthropic_file_block(model: &str, file: FileInput) -> Result<AnthropicContentBlock, Error> {
+        let mut blocks = build_user_blocks(model, &[UserPart::File(file)])?;
+        assert_eq!(blocks.len(), 1, "expected exactly one block");
+        Ok(blocks.pop().unwrap())
+    }
+
+    #[test]
+    fn anthropic_image_bytes_maps_to_base64_source_with_real_mime() {
+        let block = anthropic_file_block(
+            "claude-sonnet-4-5",
+            FileInput::bytes("image/png", bytes::Bytes::from_static(b"PNGDATA")),
+        )
+        .unwrap();
+        match block {
+            AnthropicContentBlock::Image { source, .. } => {
+                let v = serde_json::to_value(&source).unwrap();
+                assert_eq!(v["type"], "base64");
+                assert_eq!(v["media_type"], "image/png");
+                assert_eq!(v["data"], "UE5HREFUQQ==");
+            }
+            other => panic!("expected Image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_image_url_maps_to_url_source() {
+        let block = anthropic_file_block(
+            "claude-sonnet-4-5",
+            FileInput::url("image/jpeg", "https://example.com/cat.jpg"),
+        )
+        .unwrap();
+        match block {
+            AnthropicContentBlock::Image { source, .. } => {
+                let v = serde_json::to_value(&source).unwrap();
+                assert_eq!(v["type"], "url");
+                assert_eq!(v["url"], "https://example.com/cat.jpg");
+            }
+            other => panic!("expected Image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_document_bytes_maps_to_document_block() {
+        let block = anthropic_file_block(
+            "claude-sonnet-4-5",
+            FileInput::bytes("application/pdf", bytes::Bytes::from_static(b"%PDF")),
+        )
+        .unwrap();
+        match block {
+            AnthropicContentBlock::Document { source, .. } => {
+                let v = serde_json::to_value(&source).unwrap();
+                assert_eq!(v["type"], "base64");
+                assert_eq!(v["media_type"], "application/pdf");
+            }
+            other => panic!("expected Document block, got {other:?}"),
+        }
+    }
+
+    /// Claude doesn't accept audio — under the old code this was a
+    /// silent `debug!`-drop. It must now ERROR (file payload is not
+    /// dropped).
+    #[test]
+    fn anthropic_audio_modality_errors() {
+        let err = anthropic_file_block(
+            "claude-sonnet-4-5",
+            FileInput::bytes("audio/mpeg", bytes::Bytes::from_static(b"ID3")),
+        )
+        .expect_err("audio unsupported on Claude → error, not drop");
+        assert!(err.to_string().contains("Audio"), "{err}");
+    }
+
+    /// The Files API isn't available on Vertex; an uploaded reference
+    /// can't be sent — must error.
+    #[test]
+    fn anthropic_uploaded_reference_errors() {
+        let err = anthropic_file_block(
+            "claude-sonnet-4-5",
+            FileInput {
+                mime_type: "image/png".into(),
+                source: FileSource::Uploaded(ProviderFileRef {
+                    provider: ProviderType::Anthropic,
+                    id: "file-abc".into(),
+                }),
+            },
+        )
+        .expect_err("uploaded ref has no Vertex mapping");
+        assert!(err.to_string().contains("no Files API"), "{err}");
     }
 }

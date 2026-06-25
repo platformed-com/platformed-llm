@@ -13,10 +13,17 @@
 //! than over-promising and rejecting a request the model would
 //! otherwise accept under the beta path.
 
-use super::{Capabilities, ModelEntry, ModelMatch};
+use super::{Capabilities, FileCapabilities, ModelEntry, ModelMatch};
 use ModelMatch::Prefix;
 
 /// Build an Anthropic capabilities entry.
+///
+/// File support: Claude accepts image and PDF/document inputs via its
+/// vision stack, but not audio or video. `upload` is `false`: the Files
+/// API is not available on Vertex AI (only the direct Claude API / AWS
+/// / Foundry), and this crate's Anthropic provider is Vertex-only — so
+/// file bytes ride inline / by URL on each request rather than via an
+/// upload.
 const fn caps(context: u32, output: u32) -> Capabilities {
     Capabilities {
         native_json_mode: false,
@@ -24,6 +31,13 @@ const fn caps(context: u32, output: u32) -> Capabilities {
         response_schema_with_tools: false,
         context_window_tokens: context,
         max_output_tokens: output,
+        files: FileCapabilities {
+            upload: false,
+            image: true,
+            audio: false,
+            video: false,
+            document: true,
+        },
     }
 }
 

@@ -39,6 +39,39 @@ pub use local::LlamaGgufProvider;
 #[cfg(feature = "mock")]
 pub use mock::{CallLog, Chunking, MockProvider, MockProviderBuilder, MockResponse, RecordedCall};
 
+/// Standard base64 (RFC 4648) encode with padding. The hosted
+/// providers carry inline file bytes as base64 in their wire formats
+/// (OpenAI data-URLs, Gemini `inlineData.data`, Anthropic
+/// `source.data`); the canonical [`crate::FileSource::Bytes`] holds raw
+/// bytes, so each provider encodes here. Kept dependency-free — a small
+/// encoder beats pulling in the `base64` crate for one call site per
+/// provider.
+#[cfg(any(feature = "openai", feature = "google", feature = "anthropic-vertex"))]
+pub(crate) fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        // Pad the final partial chunk: 1 byte → "==", 2 bytes → "=".
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Best-effort flatten of a tool-result content array into a single
 /// string. Tool-result wire shapes accept only plain text on OpenAI's
 /// `function_call_output`, Gemini's `functionResponse`, and the

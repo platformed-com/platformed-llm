@@ -58,7 +58,7 @@ mod types;
 // and are reachable via the fully-qualified path. No globs — adding a
 // `pub` item to an internal module must not leak it.
 
-pub use capabilities::Capabilities;
+pub use capabilities::{Capabilities, FileCapabilities};
 pub use compaction::Compactor;
 pub use error::Error;
 pub use factory::{ProviderConfig, ProviderFactory, ProviderType};
@@ -66,9 +66,9 @@ pub use middleware::{generate, JsonCoercionMiddleware, Middleware};
 pub use provider::Provider;
 pub use response::{CompleteResponse, Response};
 pub use types::{
-    Annotation, AnnotationKind, AssistantPart, AudioSource, ComputerUseConfig, Config,
-    ConfigBuilder, DocumentSource, FinishReason, Function, FunctionCall, ImageSource, InputItem,
-    PartKind, PartUpdate, Prompt, ProviderBuiltin, ProviderContinuation, RawConfig,
-    ReasoningConfig, ReasoningEffort, ReasoningSummary, ResponseFormat, StreamEvent, Tool,
-    ToolChoice, Usage, UserPart,
+    modality_from_mime, Annotation, AnnotationKind, AssistantPart, ComputerUseConfig, Config,
+    ConfigBuilder, FileInput, FileSource, FinishReason, Function, FunctionCall, InputItem,
+    Modality, PartKind, PartUpdate, Prompt, ProviderBuiltin, ProviderContinuation, ProviderFileRef,
+    RawConfig, ReasoningConfig, ReasoningEffort, ReasoningSummary, ResponseFormat, StreamEvent,
+    Tool, ToolChoice, Usage, UserPart,
 };

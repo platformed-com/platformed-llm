@@ -4,12 +4,16 @@
 //! 2026-06. Keep the per-row comments accurate — they're the audit
 //! trail for the next refresh.
 
-use super::{Capabilities, ModelEntry, ModelMatch};
+use super::{Capabilities, FileCapabilities, ModelEntry, ModelMatch};
 use ModelMatch::{Exact, Prefix};
 
 /// Build an OpenAI capabilities entry. Every modern OpenAI Chat /
 /// Responses model supports native JSON mode, JSON schema, and schema
 /// + tools combined; only the token limits vary.
+///
+/// File support: OpenAI exposes a real Files API (`upload: true`) and
+/// vision-class models accept image / audio / document inputs; video is
+/// not a supported input modality on the Responses API.
 const fn caps(context: u32, output: u32) -> Capabilities {
     Capabilities {
         native_json_mode: true,
@@ -17,6 +21,13 @@ const fn caps(context: u32, output: u32) -> Capabilities {
         response_schema_with_tools: true,
         context_window_tokens: context,
         max_output_tokens: output,
+        files: FileCapabilities {
+            upload: true,
+            image: true,
+            audio: true,
+            video: false,
+            document: true,
+        },
     }
 }
 

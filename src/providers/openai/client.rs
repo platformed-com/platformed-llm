@@ -73,7 +73,11 @@ impl OpenAIProvider {
     }
 
     /// Convert internal request to OpenAI Responses API format.
-    fn convert_request(&self, prompt: &crate::Prompt, config: &RawConfig) -> ResponsesRequest {
+    fn convert_request(
+        &self,
+        prompt: &crate::Prompt,
+        config: &RawConfig,
+    ) -> Result<ResponsesRequest, Error> {
         let messages = prompt.items();
 
         // Scan history for the latest InputItem::Continuation carrying
@@ -84,10 +88,10 @@ impl OpenAIProvider {
 
         let mut input: Vec<crate::providers::openai::types::OpenAIInputMessage> = Vec::new();
         for item in &messages[start_index..] {
-            Self::flatten_input_item(item, &mut input);
+            Self::flatten_input_item(&config.model, item, &mut input)?;
         }
 
-        ResponsesRequest {
+        Ok(ResponsesRequest {
             model: config.model.clone(),
             input,
             instructions: None,
@@ -112,7 +116,7 @@ impl OpenAIProvider {
                 .response_format
                 .as_ref()
                 .and_then(convert_response_format),
-        }
+        })
     }
 
     /// Flatten one canonical `InputItem` into one or more OpenAI input
@@ -121,9 +125,10 @@ impl OpenAIProvider {
     /// text + tool calls splits into a message + N function_call items
     /// here (preserving emit order).
     fn flatten_input_item(
+        model: &str,
         item: &crate::types::InputItem,
         out: &mut Vec<crate::providers::openai::types::OpenAIInputMessage>,
-    ) {
+    ) -> Result<(), Error> {
         use crate::providers::openai::types::OpenAIInputMessage;
         use crate::types::{AssistantPart, InputItem, UserPart};
 
@@ -148,16 +153,8 @@ impl OpenAIProvider {
                         UserPart::Text(s) => {
                             parts.push(OpenAIContentPart::InputText { text: s.clone() })
                         }
-                        UserPart::Image(src) => {
-                            let url = match src {
-                                crate::types::ImageSource::Url(u) => u.clone(),
-                                crate::types::ImageSource::Base64 { data, media_type } => {
-                                    format!("data:{media_type};base64,{data}")
-                                }
-                            };
-                            parts.push(OpenAIContentPart::InputImage {
-                                image_url: Some(url),
-                            });
+                        UserPart::File(file) => {
+                            parts.push(map_openai_file(model, file)?);
                         }
                         UserPart::ToolResult { call_id, content } => {
                             // A user turn mixing free text with a tool
@@ -181,44 +178,6 @@ impl OpenAIProvider {
                                 output: flatten_user_parts_to_text(content),
                             });
                         }
-                        UserPart::Audio(src) => match src {
-                            crate::types::AudioSource::Base64 { data, media_type } => {
-                                // OpenAI accepts mp3 / wav. media_type is
-                                // expected to be something like "audio/mp3".
-                                let format = media_type
-                                    .strip_prefix("audio/")
-                                    .unwrap_or(media_type.as_str())
-                                    .to_string();
-                                parts.push(OpenAIContentPart::InputAudio {
-                                    input_audio:
-                                        crate::providers::openai::types::OpenAIInputAudio {
-                                            data: data.clone(),
-                                            format,
-                                        },
-                                });
-                            }
-                            crate::types::AudioSource::Url(_) => {
-                                tracing::debug!(
-                                    "OpenAI input_audio requires inline base64; dropping URL audio"
-                                );
-                            }
-                        },
-                        UserPart::Document(src) => match src {
-                            crate::types::DocumentSource::Url(u) => {
-                                parts.push(OpenAIContentPart::InputFile {
-                                    file_url: Some(u.clone()),
-                                    file_data: None,
-                                    filename: None,
-                                });
-                            }
-                            crate::types::DocumentSource::Base64 { data, media_type } => {
-                                parts.push(OpenAIContentPart::InputFile {
-                                    file_url: None,
-                                    file_data: Some(format!("data:{media_type};base64,{data}")),
-                                    filename: None,
-                                });
-                            }
-                        },
                         UserPart::CacheBreakpoint => {
                             // OpenAI maps cache breakpoints onto a per-
                             // request `prompt_cache_key` rather than
@@ -282,6 +241,7 @@ impl OpenAIProvider {
                 }
             }
         }
+        Ok(())
     }
 
     /// Convert our internal tools to OpenAI Responses API format.
@@ -426,9 +386,9 @@ fn derive_prompt_cache_key(messages: &[crate::types::InputItem]) -> Option<Strin
                 for part in content {
                     match part {
                         UserPart::Text(s) => s.hash(&mut hasher),
-                        UserPart::Image(_) | UserPart::Audio(_) | UserPart::Document(_) => {
+                        UserPart::File(_) => {
                             // Skip multi-modal payloads from the hash —
-                            // their base64 representation would dominate
+                            // their byte representation would dominate
                             // and small re-encodings would defeat the key.
                             "<media>".hash(&mut hasher);
                         }
@@ -526,6 +486,124 @@ fn push_user_parts(
 }
 
 use crate::providers::flatten_user_parts_to_text;
+
+/// Map a unified [`crate::UserPart::File`] to an OpenAI Responses
+/// content part, gating on the model's file capabilities (an
+/// unsupported modality is an error — file payload is never silently
+/// dropped).
+///
+/// Per modality:
+/// - image → `input_image` (`image_url` data-URL / external URL, or
+///   `file_id` for an uploaded image),
+/// - audio → `input_audio` (inline base64 only; OpenAI's audio part
+///   takes no URL or file id, so URL / uploaded audio errors),
+/// - document / other → `input_file` (`file_data` data-URL, `file_url`,
+///   or `file_id`).
+///
+/// [`crate::FileSource::Uploaded`] is validated to belong to OpenAI
+/// first; a wrong-provider id errors rather than leaking onto the wire.
+fn map_openai_file(
+    model: &str,
+    file: &crate::FileInput,
+) -> Result<crate::providers::openai::types::OpenAIContentPart, Error> {
+    use crate::providers::openai::types::{OpenAIContentPart, OpenAIInputAudio};
+    use crate::{FileSource, Modality, ProviderType};
+
+    let modality = file.modality();
+    if !crate::Capabilities::openai(model).files.accepts(modality) {
+        return Err(Error::provider(
+            "OpenAI",
+            format!(
+                "model {model} does not accept {modality:?} file input (mime {})",
+                file.mime_type
+            ),
+        ));
+    }
+
+    // Validate an uploaded reference belongs to OpenAI before using its id.
+    if let FileSource::Uploaded(file_ref) = &file.source {
+        if file_ref.provider != ProviderType::OpenAI {
+            return Err(Error::provider(
+                "OpenAI",
+                format!(
+                    "uploaded file reference belongs to {:?}, not OpenAI; cannot send id {}",
+                    file_ref.provider, file_ref.id
+                ),
+            ));
+        }
+    }
+
+    let part = match modality {
+        Modality::Image => match &file.source {
+            FileSource::Bytes(bytes) => OpenAIContentPart::InputImage {
+                image_url: Some(format!(
+                    "data:{};base64,{}",
+                    file.mime_type,
+                    crate::providers::base64_encode(bytes)
+                )),
+                file_id: None,
+            },
+            FileSource::Url(u) => OpenAIContentPart::InputImage {
+                image_url: Some(u.clone()),
+                file_id: None,
+            },
+            FileSource::Uploaded(file_ref) => OpenAIContentPart::InputImage {
+                image_url: None,
+                file_id: Some(file_ref.id.clone()),
+            },
+        },
+        Modality::Audio => match &file.source {
+            FileSource::Bytes(bytes) => {
+                // OpenAI's `input_audio.format` is the bare codec
+                // (`mp3` / `wav`), derived from the `audio/<codec>` mime.
+                let format = file
+                    .mime_type
+                    .split('/')
+                    .nth(1)
+                    .unwrap_or(&file.mime_type)
+                    .to_string();
+                OpenAIContentPart::InputAudio {
+                    input_audio: OpenAIInputAudio {
+                        data: crate::providers::base64_encode(bytes),
+                        format,
+                    },
+                }
+            }
+            FileSource::Url(_) | FileSource::Uploaded(_) => {
+                return Err(Error::provider(
+                    "OpenAI",
+                    "OpenAI input_audio requires inline bytes; URL / uploaded audio is unsupported",
+                ));
+            }
+        },
+        // Document (and any other non-media) → input_file.
+        _ => match &file.source {
+            FileSource::Bytes(bytes) => OpenAIContentPart::InputFile {
+                file_url: None,
+                file_data: Some(format!(
+                    "data:{};base64,{}",
+                    file.mime_type,
+                    crate::providers::base64_encode(bytes)
+                )),
+                filename: None,
+                file_id: None,
+            },
+            FileSource::Url(u) => OpenAIContentPart::InputFile {
+                file_url: Some(u.clone()),
+                file_data: None,
+                filename: None,
+                file_id: None,
+            },
+            FileSource::Uploaded(file_ref) => OpenAIContentPart::InputFile {
+                file_url: None,
+                file_data: None,
+                filename: None,
+                file_id: Some(file_ref.id.clone()),
+            },
+        },
+    };
+    Ok(part)
+}
 
 fn convert_response_format(
     rf: &crate::types::ResponseFormat,
@@ -1036,7 +1114,7 @@ impl Provider for OpenAIProvider {
         prompt: &crate::Prompt,
         config: &RawConfig,
     ) -> Result<Response, Error> {
-        let mut openai_request = self.convert_request(prompt, config);
+        let mut openai_request = self.convert_request(prompt, config)?;
         openai_request.stream = Some(true);
 
         debug!(
@@ -1114,6 +1192,109 @@ impl Provider for OpenAIProvider {
         let _ = state; // keep state alive (the closure also clones it)
         Ok(Response::from_stream(event_stream))
     }
+
+    /// Upload `bytes` to OpenAI's Files API
+    /// (`POST {base_url}/files`, `multipart/form-data` with `file` +
+    /// `purpose` fields) and return the assigned `file-…` id stamped
+    /// [`ProviderType::OpenAI`].
+    ///
+    /// `purpose` is `user_data` — OpenAI's recommended purpose for files
+    /// passed as model inputs to the Responses API.
+    ///
+    /// Routed through the provider's [`Transport`] (POST), so tests
+    /// inject a canned [`crate::transport::TransportImpl`] exactly as
+    /// they do for `generate`.
+    async fn upload(
+        &self,
+        bytes: bytes::Bytes,
+        mime_type: &str,
+        file_name: Option<&str>,
+    ) -> Result<crate::ProviderFileRef, Error> {
+        let filename = file_name.unwrap_or("upload.bin");
+        let boundary = format!("platformed-llm-{}", uuid_like(&bytes, mime_type));
+        let body = build_multipart(&boundary, filename, mime_type, "user_data", &bytes);
+
+        let mut headers = vec![
+            (
+                "Authorization".to_string(),
+                format!("Bearer {}", self.api_key),
+            ),
+            (
+                "Content-Type".to_string(),
+                format!("multipart/form-data; boundary={boundary}"),
+            ),
+        ];
+        if let Some(org) = &self.organization {
+            headers.push(("OpenAI-Organization".to_string(), org.clone()));
+        }
+        if let Some(project) = &self.project {
+            headers.push(("OpenAI-Project".to_string(), project.clone()));
+        }
+
+        let req = TransportRequest {
+            url: format!("{}/files", self.base_url),
+            headers,
+            body,
+        };
+        let response = self.transport.send(req).await?;
+        let status = response.status;
+        let body_bytes = response.collect_body().await?;
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        if !(200..300).contains(&status) {
+            return Err(parse_openai_error(status, None, &body_str));
+        }
+        let parsed: OpenAIFileResponse = serde_json::from_str(&body_str)?;
+        Ok(crate::ProviderFileRef {
+            provider: crate::ProviderType::OpenAI,
+            id: parsed.id,
+        })
+    }
+}
+
+/// Minimal `multipart/form-data` body builder for the Files API upload.
+/// Two parts: a `purpose` text field and a `file` field carrying the raw
+/// bytes verbatim. The boundary must not occur in the payload — see
+/// [`uuid_like`] for how it's made collision-resistant.
+fn build_multipart(
+    boundary: &str,
+    filename: &str,
+    mime_type: &str,
+    purpose: &str,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    let header = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"purpose\"\r\n\r\n\
+         {purpose}\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+         Content-Type: {mime_type}\r\n\r\n"
+    );
+    body.extend_from_slice(header.as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// Derive a short, deterministic, collision-resistant suffix for the
+/// multipart boundary from the payload, so the boundary never appears
+/// inside the file bytes. Not a real UUID — a `DefaultHasher` digest of
+/// the bytes + mime is enough, since the boundary only has to be unique
+/// *within this one request body*.
+fn uuid_like(bytes: &[u8], mime_type: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    mime_type.hash(&mut h);
+    bytes.len().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// OpenAI Files API upload response — only the `id` is consumed.
+#[derive(serde::Deserialize)]
+struct OpenAIFileResponse {
+    id: String,
 }
 
 #[cfg(test)]
@@ -1267,7 +1448,7 @@ mod tests {
             (ToolChoice::Required, serde_json::json!("required")),
         ] {
             let cfg = Config::builder("gpt-4").tool_choice(choice.clone()).build();
-            let req = provider().convert_request(&prompt, cfg.raw());
+            let req = provider().convert_request(&prompt, cfg.raw()).unwrap();
             let json = serde_json::to_value(&req).unwrap();
             assert_eq!(
                 json["tool_choice"], expected,
@@ -1284,7 +1465,7 @@ mod tests {
                 name: "get_weather".to_string(),
             })
             .build();
-        let req = provider().convert_request(&prompt, cfg.raw());
+        let req = provider().convert_request(&prompt, cfg.raw()).unwrap();
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
             json["tool_choice"],
@@ -1304,7 +1485,7 @@ mod tests {
                 summary: Some(ReasoningSummary::Auto),
             })
             .build();
-        let req = provider().convert_request(&prompt, cfg.raw());
+        let req = provider().convert_request(&prompt, cfg.raw()).unwrap();
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
             json["reasoning"],
@@ -1367,7 +1548,7 @@ mod tests {
             .parallel_tool_calls(false)
             .store(true)
             .build();
-        let req = provider().convert_request(&prompt, cfg.raw());
+        let req = provider().convert_request(&prompt, cfg.raw()).unwrap();
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["parallel_tool_calls"], false);
         assert_eq!(json["store"], true);
@@ -1443,7 +1624,7 @@ mod tests {
             ))
             .with_user("follow-up");
         let cfg = Config::builder("gpt-5").build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_1"));
         // Only the items after the assistant turn carrying the
         // continuation reach the wire.
@@ -1475,7 +1656,7 @@ mod tests {
             .with_response(&prior)
             .with_user("follow-up");
         let cfg = Config::builder("gpt-5").build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_prior"));
         // Only the follow-up reaches the wire — everything else is
         // covered by the server-side response state.
@@ -1501,7 +1682,7 @@ mod tests {
             ))
             .with_user("c");
         let cfg = Config::builder("gpt-5").build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_new"));
         // Only items strictly after the latest matching assistant turn.
         assert_eq!(body.input.len(), 1);
@@ -1521,7 +1702,7 @@ mod tests {
             ))
             .with_user("b");
         let cfg = Config::builder("gpt-5").build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         assert!(body.previous_response_id.is_none());
         // Both user items still on the wire (continuation part drops out).
         assert_eq!(body.input.len(), 2);
@@ -1540,7 +1721,7 @@ mod tests {
                 },
             ))])
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["tools"][0]["type"], "computer_use_preview");
         assert_eq!(json["tools"][0]["display_width"], 1280);
@@ -1555,7 +1736,7 @@ mod tests {
         let cfg = Config::builder("gpt-5")
             .response_format(ResponseFormat::JsonObject)
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["text"]["format"]["type"], "json_object");
     }
@@ -1574,7 +1755,7 @@ mod tests {
                 strict: true,
             })
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw());
+        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["text"]["format"]["type"], "json_schema");
         assert_eq!(json["text"]["format"]["name"], "Point");
@@ -1601,8 +1782,8 @@ mod tests {
         let prompt1 = make_prompt();
         let prompt2 = make_prompt();
         let cfg = Config::builder("gpt-5").build();
-        let req1 = provider().convert_request(&prompt1, cfg.raw());
-        let req2 = provider().convert_request(&prompt2, cfg.raw());
+        let req1 = provider().convert_request(&prompt1, cfg.raw()).unwrap();
+        let req2 = provider().convert_request(&prompt2, cfg.raw()).unwrap();
         assert!(req1.prompt_cache_key.is_some());
         assert_eq!(req1.prompt_cache_key, req2.prompt_cache_key);
     }
@@ -1611,7 +1792,7 @@ mod tests {
     fn no_cache_breakpoint_means_no_prompt_cache_key() {
         let prompt = Prompt::user("hi");
         let cfg = Config::builder("gpt-5").build();
-        let req = provider().convert_request(&prompt, cfg.raw());
+        let req = provider().convert_request(&prompt, cfg.raw()).unwrap();
         assert!(req.prompt_cache_key.is_none());
     }
 
@@ -1628,8 +1809,14 @@ mod tests {
         let cfg = Config::builder("gpt-5").build();
         let p1 = make_prompt("system one");
         let p2 = make_prompt("system two");
-        let k1 = provider().convert_request(&p1, cfg.raw()).prompt_cache_key;
-        let k2 = provider().convert_request(&p2, cfg.raw()).prompt_cache_key;
+        let k1 = provider()
+            .convert_request(&p1, cfg.raw())
+            .unwrap()
+            .prompt_cache_key;
+        let k2 = provider()
+            .convert_request(&p2, cfg.raw())
+            .unwrap()
+            .prompt_cache_key;
         assert!(k1.is_some());
         assert_ne!(k1, k2);
     }
@@ -1642,7 +1829,7 @@ mod tests {
             .temperature(0.7)
             .max_tokens(100)
             .build();
-        let openai_request = provider.convert_request(&prompt, cfg.raw());
+        let openai_request = provider.convert_request(&prompt, cfg.raw()).unwrap();
         assert_eq!(openai_request.model, "gpt-4");
         assert_eq!(openai_request.temperature, Some(0.7));
         assert_eq!(openai_request.max_output_tokens, Some(100));
@@ -1653,7 +1840,10 @@ mod tests {
         // The common (no-breakpoint) path short-circuits to None.
         let p = Prompt::system("sys").with_user("hello");
         let cfg = Config::builder("gpt-5").build();
-        let k = provider().convert_request(&p, cfg.raw()).prompt_cache_key;
+        let k = provider()
+            .convert_request(&p, cfg.raw())
+            .unwrap()
+            .prompt_cache_key;
         assert_eq!(k, None);
     }
 
@@ -1756,5 +1946,268 @@ mod tests {
             })
             .expect_err("missing name must error, not fabricate 'unknown'");
         assert!(err.to_string().contains("missing name"), "{err}");
+    }
+
+    // ---------------------------------------------------------------
+    // File-input mapping (UserPart::File) + Files API upload.
+    // ---------------------------------------------------------------
+
+    use crate::{FileInput, InputItem, ProviderFileRef, ProviderType, UserPart};
+
+    /// Build a one-file user prompt and return the serialized `input`
+    /// array's first message's content-parts JSON.
+    fn file_part_json(model: &str, file: FileInput) -> Result<serde_json::Value, Error> {
+        let prompt = Prompt::new().with_item(InputItem::User {
+            content: vec![UserPart::File(file)],
+        });
+        let cfg = Config::builder(model).build();
+        let req = provider().convert_request(&prompt, cfg.raw())?;
+        let json = serde_json::to_value(&req).unwrap();
+        // input[0] is the single user message; its `content` is the
+        // parts array (non-text → never collapsed to a bare string).
+        Ok(json["input"][0]["content"][0].clone())
+    }
+
+    #[test]
+    fn openai_image_bytes_maps_to_data_url_with_real_mime() {
+        let part = file_part_json(
+            "gpt-4o",
+            FileInput::bytes("image/png", bytes::Bytes::from_static(b"PNGDATA")),
+        )
+        .unwrap();
+        assert_eq!(part["type"], "input_image");
+        let url = part["image_url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+        // "PNGDATA" base64 == "UE5HREFUQQ=="
+        assert!(url.ends_with("UE5HREFUQQ=="), "{url}");
+        assert!(part.get("file_id").is_none());
+    }
+
+    #[test]
+    fn openai_image_url_passes_url_through() {
+        let part = file_part_json(
+            "gpt-4o",
+            FileInput::url("image/jpeg", "https://example.com/cat.jpg"),
+        )
+        .unwrap();
+        assert_eq!(part["type"], "input_image");
+        assert_eq!(part["image_url"], "https://example.com/cat.jpg");
+    }
+
+    #[test]
+    fn openai_image_uploaded_references_file_id() {
+        let part = file_part_json(
+            "gpt-4o",
+            FileInput::uploaded(
+                "image/png",
+                ProviderFileRef {
+                    provider: ProviderType::OpenAI,
+                    id: "file-img1".into(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(part["type"], "input_image");
+        assert_eq!(part["file_id"], "file-img1");
+        assert!(part.get("image_url").is_none());
+    }
+
+    #[test]
+    fn openai_document_bytes_maps_to_input_file_data_url() {
+        let part = file_part_json(
+            "gpt-4o",
+            FileInput::bytes("application/pdf", bytes::Bytes::from_static(b"%PDF")),
+        )
+        .unwrap();
+        assert_eq!(part["type"], "input_file");
+        let data = part["file_data"].as_str().unwrap();
+        assert!(data.starts_with("data:application/pdf;base64,"), "{data}");
+    }
+
+    #[test]
+    fn openai_document_url_uses_file_url() {
+        let part = file_part_json(
+            "gpt-4o",
+            FileInput::url("application/pdf", "https://example.com/doc.pdf"),
+        )
+        .unwrap();
+        assert_eq!(part["type"], "input_file");
+        assert_eq!(part["file_url"], "https://example.com/doc.pdf");
+    }
+
+    #[test]
+    fn openai_document_uploaded_references_file_id() {
+        let part = file_part_json(
+            "gpt-4o",
+            FileInput::uploaded(
+                "application/pdf",
+                ProviderFileRef {
+                    provider: ProviderType::OpenAI,
+                    id: "file-doc1".into(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(part["type"], "input_file");
+        assert_eq!(part["file_id"], "file-doc1");
+    }
+
+    #[test]
+    fn openai_audio_bytes_maps_to_input_audio_with_codec_format() {
+        let part = file_part_json(
+            "gpt-4o",
+            FileInput::bytes("audio/mp3", bytes::Bytes::from_static(b"ID3")),
+        )
+        .unwrap();
+        assert_eq!(part["type"], "input_audio");
+        assert_eq!(part["input_audio"]["format"], "mp3");
+        assert!(part["input_audio"]["data"].is_string());
+    }
+
+    #[test]
+    fn openai_audio_url_errors_inline_only() {
+        let err = file_part_json("gpt-4o", FileInput::url("audio/mp3", "https://x/a.mp3"))
+            .expect_err("URL audio must error, not drop");
+        assert!(err.to_string().contains("inline"), "{err}");
+    }
+
+    /// A video file targets a modality OpenAI doesn't accept — must
+    /// error rather than silently drop (files are payload).
+    #[test]
+    fn openai_video_modality_errors() {
+        let err = file_part_json(
+            "gpt-4o",
+            FileInput::bytes("video/mp4", bytes::Bytes::from_static(b"\x00\x00")),
+        )
+        .expect_err("video unsupported on OpenAI → error");
+        assert!(err.to_string().contains("Video"), "{err}");
+    }
+
+    /// An uploaded ref stamped with a different provider must error —
+    /// never leak a wrong-provider id onto the wire.
+    #[test]
+    fn openai_uploaded_wrong_provider_errors() {
+        let err = file_part_json(
+            "gpt-4o",
+            FileInput::uploaded(
+                "image/png",
+                ProviderFileRef {
+                    provider: ProviderType::Google,
+                    id: "files/abc".into(),
+                },
+            ),
+        )
+        .expect_err("wrong-provider id must error");
+        let msg = err.to_string();
+        assert!(msg.contains("Google"), "{msg}");
+        assert!(msg.contains("not OpenAI"), "{msg}");
+    }
+
+    // ---- upload() against a mocked Transport --------------------------
+
+    use crate::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
+
+    /// Canned-response `TransportImpl`: records the request it received
+    /// and replays a fixed status / body. Mirrors the crate's existing
+    /// `StaticTransport` pattern (tests/http_errors_e2e.rs) so `upload`
+    /// is exercised end-to-end without a live API.
+    struct RecordingTransport {
+        status: u16,
+        body: Vec<u8>,
+        seen: std::sync::Arc<std::sync::Mutex<Option<TransportRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TransportImpl for RecordingTransport {
+        async fn send(&self, req: TransportRequest) -> Result<TransportResponse, Error> {
+            *self.seen.lock().unwrap() = Some(req);
+            let body = bytes::Bytes::from(self.body.clone());
+            Ok(TransportResponse {
+                status: self.status,
+                headers: vec![],
+                body: Box::pin(futures_util::stream::iter(vec![Ok(body)])),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_posts_multipart_and_returns_stamped_ref() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let transport = Transport::new(RecordingTransport {
+            status: 200,
+            body: br#"{"id":"file-xyz","object":"file"}"#.to_vec(),
+            seen: seen.clone(),
+        });
+        let provider = OpenAIProvider::with_transport(
+            "sk-test".into(),
+            "https://api.test/v1".into(),
+            transport,
+        );
+
+        let file_ref = provider
+            .upload(
+                bytes::Bytes::from_static(b"hello bytes"),
+                "text/plain",
+                Some("notes.txt"),
+            )
+            .await
+            .expect("upload should succeed");
+
+        assert_eq!(file_ref.provider, ProviderType::OpenAI);
+        assert_eq!(file_ref.id, "file-xyz");
+
+        // Inspect the request the transport actually saw.
+        let req = seen.lock().unwrap().take().expect("a request was sent");
+        assert_eq!(req.url, "https://api.test/v1/files");
+        let ct = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert!(ct.starts_with("multipart/form-data; boundary="), "{ct}");
+        assert!(req
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "Bearer sk-test"));
+        let body = String::from_utf8_lossy(&req.body);
+        assert!(body.contains("name=\"purpose\""), "{body}");
+        assert!(body.contains("user_data"), "{body}");
+        assert!(body.contains("filename=\"notes.txt\""), "{body}");
+        assert!(body.contains("Content-Type: text/plain"), "{body}");
+        assert!(body.contains("hello bytes"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn upload_maps_http_error_to_typed_error() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let transport = Transport::new(RecordingTransport {
+            status: 401,
+            body: br#"{"error":{"message":"Bad key","type":"invalid_request_error"}}"#.to_vec(),
+            seen,
+        });
+        let provider = OpenAIProvider::with_transport(
+            "sk-bad".into(),
+            "https://api.test/v1".into(),
+            transport,
+        );
+        let err = provider
+            .upload(bytes::Bytes::from_static(b"x"), "text/plain", None)
+            .await
+            .expect_err("401 must surface as an error");
+        assert!(matches!(err, Error::Auth { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        use crate::providers::base64_encode;
+        // RFC 4648 test vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 }

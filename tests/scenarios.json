@@ -223,7 +223,7 @@
 
     {
       "name": "multi_modal_image",
-      "description": "User message with an inline 1x1 red PNG. Exercises UserPart::Image base64 wiring on OpenAI (input_image data: URI) and Gemini (inlineData with mime type). Anthropic skipped per testing-gap limitation.",
+      "description": "User message with an inline 1x1 red PNG. Exercises UserPart::File (image bytes) wiring on OpenAI (input_image data: URI) and Gemini (inlineData with mime type). Anthropic skipped per testing-gap limitation.",
       "max_tokens": 256,
       "providers": {
         "anthropic": { "skip": true }

@@ -18,6 +18,8 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
+use crate::ProviderType;
+
 /// A single item in a conversation history.
 ///
 /// Each item is one logical turn. The variant encodes the role; the
@@ -98,12 +100,11 @@ impl InputItem {
 pub enum UserPart {
     /// Plain text content.
     Text(String),
-    /// Image input by URL or inline base64.
-    Image(ImageSource),
-    /// Audio input by URL or inline base64.
-    Audio(AudioSource),
-    /// Document (e.g. PDF) input by URL or inline base64.
-    Document(DocumentSource),
+    /// File input — image, audio, video, or document. The modality is
+    /// derived from [`FileInput::mime_type`] by [`modality_from_mime`]
+    /// (providers map per-modality and the capability check gates on it),
+    /// so a single variant carries every binary input kind.
+    File(FileInput),
     /// Result of a tool the assistant previously called. `call_id`
     /// correlates with a prior `AssistantPart::ToolCall`.
     ToolResult {
@@ -221,46 +222,117 @@ pub enum AnnotationKind {
     FileCitation,
 }
 
-/// Source for an image input.
+/// A file input to the model — image, audio, video, or document.
+///
+/// `mime_type` is top-level and authoritative: every provider mapping
+/// carries it onto the wire verbatim, so a `gs://` or HTTP URL is no
+/// longer forced to a hard-coded MIME the way the old per-kind `Url`
+/// variants were. The modality (image / audio / video / document) is
+/// derived from it via [`modality_from_mime`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ImageSource {
-    /// HTTP(S) URL the provider will fetch.
-    Url(String),
-    /// Inline base64-encoded payload.
-    Base64 {
-        /// Base64-encoded image bytes.
-        data: String,
-        /// MIME type (e.g. `image/png`, `image/jpeg`).
-        media_type: String,
-    },
+pub struct FileInput {
+    /// The file's MIME type (e.g. `image/png`, `audio/mpeg`,
+    /// `application/pdf`). Authoritative — providers send this exact
+    /// value, and the modality / capability gate is derived from it.
+    pub mime_type: String,
+    /// Where the bytes come from.
+    pub source: FileSource,
 }
 
-/// Source for an audio input.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AudioSource {
-    /// HTTP(S) URL the provider will fetch.
-    Url(String),
-    /// Inline base64-encoded payload.
-    Base64 {
-        /// Base64-encoded audio bytes.
-        data: String,
-        /// MIME type (e.g. `audio/mpeg`, `audio/wav`).
-        media_type: String,
-    },
+impl FileInput {
+    /// Build a [`FileInput`] from inline bytes and a MIME type.
+    pub fn bytes(mime_type: impl Into<String>, bytes: impl Into<bytes::Bytes>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            source: FileSource::Bytes(bytes.into()),
+        }
+    }
+
+    /// Build a [`FileInput`] referencing a fetch-by-URL source. For
+    /// Gemini-via-Vertex this is the only place `gs://` URIs work; for
+    /// OpenAI / Anthropic it is an HTTP(S) URL the provider fetches.
+    pub fn url(mime_type: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            source: FileSource::Url(url.into()),
+        }
+    }
+
+    /// Build a [`FileInput`] referencing a previously
+    /// [`Provider::upload`](crate::Provider::upload)ed provider file.
+    pub fn uploaded(mime_type: impl Into<String>, file_ref: ProviderFileRef) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            source: FileSource::Uploaded(file_ref),
+        }
+    }
+
+    /// The modality this file represents, derived from [`Self::mime_type`].
+    pub fn modality(&self) -> Modality {
+        modality_from_mime(&self.mime_type)
+    }
 }
 
-/// Source for a document input (PDF, etc.).
+/// Where a [`FileInput`]'s bytes come from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DocumentSource {
-    /// HTTP(S) URL the provider will fetch.
+pub enum FileSource {
+    /// Inline bytes — sent as base64 in the provider's inline format.
+    Bytes(bytes::Bytes),
+    /// A URL the provider fetches. HTTP(S) on OpenAI / Anthropic;
+    /// additionally `gs://` Cloud Storage URIs on Gemini-via-Vertex
+    /// (`fileData.fileUri`).
     Url(String),
-    /// Inline base64-encoded payload.
-    Base64 {
-        /// Base64-encoded document bytes.
-        data: String,
-        /// MIME type (e.g. `application/pdf`).
-        media_type: String,
-    },
+    /// A file already uploaded to a provider's Files API, referenced by
+    /// id. The [`ProviderFileRef::provider`] stamp is validated against
+    /// the sending provider so a wrong-provider id can't silently leak
+    /// onto the wire.
+    Uploaded(ProviderFileRef),
+}
+
+/// A handle to a file uploaded to a specific provider's Files API,
+/// returned by [`Provider::upload`](crate::Provider::upload). The
+/// `provider` stamp records which provider owns `id`; providers reject a
+/// reference whose `provider` doesn't match their own type rather than
+/// sending an id the upstream won't recognise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderFileRef {
+    /// Which provider this file id belongs to.
+    pub provider: ProviderType,
+    /// The provider-assigned file identifier (e.g. OpenAI's `file-…`).
+    pub id: String,
+}
+
+/// The coarse modality of a file input, derived from its MIME type by
+/// [`modality_from_mime`]. Providers map per-modality and the
+/// capability gate (`Capabilities::files`) is keyed on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modality {
+    /// `image/*`.
+    Image,
+    /// `audio/*`.
+    Audio,
+    /// `video/*`.
+    Video,
+    /// Anything else (`application/pdf`, `text/*`, …) — treated as a
+    /// document.
+    Document,
+}
+
+/// Derive the [`Modality`] from a MIME type by its top-level type:
+/// `image/*` → image, `audio/*` → audio, `video/*` → video; everything
+/// else (PDFs, text, office formats) → document. Comparison is
+/// case-insensitive on the top-level type.
+pub fn modality_from_mime(mime_type: &str) -> Modality {
+    let top = mime_type.split('/').next().unwrap_or("");
+    if top.eq_ignore_ascii_case("image") {
+        Modality::Image
+    } else if top.eq_ignore_ascii_case("audio") {
+        Modality::Audio
+    } else if top.eq_ignore_ascii_case("video") {
+        Modality::Video
+    } else {
+        Modality::Document
+    }
 }
 
 /// Tool definition the model can call.
@@ -422,4 +494,69 @@ pub enum FinishReason {
     /// so callers driving tool-call loops or billing don't mistake a
     /// truncated turn for a clean finish.
     Incomplete,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modality_from_mime_splits_on_top_level_type() {
+        assert_eq!(modality_from_mime("image/png"), Modality::Image);
+        assert_eq!(modality_from_mime("image/jpeg"), Modality::Image);
+        assert_eq!(modality_from_mime("audio/mpeg"), Modality::Audio);
+        assert_eq!(modality_from_mime("audio/wav"), Modality::Audio);
+        assert_eq!(modality_from_mime("video/mp4"), Modality::Video);
+        assert_eq!(modality_from_mime("video/webm"), Modality::Video);
+    }
+
+    #[test]
+    fn modality_from_mime_treats_non_media_as_document() {
+        // PDFs, office formats, text and bare/garbage values all map to
+        // Document — the catch-all branch.
+        for m in [
+            "application/pdf",
+            "text/plain",
+            "text/csv",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/octet-stream",
+            "",
+            "notamime",
+        ] {
+            assert_eq!(modality_from_mime(m), Modality::Document, "{m}");
+        }
+    }
+
+    #[test]
+    fn modality_from_mime_is_case_insensitive_on_top_level() {
+        assert_eq!(modality_from_mime("IMAGE/PNG"), Modality::Image);
+        assert_eq!(modality_from_mime("Audio/Mpeg"), Modality::Audio);
+        assert_eq!(modality_from_mime("VIDEO/mp4"), Modality::Video);
+    }
+
+    #[test]
+    fn file_input_helpers_build_expected_sources() {
+        let b = FileInput::bytes("image/png", bytes::Bytes::from_static(b"\x89PNG"));
+        assert_eq!(b.mime_type, "image/png");
+        assert_eq!(b.modality(), Modality::Image);
+        assert!(matches!(b.source, FileSource::Bytes(_)));
+
+        let u = FileInput::url("application/pdf", "gs://bucket/doc.pdf");
+        assert_eq!(u.modality(), Modality::Document);
+        match u.source {
+            FileSource::Url(ref s) => assert_eq!(s, "gs://bucket/doc.pdf"),
+            _ => panic!("expected Url source"),
+        }
+
+        let r = ProviderFileRef {
+            provider: ProviderType::OpenAI,
+            id: "file-abc".into(),
+        };
+        let up = FileInput::uploaded("audio/mpeg", r.clone());
+        assert_eq!(up.modality(), Modality::Audio);
+        match up.source {
+            FileSource::Uploaded(ref got) => assert_eq!(got, &r),
+            _ => panic!("expected Uploaded source"),
+        }
+    }
 }

@@ -17,8 +17,9 @@ pub use config::{
     ReasoningSummary, ResponseFormat, ToolChoice, Usage,
 };
 pub use message::{
-    Annotation, AnnotationKind, AssistantPart, AudioSource, ComputerUseConfig, DocumentSource,
-    FinishReason, Function, FunctionCall, ImageSource, InputItem, ProviderBuiltin, Tool, UserPart,
+    modality_from_mime, Annotation, AnnotationKind, AssistantPart, ComputerUseConfig, FileInput,
+    FileSource, FinishReason, Function, FunctionCall, InputItem, Modality, ProviderBuiltin,
+    ProviderFileRef, Tool, UserPart,
 };
 pub use prompt::Prompt;
 pub use streaming::{PartKind, PartUpdate, StreamEvent};

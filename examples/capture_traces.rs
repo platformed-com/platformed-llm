@@ -297,6 +297,47 @@ impl TransportImpl for RecordingTransport {
 /// so tokenization is realistic; each word is roughly one token, so
 /// `target_bytes` ≈ `4 * target_tokens` for the languages most
 /// frontier models train on.
+/// Decode standard base64 (RFC 4648, with padding) into raw bytes.
+/// Scenario attachments store image payloads as base64; the canonical
+/// message model carries raw bytes, so the capture tool decodes here.
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let mut buf = [0u8; 4];
+        let mut n = 0;
+        for (i, &c) in chunk.iter().enumerate() {
+            if c == b'=' {
+                break;
+            }
+            buf[i] = val(c).ok_or_else(|| format!("invalid base64 char: {c}"))?;
+            n += 1;
+        }
+        let acc =
+            (buf[0] as u32) << 18 | (buf[1] as u32) << 12 | (buf[2] as u32) << 6 | (buf[3] as u32);
+        if n >= 2 {
+            out.push((acc >> 16) as u8);
+        }
+        if n >= 3 {
+            out.push((acc >> 8) as u8);
+        }
+        if n >= 4 {
+            out.push(acc as u8);
+        }
+    }
+    Ok(out)
+}
+
 fn oversize_filler(seed: &str, target_bytes: usize) -> String {
     const FILLER: &str = " Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.";
     let mut out = String::with_capacity(target_bytes + seed.len());
@@ -369,13 +410,17 @@ fn scenario_to_llm_request(
                 for att in &m.attachments {
                     match att {
                         ScenarioAttachment::Image { data, media_type } => {
-                            content.push(UserPart::Image(platformed_llm::ImageSource::Base64 {
-                                data: data.clone(),
-                                media_type: media_type.clone(),
-                            }));
+                            // Scenario `data` is base64; the canonical
+                            // model carries raw bytes, so decode here.
+                            let raw = base64_decode(data).expect("scenario image data is base64");
+                            content.push(UserPart::File(platformed_llm::FileInput::bytes(
+                                media_type.clone(),
+                                raw,
+                            )));
                         }
                         ScenarioAttachment::ImageUrl { url } => {
-                            content.push(UserPart::Image(platformed_llm::ImageSource::Url(
+                            content.push(UserPart::File(platformed_llm::FileInput::url(
+                                "image/*",
                                 url.clone(),
                             )));
                         }

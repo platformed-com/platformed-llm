@@ -54,8 +54,13 @@ pub enum OpenAIContentPart {
         text: String,
     },
     InputImage {
+        /// Inline data-URL or external image URL. Mutually exclusive
+        /// with `file_id` (an uploaded image is referenced by id).
         #[serde(skip_serializing_if = "Option::is_none")]
         image_url: Option<String>,
+        /// Id of an image uploaded via the Files API.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
     },
     InputAudio {
         input_audio: OpenAIInputAudio,
@@ -67,6 +72,9 @@ pub enum OpenAIContentPart {
         file_data: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
+        /// Id of a document uploaded via the Files API.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
     },
 }
 

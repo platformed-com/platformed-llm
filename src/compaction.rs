@@ -887,7 +887,7 @@ mod tests {
     /// and re-serialize.
     #[tokio::test]
     async fn multipart_user_tail_preserves_every_part_verbatim() {
-        use crate::ImageSource;
+        use crate::FileInput;
         let provider = MockProvider::builder()
             .reply(MockResponse::text("memo body"))
             .build();
@@ -895,7 +895,7 @@ mod tests {
         let multipart_tail = InputItem::User {
             content: vec![
                 UserPart::Text("look at this:".into()),
-                UserPart::Image(ImageSource::Url("https://example.com/img.png".into())),
+                UserPart::File(FileInput::url("image/png", "https://example.com/img.png")),
                 UserPart::CacheBreakpoint,
                 UserPart::Text("what do you see?".into()),
             ],
@@ -924,7 +924,7 @@ mod tests {
                         (UserPart::Text(at), UserPart::Text(et)) => {
                             assert_eq!(at, et, "text part {i} drifted")
                         }
-                        (UserPart::Image(_), UserPart::Image(_)) => {}
+                        (UserPart::File(_), UserPart::File(_)) => {}
                         (UserPart::CacheBreakpoint, UserPart::CacheBreakpoint) => {}
                         (a, e) => panic!("part {i} variant changed: {a:?} vs {e:?}"),
                     }

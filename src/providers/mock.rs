@@ -830,6 +830,19 @@ mod tests {
         assert_eq!(calls[0].prompt.items().len(), 1);
     }
 
+    /// The mock provider has no Files API; it inherits the trait's
+    /// default `upload`, which reports the operation unsupported.
+    #[tokio::test]
+    async fn mock_upload_is_unsupported() {
+        let provider = MockProvider::with_text("ok");
+        let err = provider
+            .upload(bytes::Bytes::from_static(b"x"), "text/plain", None)
+            .await
+            .expect_err("mock has no Files API");
+        assert!(matches!(err, Error::Config(_)), "got: {err:?}");
+        assert!(err.to_string().contains("does not support file uploads"));
+    }
+
     #[tokio::test]
     async fn raw_events_emitted_verbatim() {
         let provider = MockProvider::builder()
