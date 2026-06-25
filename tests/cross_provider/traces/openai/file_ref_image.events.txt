@@ -1,0 +1,27 @@
+PartStart[0] text
+Delta[0] "The"
+Delta[0] " image"
+Delta[0] " is"
+Delta[0] " a"
+Delta[0] " plain"
+Delta[0] ","
+Delta[0] " bright"
+Delta[0] " yellow"
+Delta[0] " background"
+Delta[0] " with"
+Delta[0] " no"
+Delta[0] " other"
+Delta[0] " details"
+Delta[0] " or"
+Delta[0] " objects"
+Delta[0] " present"
+Delta[0] "."
+PartEnd[0]
+PartStart[1] continuation kind=OpenAI id=<n>
+PartEnd[1]
+Done finish=Stop input=<n> output=<n>
+
+=== final ===
+finish=Stop
+part[0] text "The image is a plain, bright yellow background with no other details or objects present." annotations=0
+part[1] continuation kind=OpenAI id=<n>

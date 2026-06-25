@@ -1,0 +1,4 @@
+{
+  "gs_uri": "<captured-file-handle>",
+  "note": "GCS object metadata omitted (volatile); the gs:// URI is referenced via request fileData.fileUri"
+}

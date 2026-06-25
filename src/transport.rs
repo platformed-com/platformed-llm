@@ -62,6 +62,39 @@ pub struct TransportRequest {
     pub body: Vec<u8>,
 }
 
+/// HTTP method for a streaming [`UploadRequest`]. File-upload endpoints use
+/// `POST` (multipart create) or `PUT` (resumable-session data).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// HTTP `POST`.
+    Post,
+    /// HTTP `PUT`.
+    Put,
+}
+
+/// A streaming-body request used for **file uploads** — the one place the
+/// library must not buffer the whole payload in memory.
+///
+/// Kept separate from [`TransportRequest`] (which stays buffered + `Clone`
+/// for the `generate` path) so the streaming body — which is single-use and
+/// neither `Clone` nor `Debug` — never infects that path. The library never
+/// replays an upload body; on retry it re-opens a fresh stream via
+/// [`FileResolver::open`](crate::FileResolver::open).
+pub struct UploadRequest {
+    /// HTTP method.
+    pub method: Method,
+    /// Full request URL.
+    pub url: String,
+    /// Request headers (case preserved as supplied).
+    pub headers: Vec<(String, String)>,
+    /// Total body length when known. Enables `Content-Length`; `None` falls
+    /// back to chunked transfer-encoding.
+    pub content_length: Option<u64>,
+    /// Streaming request body. Mirrors [`TransportResponse::body`]; dropping
+    /// it mid-flight must terminate the upload cleanly.
+    pub body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
+}
+
 /// A streaming response yielded by a [`Transport`].
 ///
 /// Status and headers are read eagerly (cheap), but the body is exposed as
@@ -127,6 +160,21 @@ pub trait TransportImpl: Send + Sync + 'static {
     /// Issue an HTTP request and return a streaming response. Implementations
     /// must propagate cancellation through the returned body stream.
     async fn send(&self, req: TransportRequest) -> Result<TransportResponse, Error>;
+
+    /// Issue a streaming-body request (file upload) and return the response.
+    ///
+    /// Default implementation errors — only transports that genuinely talk
+    /// HTTP (e.g. [`ReqwestTransport`]) need to support uploads; mocks and
+    /// replayers can ignore it. Implementations must stream `req.body`
+    /// without buffering it whole and propagate cancellation.
+    async fn send_upload(&self, req: UploadRequest) -> Result<TransportResponse, Error> {
+        // Drop the body stream (closing any underlying source) and report
+        // that this transport can't upload.
+        drop(req);
+        Err(Error::config(
+            "this transport does not support file uploads (send_upload)",
+        ))
+    }
 }
 
 /// The shared transport handle that providers store. Cheap to clone
@@ -171,6 +219,11 @@ impl Transport {
     /// Send a request via the underlying transport.
     pub async fn send(&self, req: TransportRequest) -> Result<TransportResponse, Error> {
         self.inner.send(req).await
+    }
+
+    /// Send a streaming-body upload request via the underlying transport.
+    pub async fn send_upload(&self, req: UploadRequest) -> Result<TransportResponse, Error> {
+        self.inner.send_upload(req).await
     }
 }
 
@@ -232,6 +285,45 @@ impl TransportImpl for ReqwestTransport {
         // Map reqwest's per-chunk stream error onto ours. Dropping this
         // boxed stream drops the underlying reqwest body, which closes
         // the connection — preserving the cancellation contract.
+        let body = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|e| Error::streaming(format!("transport: {e}"))));
+        let body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> = Box::pin(body);
+
+        Ok(TransportResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    async fn send_upload(&self, req: UploadRequest) -> Result<TransportResponse, Error> {
+        let mut builder = match req.method {
+            Method::Post => self.client.post(&req.url),
+            Method::Put => self.client.put(&req.url),
+        };
+        for (k, v) in &req.headers {
+            builder = builder.header(k, v);
+        }
+        if let Some(len) = req.content_length {
+            builder = builder.header("content-length", len);
+        }
+        // wrap_stream streams the body to the wire without buffering it whole;
+        // dropping the response (and thus this request future) cancels it.
+        builder = builder.body(reqwest::Body::wrap_stream(req.body));
+
+        let response = builder.send().await?;
+
+        let status = response.status().as_u16();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (k.as_str().to_string(), s.to_string()))
+            })
+            .collect();
         let body = response
             .bytes_stream()
             .map(|chunk| chunk.map_err(|e| Error::streaming(format!("transport: {e}"))));

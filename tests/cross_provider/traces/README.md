@@ -44,6 +44,30 @@ cargo run --example capture_traces -- openai function_call
 Captures are committed to git so the test suite is reproducible without
 network access.
 
+### File-upload scenarios (`file_ref_image`)
+
+The `file_ref_image` scenario exercises the lazy file-upload path
+(`UserPart::Image(FileSource::Ref)`): the lib uploads `tests/fixtures/`
+to the provider and references the returned handle.
+
+- **OpenAI** uploads to `POST /v1/files` — captured automatically.
+- **Gemini** uploads to a GCS bucket. Set `GOOGLE_GCS_BUCKET` to a bucket
+  in the same project the test service account can write to (the team
+  default is `will_dev_bucket`); the Gemini capture is skipped otherwise:
+
+  ```sh
+  GOOGLE_GCS_BUCKET=will_dev_bucket \
+    cargo run --example capture_traces -- openai google file_ref_image
+  ```
+
+- **Anthropic-via-Vertex** has no Files API, so it's skipped.
+
+The capture is self-cleaning and deterministic: every uploaded object is
+**deleted** after the run (no orphans accumulate), and the recorded
+`request.json` / `upload.response.json` substitute a
+`<captured-file-handle>` placeholder for the volatile id / `gs://` URI —
+so re-captures don't churn the fixtures or commit a real bucket name.
+
 ## Replaying
 
 ```sh

@@ -1,16 +1,28 @@
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use ijson::{ijson, IValue};
 use serde_json::value::RawValue;
 use uuid::Uuid;
 
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+
 use super::endpoint::VertexEndpoint;
 use super::google_types::*;
+use crate::factory::ProviderType;
 use crate::provider::Provider;
+use crate::providers::file_resolve::{
+    media_type_extension, percent_encode, resolve_refs, NoLibraryUpload, ProviderUploader,
+    ResolvedRef,
+};
 use crate::sse_stream::SseStream;
-use crate::transport::{Transport, TransportRequest};
+use crate::transport::{Method, Transport, TransportRequest, UploadRequest};
 use crate::types::{
-    Annotation, AnnotationKind, AssistantPart, FinishReason, InputItem, PartKind, PartUpdate,
-    UserPart,
+    Annotation, AnnotationKind, AssistantPart, FileResolver, FileSource, FinishReason, InputItem,
+    PartKind, PartUpdate, ProviderScope, ResolvedHandle, UserPart,
 };
 use crate::{Error, RawConfig, Response, StreamEvent};
 
@@ -18,6 +30,16 @@ use crate::{Error, RawConfig, Response, StreamEvent};
 pub struct GoogleProvider {
     endpoint: VertexEndpoint,
     transport: Transport,
+    /// Optional caller-held file registry for resolving `Ref` file inputs.
+    file_resolver: Option<Arc<dyn FileResolver>>,
+    /// Cloud Storage bucket the lib uploads streamed `Ref` files into. When
+    /// set, a `Ref` resolving to a stream is uploaded to GCS (using the same
+    /// Vertex OAuth token) and referenced as a `gs://` URI. When unset, a
+    /// streamed `Ref` is rejected (caller must supply a handle/URL).
+    gcs_bucket: Option<String>,
+    /// Optional object-name prefix for uploaded files (default
+    /// `platformed-llm/`).
+    gcs_prefix: Option<String>,
 }
 
 impl GoogleProvider {
@@ -26,6 +48,9 @@ impl GoogleProvider {
         Ok(Self {
             endpoint: VertexEndpoint::with_access_token(project_id, location, access_token),
             transport: Transport::reqwest()?,
+            file_resolver: None,
+            gcs_bucket: None,
+            gcs_prefix: None,
         })
     }
 
@@ -40,6 +65,9 @@ impl GoogleProvider {
             endpoint: VertexEndpoint::with_access_token(project_id, location, access_token)
                 .with_base_url(base_url),
             transport: Transport::reqwest()?,
+            file_resolver: None,
+            gcs_bucket: None,
+            gcs_prefix: None,
         })
     }
 
@@ -48,6 +76,9 @@ impl GoogleProvider {
         Ok(Self {
             endpoint: VertexEndpoint::with_adc(project_id, location).await?,
             transport: Transport::reqwest()?,
+            file_resolver: None,
+            gcs_bucket: None,
+            gcs_prefix: None,
         })
     }
 
@@ -58,7 +89,56 @@ impl GoogleProvider {
         Self {
             endpoint,
             transport,
+            file_resolver: None,
+            gcs_bucket: None,
+            gcs_prefix: None,
         }
+    }
+
+    /// Attach a [`FileResolver`] so the provider can resolve
+    /// [`FileSource::Ref`](crate::FileSource::Ref) file inputs.
+    ///
+    /// If a [GCS bucket is configured](Self::with_gcs_bucket), a `Ref` that
+    /// resolves to a stream is uploaded to Cloud Storage (using the same
+    /// Vertex OAuth token) and referenced as a `gs://` URI. Otherwise the
+    /// resolver must return a durable `gs://` URI via
+    /// [`ResolvedFile::ProviderHandle`](crate::ResolvedFile::ProviderHandle)
+    /// (or, for a genuinely public file, a public URL via
+    /// [`ResolvedFile::Url`](crate::ResolvedFile::Url)); a streaming payload is
+    /// rejected.
+    pub fn with_file_resolver(mut self, resolver: Arc<dyn FileResolver>) -> Self {
+        self.file_resolver = Some(resolver);
+        self
+    }
+
+    /// Configure the Cloud Storage bucket the lib uploads streamed `Ref` files
+    /// into. The bucket must live in the same GCP project as the Vertex
+    /// endpoint (Gemini only fetches `gs://` objects from the requesting
+    /// project, or publicly-readable ones). Uploads reuse the endpoint's
+    /// OAuth token — the `cloud-platform` scope covers both Vertex and GCS.
+    pub fn with_gcs_bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.gcs_bucket = Some(bucket.into());
+        self
+    }
+
+    /// Override the object-name prefix for uploaded files. Defaults to
+    /// `platformed-llm/`. A trailing `/` makes it a folder.
+    pub fn with_gcs_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.gcs_prefix = Some(prefix.into());
+        self
+    }
+
+    /// The [`ProviderScope`] file handles are valid within — the GCP
+    /// project + region.
+    fn scope(&self) -> ProviderScope {
+        ProviderScope::new(
+            ProviderType::Google,
+            format!(
+                "{}/{}",
+                self.endpoint.project_id(),
+                self.endpoint.location()
+            ),
+        )
     }
 
     /// Swap the static access token before it expires (GCP tokens
@@ -69,10 +149,14 @@ impl GoogleProvider {
     }
 
     /// Convert internal request to Google format.
+    ///
+    /// `resolved` maps each file-`Ref` id to its wire-ready reference, built
+    /// by the async [`resolve_refs`] pre-pass in [`Self::generate`].
     fn convert_request(
         &self,
         prompt: &crate::Prompt,
         config: &RawConfig,
+        resolved: &HashMap<String, ResolvedRef>,
     ) -> Result<GoogleRequest, Error> {
         let messages = prompt.items();
 
@@ -191,62 +275,30 @@ impl GoogleProvider {
                                     },
                                 );
                             }
+                            // Image / audio / document / video all map the same
+                            // way (inlineData for base64, fileData for URL/Ref);
+                            // only the fallback MIME differs.
                             UserPart::Image(src) => {
-                                let part = match src {
-                                    crate::types::ImageSource::Base64 { data, media_type } => {
-                                        GooglePart::InlineData {
-                                            inline_data: GoogleInlineData {
-                                                mime_type: media_type.clone(),
-                                                data: data.clone(),
-                                            },
-                                        }
-                                    }
-                                    crate::types::ImageSource::Url(u) => GooglePart::FileData {
-                                        file_data: GoogleFileData {
-                                            mime_type: "image/*".to_string(),
-                                            file_uri: u.clone(),
-                                        },
-                                    },
-                                };
-                                push_part(&mut contents, "user", part);
+                                if let Some(part) = file_source_to_part(src, "image/*", resolved) {
+                                    push_part(&mut contents, "user", part);
+                                }
                             }
                             UserPart::Audio(src) => {
-                                let part = match src {
-                                    crate::types::AudioSource::Base64 { data, media_type } => {
-                                        GooglePart::InlineData {
-                                            inline_data: GoogleInlineData {
-                                                mime_type: media_type.clone(),
-                                                data: data.clone(),
-                                            },
-                                        }
-                                    }
-                                    crate::types::AudioSource::Url(u) => GooglePart::FileData {
-                                        file_data: GoogleFileData {
-                                            mime_type: "audio/*".to_string(),
-                                            file_uri: u.clone(),
-                                        },
-                                    },
-                                };
-                                push_part(&mut contents, "user", part);
+                                if let Some(part) = file_source_to_part(src, "audio/*", resolved) {
+                                    push_part(&mut contents, "user", part);
+                                }
                             }
                             UserPart::Document(src) => {
-                                let part = match src {
-                                    crate::types::DocumentSource::Base64 { data, media_type } => {
-                                        GooglePart::InlineData {
-                                            inline_data: GoogleInlineData {
-                                                mime_type: media_type.clone(),
-                                                data: data.clone(),
-                                            },
-                                        }
-                                    }
-                                    crate::types::DocumentSource::Url(u) => GooglePart::FileData {
-                                        file_data: GoogleFileData {
-                                            mime_type: "application/pdf".to_string(),
-                                            file_uri: u.clone(),
-                                        },
-                                    },
-                                };
-                                push_part(&mut contents, "user", part);
+                                if let Some(part) =
+                                    file_source_to_part(src, "application/pdf", resolved)
+                                {
+                                    push_part(&mut contents, "user", part);
+                                }
+                            }
+                            UserPart::Video(src) => {
+                                if let Some(part) = file_source_to_part(src, "video/*", resolved) {
+                                    push_part(&mut contents, "user", part);
+                                }
                             }
                             UserPart::CacheBreakpoint => {
                                 // Gemini uses a separate cachedContent
@@ -708,7 +760,22 @@ impl Provider for GoogleProvider {
         prompt: &crate::Prompt,
         config: &RawConfig,
     ) -> Result<Response, Error> {
-        let google_request = self.convert_request(prompt, config)?;
+        // Upload streamed Refs to GCS when a bucket is configured; otherwise
+        // require the resolver to supply a durable handle/URL.
+        let no_upload = NoLibraryUpload { provider: "Google" };
+        let uploader: &dyn ProviderUploader = if self.gcs_bucket.is_some() {
+            self
+        } else {
+            &no_upload
+        };
+        let resolved = resolve_refs(
+            prompt.items(),
+            &self.scope(),
+            self.file_resolver.as_deref(),
+            uploader,
+        )
+        .await?;
+        let google_request = self.convert_request(prompt, config, &resolved)?;
 
         let url = self.endpoint.url(
             "google",
@@ -806,6 +873,121 @@ impl Provider for GoogleProvider {
             .flatten();
 
         Ok(Response::from_stream(event_stream))
+    }
+}
+
+/// Cloud Storage JSON-API upload host. Auth is the same `cloud-platform`
+/// bearer used for Vertex.
+const GCS_UPLOAD_HOST: &str = "https://storage.googleapis.com";
+
+#[async_trait]
+impl ProviderUploader for GoogleProvider {
+    /// Stream `body` to a Cloud Storage object and return its `gs://` URI.
+    ///
+    /// Uses the GCS JSON API single-request media upload
+    /// (`uploadType=media`), authenticated with the endpoint's Vertex OAuth
+    /// token. The object lives in the configured bucket under the configured
+    /// prefix with a random name; Gemini reads it via `fileData.fileUri`.
+    async fn upload(
+        &self,
+        media_type: &str,
+        content_length: Option<u64>,
+        body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
+    ) -> Result<ResolvedHandle, Error> {
+        let bucket = self.gcs_bucket.as_deref().ok_or_else(|| {
+            Error::config("GoogleProvider GCS upload called without a configured bucket")
+        })?;
+        let prefix = self.gcs_prefix.as_deref().unwrap_or("platformed-llm/");
+        let object = match media_type_extension(media_type) {
+            "" => format!("{prefix}{}", Uuid::new_v4()),
+            ext => format!("{prefix}{}.{ext}", Uuid::new_v4()),
+        };
+        let url = format!(
+            "{GCS_UPLOAD_HOST}/upload/storage/v1/b/{bucket}/o?uploadType=media&name={}",
+            percent_encode(&object),
+        );
+        let headers = vec![
+            self.endpoint.auth_header().await?,
+            ("Content-Type".to_string(), media_type.to_string()),
+        ];
+        let req = UploadRequest {
+            method: Method::Post,
+            url,
+            headers,
+            content_length,
+            body,
+        };
+        let response = self.transport.send_upload(req).await?;
+        let status = response.status;
+        let bytes = response.collect_body().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            let body_str = String::from_utf8_lossy(&bytes).into_owned();
+            return Err(Error::provider_with_status(
+                "Google",
+                status,
+                format!("GCS upload failed: {body_str}"),
+            ));
+        }
+        Ok(ResolvedHandle {
+            uri: format!("gs://{bucket}/{object}"),
+            media_type: media_type.to_string(),
+            expires_at: None,
+        })
+    }
+}
+
+/// Convert a [`FileSource`] (any modality) to a Gemini part: `inlineData` for
+/// inline base64, `fileData` for a URL or a resolved `Ref`. `fallback_mime` is
+/// used for URL/Ref inputs that don't carry their own MIME type.
+fn file_source_to_part(
+    src: &FileSource,
+    fallback_mime: &str,
+    resolved: &HashMap<String, ResolvedRef>,
+) -> Option<GooglePart> {
+    match src {
+        FileSource::Base64 { data, media_type } => Some(GooglePart::InlineData {
+            inline_data: GoogleInlineData {
+                mime_type: media_type.clone(),
+                data: data.clone(),
+            },
+        }),
+        FileSource::Url(u) => Some(GooglePart::FileData {
+            file_data: GoogleFileData {
+                mime_type: fallback_mime.to_string(),
+                file_uri: u.clone(),
+            },
+        }),
+        FileSource::Ref(id) => ref_to_file_data(resolved, id, fallback_mime),
+    }
+}
+
+/// Resolve a file `Ref` to a Gemini `fileData` part, or `None` (logged) when
+/// the id wasn't resolved. Both handle and URL results become a `fileData`
+/// `fileUri` — a `gs://` or `https` URI Vertex fetches at request time.
+fn ref_to_file_data(
+    resolved: &HashMap<String, ResolvedRef>,
+    id: &str,
+    fallback_mime: &str,
+) -> Option<GooglePart> {
+    match resolved.get(id) {
+        Some(ResolvedRef::Handle { uri, media_type })
+        | Some(ResolvedRef::Url { uri, media_type }) => {
+            let mime = if media_type.is_empty() {
+                fallback_mime.to_string()
+            } else {
+                media_type.clone()
+            };
+            Some(GooglePart::FileData {
+                file_data: GoogleFileData {
+                    mime_type: mime,
+                    file_uri: uri.clone(),
+                },
+            })
+        }
+        None => {
+            tracing::debug!("Gemini: unresolved file Ref {id}; dropping");
+            None
+        }
     }
 }
 
@@ -1239,7 +1421,9 @@ mod tests {
                 .unwrap();
         let prompt = crate::Prompt::user("hi");
         let cfg = Config::builder("gemini").build();
-        let body = provider.convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         assert_eq!(body.contents.len(), 1);
         assert_eq!(body.contents[0].role, "user");
     }
@@ -1251,7 +1435,9 @@ mod tests {
                 .unwrap();
         let prompt = crate::Prompt::system("you are helpful").with_user("hi");
         let cfg = Config::builder("gemini").build();
-        let body = provider.convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         let role = json["systemInstruction"]["role"].as_str();
         assert!(
@@ -1294,12 +1480,69 @@ mod tests {
         let cfg = Config::builder("gemini")
             .stop(vec!["END".to_string(), "STOP".to_string()])
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["generationConfig"]["stopSequences"],
             serde_json::json!(["END", "STOP"]),
         );
+    }
+
+    /// A resolved document `Ref` lands as a `fileData` part carrying the
+    /// resolved URI and real MIME type (handle and URL both map here).
+    #[test]
+    fn resolved_ref_emits_file_data() {
+        use crate::providers::file_resolve::ResolvedRef;
+        use crate::types::{FileSource, InputItem, UserPart};
+
+        let prompt = crate::Prompt::new().with_item(InputItem::User {
+            content: vec![UserPart::Document(FileSource::Ref("doc1".into()))],
+        });
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(
+            "doc1".to_string(),
+            ResolvedRef::Handle {
+                uri: "gs://bucket/x.pdf".into(),
+                media_type: "application/pdf".into(),
+            },
+        );
+        let cfg = Config::builder("gemini").build();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &resolved)
+            .unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let part = &json["contents"][0]["parts"][0]["fileData"];
+        assert_eq!(part["fileUri"], "gs://bucket/x.pdf");
+        assert_eq!(part["mimeType"], "application/pdf");
+    }
+
+    /// Video inputs map like the other modalities: a URL → `fileData` (with the
+    /// `video/*` fallback mime), inline base64 → `inlineData`.
+    #[test]
+    fn video_maps_to_gemini_parts() {
+        use crate::types::{FileSource, InputItem, UserPart};
+
+        let prompt = crate::Prompt::new().with_item(InputItem::User {
+            content: vec![
+                UserPart::Video(FileSource::Url("gs://bucket/clip.mp4".into())),
+                UserPart::Video(FileSource::Base64 {
+                    data: "AAAA".into(),
+                    media_type: "video/mp4".into(),
+                }),
+            ],
+        });
+        let cfg = Config::builder("gemini").build();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let parts = &json["contents"][0]["parts"];
+        assert_eq!(parts[0]["fileData"]["fileUri"], "gs://bucket/clip.mp4");
+        assert_eq!(parts[0]["fileData"]["mimeType"], "video/*");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "video/mp4");
+        assert_eq!(parts[1]["inlineData"]["data"], "AAAA");
     }
 
     #[test]
@@ -1309,7 +1552,9 @@ mod tests {
             .presence_penalty(0.5)
             .frequency_penalty(0.25)
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         // Use exact float values (0.5, 0.25) that survive f32 → JSON without
         // representation drift.
@@ -1327,7 +1572,9 @@ mod tests {
                 summary: None,
             })
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["generationConfig"]["thinkingConfig"]["thinkingBudget"],
@@ -1342,7 +1589,9 @@ mod tests {
         let cfg = Config::builder("gemini")
             .tool_choice(ToolChoice::Required)
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "ANY",);
     }
@@ -1356,7 +1605,9 @@ mod tests {
                 name: "get_weather".to_string(),
             })
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
@@ -1371,7 +1622,9 @@ mod tests {
         let cfg = Config::builder("gemini")
             .tools(vec![Tool::builtin(ProviderBuiltin::GoogleSearch)])
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["tools"], serde_json::json!([{ "googleSearch": {} }]));
     }
@@ -1383,7 +1636,9 @@ mod tests {
         let cfg = Config::builder("gemini")
             .tools(vec![Tool::builtin(ProviderBuiltin::CodeExecution)])
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["tools"], serde_json::json!([{ "codeExecution": {} }]));
     }
@@ -1397,7 +1652,9 @@ mod tests {
             },
         ));
         let cfg = Config::builder("gemini").build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["cachedContent"],
@@ -1412,7 +1669,9 @@ mod tests {
         let cfg = Config::builder("gemini")
             .response_format(ResponseFormat::JsonObject)
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["generationConfig"]["responseMimeType"],
@@ -1440,7 +1699,9 @@ mod tests {
                 strict: true,
             })
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["generationConfig"]["responseMimeType"],
@@ -1477,7 +1738,9 @@ mod tests {
                 strict: true,
             })
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         let schema = &json["generationConfig"]["responseSchema"];
         assert!(
@@ -1508,7 +1771,9 @@ mod tests {
             },
         ));
         let cfg = Config::builder("gemini").build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert!(json.get("cachedContent").is_none());
     }
@@ -1528,7 +1793,9 @@ mod tests {
             ))
             .with_user("follow-up");
         let cfg = Config::builder("gemini").build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         assert_eq!(body.contents.len(), 1);
         assert_eq!(body.contents[0].role, "user");
         let json = serde_json::to_value(&body).unwrap();
@@ -1559,7 +1826,9 @@ mod tests {
             .with_response(&prior)
             .with_user("follow-up");
         let cfg = Config::builder("gemini").build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["cachedContent"], "cached/prior");
         assert_eq!(body.contents.len(), 1);
@@ -1590,7 +1859,9 @@ mod tests {
             ))
             .with_user("c");
         let cfg = Config::builder("gemini").build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         assert_eq!(body.contents.len(), 1);
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["cachedContent"], "cached/new");
@@ -1616,7 +1887,9 @@ mod tests {
         let cfg = Config::builder("gemini")
             .tools(vec![tool_with_schema(schema)])
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         json["tools"][0]["functionDeclarations"][0]["parameters"].clone()
     }
@@ -1636,7 +1909,9 @@ mod tests {
         let cfg = Config::builder("gemini")
             .tools(vec![tool_with_schema(schema)])
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         let params = &json["tools"][0]["functionDeclarations"][0]["parameters"];
 
@@ -1665,7 +1940,9 @@ mod tests {
         let cfg = Config::builder("gemini")
             .tools(vec![tool_with_schema(schema)])
             .build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         let params = &json["tools"][0]["functionDeclarations"][0]["parameters"];
         // First level inlines; the recursive self-reference degrades to
@@ -1839,7 +2116,9 @@ mod tests {
             })
             .with_tool_result("c1", "ok");
         let cfg = Config::builder("gemini").build();
-        assert!(provider().convert_request(&prompt, cfg.raw()).is_ok());
+        assert!(provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .is_ok());
     }
 
     /// #4 (request side): a tool call carrying a `provider_signature` is
@@ -1856,7 +2135,9 @@ mod tests {
             })
             .with_tool_result("c1", "ok");
         let cfg = Config::builder("gemini").build();
-        let body = provider().convert_request(&prompt, cfg.raw()).unwrap();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
         let json = serde_json::to_value(&body).unwrap();
         // contents: [user "hi", model [functionCall], user [functionResponse]]
         assert_eq!(

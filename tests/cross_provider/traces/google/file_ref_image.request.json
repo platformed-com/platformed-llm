@@ -1,0 +1,21 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Briefly describe what you see in this image."
+        },
+        {
+          "fileData": {
+            "fileUri": "<captured-file-handle>",
+            "mimeType": "image/png"
+          }
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 256
+  }
+}

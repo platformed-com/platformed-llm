@@ -101,6 +101,11 @@ impl VertexEndpoint {
         &self.location
     }
 
+    /// The configured GCP project id.
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
     /// Construct the URL for a Vertex AI prediction endpoint.
     ///
     /// - `publisher` is the model publisher (`"google"` or `"anthropic"`).

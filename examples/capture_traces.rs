@@ -26,6 +26,9 @@
 //!   `gcloud auth print-access-token --impersonate-service-account=$EMAIL`
 //!   to mint a Vertex token. Otherwise we use whatever ADC resolves to via
 //!   `gcp_auth::provider()`.
+//! - `GOOGLE_GCS_BUCKET` — *optional*. Cloud Storage bucket (same project) for
+//!   Gemini file-`Ref` uploads. When set, a scenario referencing a file by
+//!   `Ref` uploads it to this bucket and references the `gs://` URI.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -41,10 +44,12 @@ use futures_util::{Stream, StreamExt};
 use platformed_llm::providers::{
     AnthropicViaVertexProvider, GoogleProvider, OpenAIProvider, VertexEndpoint,
 };
-use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
+use platformed_llm::transport::{
+    Transport, TransportImpl, TransportRequest, TransportResponse, UploadRequest,
+};
 use platformed_llm::{
-    Config, Error, FunctionCall, InputItem, Prompt, ReasoningConfig, ReasoningEffort,
-    ReasoningSummary, Tool,
+    Config, Error, FileResolver, FunctionCall, InputItem, Prompt, ProviderScope, ReasoningConfig,
+    ReasoningEffort, ReasoningSummary, ResolvedFile, ResolvedHandle, Tool,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -163,8 +168,20 @@ struct ScenarioMessage {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ScenarioAttachment {
-    Image { data: String, media_type: String },
-    ImageUrl { url: String },
+    Image {
+        data: String,
+        media_type: String,
+    },
+    ImageUrl {
+        url: String,
+    },
+    /// A local file referenced by a caller-opaque `Ref`. The lib uploads it
+    /// to the provider (lazily) and references the returned handle. The `path`
+    /// doubles as the opaque Ref id.
+    FileRef {
+        path: String,
+        media_type: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -226,6 +243,13 @@ struct Recording {
     response_status: u16,
     response_headers: Vec<(String, String)>,
     response_body: Vec<u8>,
+    /// The file-upload exchange (`send_upload` → `POST /v1/files`), when the
+    /// scenario referenced a file by `Ref`. The multipart request body is
+    /// binary and large, so only the response (the file object) is kept —
+    /// that's what the offline replay needs.
+    upload_url: Option<String>,
+    upload_status: u16,
+    upload_response_body: Vec<u8>,
 }
 
 struct RecordingTransport {
@@ -282,6 +306,145 @@ impl TransportImpl for RecordingTransport {
             body: teed,
         })
     }
+
+    async fn send_upload(&self, req: UploadRequest) -> Result<TransportResponse, Error> {
+        self.recording.lock().unwrap().upload_url = Some(req.url.clone());
+        let response = self.inner.send_upload(req).await?;
+        self.recording.lock().unwrap().upload_status = response.status;
+
+        let recording = self.recording.clone();
+        let teed = response.body.map(move |chunk| {
+            if let Ok(bytes) = &chunk {
+                recording
+                    .lock()
+                    .unwrap()
+                    .upload_response_body
+                    .extend_from_slice(bytes);
+            }
+            chunk
+        });
+        let teed: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> = Box::pin(teed);
+        Ok(TransportResponse {
+            status: response.status,
+            headers: response.headers,
+            body: teed,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File resolver: maps a scenario's opaque file Ref ids to local files on
+// disk, opening each as a fresh stream so the lib uploads real bytes.
+// ---------------------------------------------------------------------------
+
+struct CapturingFileResolver {
+    /// Ref id (the scenario `path`) → (local path, media type).
+    files: std::collections::HashMap<String, (std::path::PathBuf, String)>,
+    /// Handles the lib uploaded this run, so the capture can both sanitize
+    /// them out of the recorded request and delete them afterwards.
+    uploaded: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl FileResolver for CapturingFileResolver {
+    async fn lookup(
+        &self,
+        _id: &str,
+        _scope: &ProviderScope,
+    ) -> Result<Option<ResolvedHandle>, Error> {
+        // Always a miss so capture exercises the real upload path.
+        Ok(None)
+    }
+
+    async fn open(&self, id: &str, _scope: &ProviderScope) -> Result<ResolvedFile, Error> {
+        let (path, media_type) = self
+            .files
+            .get(id)
+            .ok_or_else(|| Error::config(format!("no local file registered for Ref `{id}`")))?;
+        let bytes = std::fs::read(path)
+            .map_err(|e| Error::config(format!("read {}: {e}", path.display())))?;
+        let len = bytes.len() as u64;
+        let body = futures_util::stream::once(async move { Ok(Bytes::from(bytes)) });
+        Ok(ResolvedFile::Stream {
+            media_type: media_type.clone(),
+            content_length: Some(len),
+            body: Box::pin(body),
+        })
+    }
+
+    async fn store(
+        &self,
+        id: &str,
+        _scope: &ProviderScope,
+        handle: ResolvedHandle,
+    ) -> Result<(), Error> {
+        eprintln!("  uploaded Ref `{id}` → {}", handle.uri);
+        self.uploaded.lock().unwrap().push(handle.uri);
+        Ok(())
+    }
+}
+
+/// Stable placeholder substituted for an uploaded handle in recorded traces,
+/// so re-captures produce identical fixtures (no churning `gs://…<uuid>` /
+/// `file-…` ids) and no real bucket name is committed.
+const HANDLE_PLACEHOLDER: &str = "<captured-file-handle>";
+
+/// Delete a file this capture uploaded, so re-runs don't accumulate orphans.
+/// Best-effort: handles GCS `gs://` objects and OpenAI `file-…` ids.
+async fn delete_uploaded(uri: &str, bearer: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let resp = if let Some(rest) = uri.strip_prefix("gs://") {
+        let (bucket, object) = rest.split_once('/').ok_or("malformed gs:// uri")?;
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{bucket}/o/{}",
+            encode_object(object),
+        );
+        client.delete(&url).bearer_auth(bearer).send().await?
+    } else if uri.starts_with("file-") {
+        let url = format!("https://api.openai.com/v1/files/{uri}");
+        client.delete(&url).bearer_auth(bearer).send().await?
+    } else {
+        return Ok(());
+    };
+    let status = resp.status().as_u16();
+    // 404 is fine — already gone.
+    if !(200..300).contains(&status) && status != 404 {
+        return Err(format!("delete {uri} → HTTP {status}").into());
+    }
+    Ok(())
+}
+
+/// Percent-encode a GCS object name for the path segment of the JSON-API
+/// object URL (slashes included → `%2F`).
+fn encode_object(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Collect the `(ref_id → (path, media_type))` map for a scenario's file refs.
+fn scenario_file_refs(
+    scenario: &Scenario,
+) -> std::collections::HashMap<String, (std::path::PathBuf, String)> {
+    let mut out = std::collections::HashMap::new();
+    for m in &scenario.messages {
+        for att in &m.attachments {
+            if let ScenarioAttachment::FileRef { path, media_type } = att {
+                out.insert(
+                    path.clone(),
+                    (std::path::PathBuf::from(path), media_type.clone()),
+                );
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -369,15 +532,28 @@ fn scenario_to_llm_request(
                 for att in &m.attachments {
                     match att {
                         ScenarioAttachment::Image { data, media_type } => {
-                            content.push(UserPart::Image(platformed_llm::ImageSource::Base64 {
+                            content.push(UserPart::Image(platformed_llm::FileSource::Base64 {
                                 data: data.clone(),
                                 media_type: media_type.clone(),
                             }));
                         }
                         ScenarioAttachment::ImageUrl { url } => {
-                            content.push(UserPart::Image(platformed_llm::ImageSource::Url(
+                            content.push(UserPart::Image(platformed_llm::FileSource::Url(
                                 url.clone(),
                             )));
+                        }
+                        ScenarioAttachment::FileRef { path, media_type } => {
+                            // The path doubles as the opaque Ref id; the
+                            // CapturingFileResolver maps it back to the file.
+                            if media_type.starts_with("image/") {
+                                content.push(UserPart::Image(platformed_llm::FileSource::Ref(
+                                    path.clone(),
+                                )));
+                            } else {
+                                content.push(UserPart::Document(platformed_llm::FileSource::Ref(
+                                    path.clone(),
+                                )));
+                            }
                         }
                     }
                 }
@@ -599,6 +775,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("[{}] {} ... skip", provider.name(), scenario.name);
                 continue;
             }
+            // Gemini file-Ref scenarios need a GCS bucket to upload into.
+            // Self-gate rather than hardcode a skip so the scenario runs
+            // automatically once GOOGLE_GCS_BUCKET is configured.
+            if provider == Provider::Google
+                && !scenario_file_refs(scenario).is_empty()
+                && std::env::var("GOOGLE_GCS_BUCKET")
+                    .map(|v| v.trim().is_empty())
+                    .unwrap_or(true)
+            {
+                println!(
+                    "[google] {} ... skip (set GOOGLE_GCS_BUCKET to capture the GCS upload)",
+                    scenario.name
+                );
+                continue;
+            }
             let model = overrides.model.clone().unwrap_or_else(|| match provider {
                 Provider::OpenAI => scenario_file.defaults.models.openai.clone(),
                 Provider::Google => scenario_file.defaults.models.google.clone(),
@@ -661,71 +852,153 @@ async fn capture_one(
     let (recorder, recording) = RecordingTransport::new(Transport::reqwest()?);
     let transport = Transport::new(recorder);
 
-    // Resolve auth (or accept a deliberate override for 4xx captures) and
-    // construct the right provider with our recording transport.
+    // If the scenario references files by Ref, build a resolver that streams
+    // them from disk so the lib performs a real upload.
+    let file_refs = scenario_file_refs(scenario);
+    let uploaded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let resolver: Option<Arc<dyn FileResolver>> = if file_refs.is_empty() {
+        None
+    } else {
+        Some(Arc::new(CapturingFileResolver {
+            files: file_refs,
+            uploaded: uploaded.clone(),
+        }))
+    };
+
+    // Resolve the provider's bearer once (a deliberate `auth_override` lets a
+    // scenario force a 4xx). The same token is reused for post-capture cleanup.
+    let bearer = match &overrides.auth_override {
+        Some(t) => t.clone(),
+        None => match provider {
+            Provider::OpenAI => openai_token().await?,
+            Provider::Google | Provider::Anthropic => vertex_token().await?,
+        },
+    };
+
+    // Construct the right provider with our recording transport.
     let started = Instant::now();
     let generate_result = match provider {
         Provider::OpenAI => {
-            let api_key = match &overrides.auth_override {
-                Some(t) => t.clone(),
-                None => openai_token().await?,
-            };
-            let p = OpenAIProvider::with_transport(
-                api_key,
+            let mut p = OpenAIProvider::with_transport(
+                bearer.clone(),
                 "https://api.openai.com/v1".to_string(),
                 transport,
             );
+            if let Some(r) = resolver.clone() {
+                p = p.with_file_resolver(r);
+            }
             run_provider(&p, &prompt, &cfg).await
         }
         Provider::Google => {
             let (project_id, region) = vertex_project_region(provider)?;
-            let token = match &overrides.auth_override {
-                Some(t) => t.clone(),
-                None => vertex_token().await?,
-            };
-            let endpoint = VertexEndpoint::with_access_token(project_id, region, token);
-            let p = GoogleProvider::with_transport(endpoint, transport);
+            let endpoint = VertexEndpoint::with_access_token(project_id, region, bearer.clone());
+            let mut p = GoogleProvider::with_transport(endpoint, transport);
+            if let Some(r) = resolver.clone() {
+                p = p.with_file_resolver(r);
+                // A configured bucket lets Gemini file Refs upload to GCS.
+                if let Ok(bucket) = std::env::var("GOOGLE_GCS_BUCKET") {
+                    if !bucket.is_empty() {
+                        p = p.with_gcs_bucket(bucket);
+                    }
+                }
+            }
             run_provider(&p, &prompt, &cfg).await
         }
         Provider::Anthropic => {
             let (project_id, region) = vertex_project_region(provider)?;
-            let token = match &overrides.auth_override {
-                Some(t) => t.clone(),
-                None => vertex_token().await?,
-            };
-            let endpoint = VertexEndpoint::with_access_token(project_id, region, token);
-            let p = AnthropicViaVertexProvider::with_transport(endpoint, transport);
+            let endpoint = VertexEndpoint::with_access_token(project_id, region, bearer.clone());
+            let mut p = AnthropicViaVertexProvider::with_transport(endpoint, transport);
+            if let Some(r) = resolver.clone() {
+                p = p.with_file_resolver(r);
+            }
             run_provider(&p, &prompt, &cfg).await
         }
     };
     let elapsed = started.elapsed();
 
+    // Files this capture uploaded — used to sanitize the trace and to delete
+    // the objects afterwards.
+    let uploaded_uris = uploaded.lock().unwrap().clone();
+
     // The recording is now populated regardless of whether generate() ok'd
     // or err'd: success-path drained the body via SSE, error-path drained
     // it via collect_body inside the lib. Either way, our tee saw the
     // bytes flow through.
-    let captured = recording.lock().unwrap();
-    let request = captured
-        .request
-        .as_ref()
-        .ok_or("recorded request is missing — provider didn't call Transport::send")?
-        .clone();
-    let status = captured.response_status;
-    let headers = captured.response_headers.clone();
-    let response_body = captured.response_body.clone();
-    drop(captured);
+    // Extract everything in a tight block so the lock guard is unambiguously
+    // released before the (async) cleanup below — no guard held across await.
+    let (request, status, headers, response_body, upload_status, upload_url, upload_response_body) = {
+        let captured = recording.lock().unwrap();
+        let request = captured
+            .request
+            .as_ref()
+            .ok_or("recorded request is missing — provider didn't call Transport::send")?
+            .clone();
+        (
+            request,
+            captured.response_status,
+            captured.response_headers.clone(),
+            captured.response_body.clone(),
+            captured.upload_status,
+            captured.upload_url.clone(),
+            captured.upload_response_body.clone(),
+        )
+    };
 
     let req_path = dir.join(format!("{}.request.json", scenario.name));
     let resp_path = dir.join(format!("{}.response.sse", scenario.name));
     let meta_path = dir.join(format!("{}.meta.json", scenario.name));
 
-    // Pretty-print the request body (it's serialized JSON internally).
-    let req_pretty = match serde_json::from_slice::<Value>(&request.body) {
+    // Pretty-print the request body (it's serialized JSON internally), then
+    // replace any uploaded handle (a `gs://…<uuid>` URI or `file-…` id) with a
+    // stable placeholder so re-captures don't churn the fixture or commit a
+    // real bucket name.
+    let mut req_pretty = match serde_json::from_slice::<Value>(&request.body) {
         Ok(v) => serde_json::to_string_pretty(&v)?,
         Err(_) => String::from_utf8_lossy(&request.body).into_owned(),
     };
+    for uri in &uploaded_uris {
+        req_pretty = req_pretty.replace(uri, HANDLE_PLACEHOLDER);
+    }
     fs::write(&req_path, req_pretty)?;
     fs::write(&resp_path, &response_body)?;
+
+    // If the scenario uploaded a file, record the upload response (the file
+    // object). The offline replay feeds this to `send_upload` so the
+    // resolve → upload → file_id → generate flow runs deterministically.
+    if !upload_response_body.is_empty() {
+        let upload_path = dir.join(format!("{}.upload.response.json", scenario.name));
+        let content = match provider {
+            // GCS object metadata is highly volatile (timestamps, generation,
+            // etag, percent-encoded media links revealing the bucket+object)
+            // and is not consumed by replay — write a stable documentary stub.
+            Provider::Google => serde_json::to_string_pretty(&json!({
+                "gs_uri": HANDLE_PLACEHOLDER,
+                "note": "GCS object metadata omitted (volatile); the gs:// URI is referenced \
+                         via request fileData.fileUri",
+            }))?,
+            // OpenAI file object: keep the real shape (the offline replay parses
+            // it), but stabilize the volatile `id` + `created_at` so re-captures
+            // produce identical fixtures.
+            _ => match serde_json::from_slice::<Value>(&upload_response_body) {
+                Ok(mut v) => {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("id".into(), json!(HANDLE_PLACEHOLDER));
+                        if obj.contains_key("created_at") {
+                            obj.insert("created_at".into(), json!(0));
+                        }
+                    }
+                    serde_json::to_string_pretty(&v)?
+                }
+                Err(_) => String::from_utf8_lossy(&upload_response_body).into_owned(),
+            },
+        };
+        fs::write(&upload_path, content)?;
+        println!(
+            "    (upload {} → HTTP {})",
+            upload_url.as_deref().unwrap_or("?"),
+            upload_status
+        );
+    }
 
     let captured_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -749,6 +1022,18 @@ async fn capture_one(
         "expect_failure": scenario.expect_failure,
     });
     fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+
+    // Best-effort cleanup: delete any files this capture uploaded so repeated
+    // re-generation doesn't accumulate orphans in the bucket / account. Skip
+    // when an auth override was used (the bearer is a deliberate dummy).
+    if !uploaded_uris.is_empty() && overrides.auth_override.is_none() {
+        for uri in &uploaded_uris {
+            match delete_uploaded(uri, &bearer).await {
+                Ok(()) => println!("    (cleaned up {uri})"),
+                Err(e) => eprintln!("    (cleanup: could not delete {uri}: {e})"),
+            }
+        }
+    }
 
     let succeeded_http = (200..300).contains(&status);
     if scenario.expect_failure {

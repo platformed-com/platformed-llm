@@ -98,12 +98,15 @@ impl InputItem {
 pub enum UserPart {
     /// Plain text content.
     Text(String),
-    /// Image input by URL or inline base64.
-    Image(ImageSource),
-    /// Audio input by URL or inline base64.
-    Audio(AudioSource),
-    /// Document (e.g. PDF) input by URL or inline base64.
-    Document(DocumentSource),
+    /// Image input (URL, inline base64, or a caller-opaque file `Ref`).
+    Image(FileSource),
+    /// Audio input (URL, inline base64, or a caller-opaque file `Ref`).
+    Audio(FileSource),
+    /// Document (e.g. PDF) input (URL, inline base64, or a file `Ref`).
+    Document(FileSource),
+    /// Video input (URL, inline base64, or a file `Ref`). Supported on
+    /// Gemini; dropped on OpenAI / Anthropic, which have no video input.
+    Video(FileSource),
     /// Result of a tool the assistant previously called. `call_id`
     /// correlates with a prior `AssistantPart::ToolCall`.
     ToolResult {
@@ -221,46 +224,26 @@ pub enum AnnotationKind {
     FileCitation,
 }
 
-/// Source for an image input.
+/// Source for a binary file input — image, audio, or document. The
+/// modality is carried by the enclosing [`UserPart`] variant
+/// ([`UserPart::Image`] / [`UserPart::Audio`] / [`UserPart::Document`]), so a
+/// single source type serves all three.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ImageSource {
+pub enum FileSource {
     /// HTTP(S) URL the provider will fetch.
     Url(String),
     /// Inline base64-encoded payload.
     Base64 {
-        /// Base64-encoded image bytes.
+        /// Base64-encoded file bytes.
         data: String,
-        /// MIME type (e.g. `image/png`, `image/jpeg`).
+        /// MIME type (e.g. `image/png`, `audio/wav`, `application/pdf`).
         media_type: String,
     },
-}
-
-/// Source for an audio input.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AudioSource {
-    /// HTTP(S) URL the provider will fetch.
-    Url(String),
-    /// Inline base64-encoded payload.
-    Base64 {
-        /// Base64-encoded audio bytes.
-        data: String,
-        /// MIME type (e.g. `audio/mpeg`, `audio/wav`).
-        media_type: String,
-    },
-}
-
-/// Source for a document input (PDF, etc.).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DocumentSource {
-    /// HTTP(S) URL the provider will fetch.
-    Url(String),
-    /// Inline base64-encoded payload.
-    Base64 {
-        /// Base64-encoded document bytes.
-        data: String,
-        /// MIME type (e.g. `application/pdf`).
-        media_type: String,
-    },
+    /// Caller-opaque file ID resolved per-provider via a
+    /// [`FileResolver`](super::FileResolver) at request time (lazy upload /
+    /// reuse). Portable across providers; the only file shape that survives
+    /// a model switch unchanged.
+    Ref(String),
 }
 
 /// Tool definition the model can call.

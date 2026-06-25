@@ -887,7 +887,7 @@ mod tests {
     /// and re-serialize.
     #[tokio::test]
     async fn multipart_user_tail_preserves_every_part_verbatim() {
-        use crate::ImageSource;
+        use crate::FileSource;
         let provider = MockProvider::builder()
             .reply(MockResponse::text("memo body"))
             .build();
@@ -895,7 +895,7 @@ mod tests {
         let multipart_tail = InputItem::User {
             content: vec![
                 UserPart::Text("look at this:".into()),
-                UserPart::Image(ImageSource::Url("https://example.com/img.png".into())),
+                UserPart::Image(FileSource::Url("https://example.com/img.png".into())),
                 UserPart::CacheBreakpoint,
                 UserPart::Text("what do you see?".into()),
             ],

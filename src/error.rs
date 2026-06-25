@@ -113,6 +113,20 @@ pub enum Error {
         /// summary, truncation, etc.).
         reason: String,
     },
+
+    /// The prompt carries an input modality the target provider cannot
+    /// accept (e.g. audio or video on OpenAI / Anthropic). Surfaced as a
+    /// hard error rather than silently dropping the content — otherwise the
+    /// model would answer without input the caller explicitly provided.
+    /// Distinct variant so callers orchestrating provider fallback can branch
+    /// on it (e.g. route audio/video to Gemini).
+    #[error("{provider} does not support {modality} input")]
+    UnsupportedInput {
+        /// Short identifier of the provider (e.g. `"OpenAI"`, `"Anthropic"`).
+        provider: &'static str,
+        /// The unsupported modality (`"audio"`, `"video"`).
+        modality: &'static str,
+    },
 }
 
 impl Error {
@@ -201,6 +215,12 @@ impl Error {
         Error::Compaction {
             reason: reason.into(),
         }
+    }
+
+    /// Build an unsupported-input error for a modality the target provider
+    /// can't accept (e.g. `("OpenAI", "audio")`).
+    pub fn unsupported_input(provider: &'static str, modality: &'static str) -> Self {
+        Error::UnsupportedInput { provider, modality }
     }
 }
 
