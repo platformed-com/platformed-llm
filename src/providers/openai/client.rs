@@ -30,6 +30,12 @@ pub struct OpenAIProvider {
     project: Option<String>,
     /// Optional caller-held file registry for resolving `Ref` file inputs.
     file_resolver: Option<Arc<dyn FileResolver>>,
+    /// Cooperative rate limiter consulted before every send. Defaults
+    /// to [`crate::NoOpRateLimiter`]; override via
+    /// [`Self::with_rate_limiter`] to plug in a shared
+    /// [`crate::InMemoryRateLimiter`] (or custom impl) for
+    /// multi-tenant fairness.
+    rate_limiter: crate::rate_limit::SharedRateLimiter,
 }
 
 impl OpenAIProvider {
@@ -42,6 +48,7 @@ impl OpenAIProvider {
             organization: None,
             project: None,
             file_resolver: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         })
     }
 
@@ -54,6 +61,7 @@ impl OpenAIProvider {
             organization: None,
             project: None,
             file_resolver: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         })
     }
 
@@ -68,6 +76,7 @@ impl OpenAIProvider {
             organization: None,
             project: None,
             file_resolver: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         }
     }
 
@@ -93,6 +102,17 @@ impl OpenAIProvider {
         self
     }
 
+    /// Attach a shared [`crate::rate_limit::RateLimiter`]. The
+    /// provider consults it before every send and reports the
+    /// response's rate-limit headers back via the returned permit so
+    /// the limiter's AIMD capacity model stays current. Without this,
+    /// the provider uses the [`crate::NoOpRateLimiter`] and behaves
+    /// exactly as it did before.
+    pub fn with_rate_limiter(mut self, limiter: crate::rate_limit::SharedRateLimiter) -> Self {
+        self.rate_limiter = limiter;
+        self
+    }
+
     /// The [`ProviderScope`] handles minted by this client are valid within —
     /// the base URL plus any org/project scoping.
     fn scope(&self) -> ProviderScope {
@@ -107,6 +127,7 @@ impl OpenAIProvider {
         }
         ProviderScope::new(ProviderType::OpenAI, account)
     }
+
 
     /// Convert internal request to OpenAI Responses API format.
     ///
@@ -398,6 +419,86 @@ impl OpenAIProvider {
             }
         }
         out
+    }
+}
+
+/// Parse OpenAI's `x-ratelimit-reset-*` header value into a
+/// [`Duration`].
+///
+/// OpenAI sends durations in a compact human-readable form: `"30s"`,
+/// `"1.5s"`, `"7m30s"`, `"1h"`, plus the occasional `"500ms"`. None of
+/// our supported responses go above hours; we parse minutes-and-seconds
+/// (the common case) plus a few single-unit suffixes and return `None`
+/// on anything we don't recognise so the limiter just falls back to its
+/// own backoff.
+fn parse_openai_reset(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Single-unit short forms: "30s", "1.5s", "500ms", "7m", "1h".
+    if let Some(num) = s.strip_suffix("ms") {
+        return num
+            .parse::<f64>()
+            .ok()
+            .map(|n| std::time::Duration::from_secs_f64(n / 1000.0));
+    }
+    if let Some(num) = s.strip_suffix('s') {
+        // Could be "1.5s" or "7m30s" — the latter is handled below.
+        if !num.contains(|c: char| c.is_ascii_alphabetic()) {
+            return num
+                .parse::<f64>()
+                .ok()
+                .map(std::time::Duration::from_secs_f64);
+        }
+    }
+    if let Some(num) = s.strip_suffix('m') {
+        return num
+            .parse::<f64>()
+            .ok()
+            .map(|n| std::time::Duration::from_secs_f64(n * 60.0));
+    }
+    if let Some(num) = s.strip_suffix('h') {
+        return num
+            .parse::<f64>()
+            .ok()
+            .map(|n| std::time::Duration::from_secs_f64(n * 3600.0));
+    }
+    // Composite minutes-and-seconds: "7m30s", "1m0.5s".
+    if let Some(m_idx) = s.find('m') {
+        let mins: f64 = s[..m_idx].parse().ok()?;
+        let rest = &s[m_idx + 1..];
+        let secs: f64 = if rest.is_empty() {
+            0.0
+        } else {
+            rest.strip_suffix('s')?.parse().ok()?
+        };
+        return Some(std::time::Duration::from_secs_f64(mins * 60.0 + secs));
+    }
+    None
+}
+
+/// Pull OpenAI's normalised rate-limit headers off a response into the
+/// [`ProviderRateInfo`] shape the limiter consumes. Every OpenAI
+/// response (success or 429) carries these — we always populate the
+/// info struct, even on success, so the limiter's AIMD step gets a real
+/// observed-capacity signal instead of just "no 429 fired".
+fn parse_openai_rate_info(
+    response: &crate::transport::TransportResponse,
+) -> crate::rate_limit::ProviderRateInfo {
+    crate::rate_limit::ProviderRateInfo {
+        requests_remaining: response
+            .header("x-ratelimit-remaining-requests")
+            .and_then(|v| v.trim().parse().ok()),
+        requests_reset: response
+            .header("x-ratelimit-reset-requests")
+            .and_then(parse_openai_reset),
+        tokens_remaining: response
+            .header("x-ratelimit-remaining-tokens")
+            .and_then(|v| v.trim().parse().ok()),
+        tokens_reset: response
+            .header("x-ratelimit-reset-tokens")
+            .and_then(parse_openai_reset),
     }
 }
 
@@ -1310,15 +1411,54 @@ impl Provider for OpenAIProvider {
             headers,
             body,
         };
-        let response = self.transport.send(req).await?;
+
+        // Acquire a rate-limit permit. The default `NoOpRateLimiter`
+        // returns immediately; a shared `InMemoryRateLimiter` paces
+        // and prioritises us. The permit's `observe()` feeds the
+        // response's normalised headers back to the limiter.
+        let scope = crate::rate_limit::RateScope {
+            provider: "OpenAI",
+            model: config.model.clone(),
+            tenant: config.tenant.clone().unwrap_or_default(),
+            priority: config.priority.unwrap_or_default(),
+            estimated_input_tokens: config.estimated_input_tokens,
+        };
+        let permit = self.rate_limiter.acquire(&scope).await?;
+        let response = match self.transport.send(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Transport-level failure: no headers to feed back,
+                // so report as OtherFailure (no AIMD update) and
+                // surface the error.
+                permit.observe(crate::rate_limit::RateOutcome::OtherFailure);
+                return Err(e);
+            }
+        };
 
         if !(200..300).contains(&response.status) {
             let status = response.status;
             let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
+            let info = parse_openai_rate_info(&response);
+            // Feed the limiter before draining the body — the body
+            // collect is async and we don't want the limiter's
+            // AIMD step to wait on it.
+            if status == 429 {
+                permit.observe(crate::rate_limit::RateOutcome::RateLimited {
+                    retry_after: retry_after.map(std::time::Duration::from_secs),
+                    info,
+                });
+            } else {
+                permit.observe(crate::rate_limit::RateOutcome::OtherFailure);
+            }
             let body_bytes = response.collect_body().await.unwrap_or_default();
             let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
             return Err(parse_openai_error(status, retry_after, &body_str));
         }
+
+        // Success path: report the response's rate-limit headers so
+        // the limiter's AIMD step grows toward observed capacity.
+        let info = parse_openai_rate_info(&response);
+        permit.observe(crate::rate_limit::RateOutcome::Success { info });
 
         use crate::sse_stream::SseStreamExt;
         let state = Arc::new(Mutex::new(OpenAIStreamState::new()));
@@ -2147,5 +2287,36 @@ mod tests {
             })
             .expect_err("missing name must error, not fabricate 'unknown'");
         assert!(err.to_string().contains("missing name"), "{err}");
+    }
+
+    /// OpenAI's `x-ratelimit-reset-*` headers use a compact mix of
+    /// units. The parser must handle the common shapes — pure
+    /// seconds, decimal seconds, milliseconds, single-unit minutes /
+    /// hours, and composite minutes-and-seconds — and return `None`
+    /// for unrecognised forms so the limiter falls back to its own
+    /// backoff rather than mis-budgeting.
+    #[test]
+    fn parse_openai_reset_handles_common_shapes() {
+        use std::time::Duration;
+        assert_eq!(parse_openai_reset("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(
+            parse_openai_reset("1.5s"),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            parse_openai_reset("500ms"),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(parse_openai_reset("7m"), Some(Duration::from_secs(420)));
+        assert_eq!(parse_openai_reset("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(
+            parse_openai_reset("7m30s"),
+            Some(Duration::from_secs(7 * 60 + 30)),
+        );
+        // Unknown / malformed shapes — limiter falls back to its own
+        // policy, never mis-budgets on a header we can't read.
+        assert_eq!(parse_openai_reset(""), None);
+        assert_eq!(parse_openai_reset("garbage"), None);
+        assert_eq!(parse_openai_reset("30sec"), None);
     }
 }

@@ -7,10 +7,11 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Always-on core: async runtime, streaming primitives, serde, tracing.
-# `time` powers the `retry` helper's `tokio::time::sleep` between
-# attempts; consumers using a `current_thread` runtime must
-# `enable_time()` on their builder.
-tokio = { version = "1.40", default-features = false, features = ["time"] }
+# `time` powers `tokio::time::sleep` in both the `retry` helper and
+# the rate-limit scheduler; `sync` brings `Notify` for the rate
+# limiter's per-bucket waiter wakeup. Consumers using a
+# `current_thread` runtime must `enable_time()` on their builder.
+tokio = { version = "1.40", default-features = false, features = ["time", "sync"] }
 async-trait = "0.1"
 tracing = "0.1"
 bytes = "1.0"

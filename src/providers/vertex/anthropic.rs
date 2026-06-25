@@ -25,6 +25,8 @@ pub struct AnthropicViaVertexProvider {
     beta: Vec<String>,
     /// Optional caller-held file registry for resolving `Ref` file inputs.
     file_resolver: Option<Arc<dyn FileResolver>>,
+    /// Cooperative rate limiter consulted before every send.
+    rate_limiter: crate::rate_limit::SharedRateLimiter,
 }
 
 impl AnthropicViaVertexProvider {
@@ -35,6 +37,7 @@ impl AnthropicViaVertexProvider {
             transport: Transport::reqwest()?,
             beta: Vec::new(),
             file_resolver: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         })
     }
 
@@ -51,6 +54,7 @@ impl AnthropicViaVertexProvider {
             transport: Transport::reqwest()?,
             beta: Vec::new(),
             file_resolver: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         })
     }
 
@@ -61,6 +65,7 @@ impl AnthropicViaVertexProvider {
             transport: Transport::reqwest()?,
             beta: Vec::new(),
             file_resolver: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         })
     }
 
@@ -72,7 +77,16 @@ impl AnthropicViaVertexProvider {
             transport,
             beta: Vec::new(),
             file_resolver: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         }
+    }
+
+    /// Attach a shared [`crate::rate_limit::RateLimiter`]. See the
+    /// equivalent method on the OpenAI provider for the model — same
+    /// trait, same semantics.
+    pub fn with_rate_limiter(mut self, limiter: crate::rate_limit::SharedRateLimiter) -> Self {
+        self.rate_limiter = limiter;
+        self
     }
 
     /// Swap the static access token before it expires (GCP tokens
@@ -505,12 +519,35 @@ impl Provider for AnthropicViaVertexProvider {
             headers.push(("anthropic-beta".to_string(), self.beta.join(",")));
         }
         let req = TransportRequest { url, headers, body };
-        let response = self.transport.send(req).await?;
+
+        let scope = crate::rate_limit::RateScope {
+            provider: "Anthropic",
+            model: config.model.clone(),
+            tenant: config.tenant.clone().unwrap_or_default(),
+            priority: config.priority.unwrap_or_default(),
+            estimated_input_tokens: config.estimated_input_tokens,
+        };
+        let permit = self.rate_limiter.acquire(&scope).await?;
+        let response = match self.transport.send(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                permit.observe(crate::rate_limit::RateOutcome::OtherFailure);
+                return Err(e);
+            }
+        };
 
         if !(200..300).contains(&response.status) {
             let status = response.status;
             // Read Retry-After before `collect_body` consumes the response.
             let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
+            if status == 429 {
+                permit.observe(crate::rate_limit::RateOutcome::RateLimited {
+                    retry_after: retry_after.map(std::time::Duration::from_secs),
+                    info: crate::rate_limit::ProviderRateInfo::default(),
+                });
+            } else {
+                permit.observe(crate::rate_limit::RateOutcome::OtherFailure);
+            }
             let body_bytes = response.collect_body().await.unwrap_or_default();
             let body_text = String::from_utf8_lossy(&body_bytes);
             // Anthropic doesn't expose a typed code for "too many input
@@ -543,6 +580,16 @@ impl Provider for AnthropicViaVertexProvider {
                 ),
             });
         }
+
+        // Success path: no rate-limit headers from Anthropic-via-Vertex,
+        // so we feed back an empty info struct. The AIMD step still
+        // grows by `additive_step` per success — the limiter just has
+        // no observed ceiling to cap growth at, so it'll keep growing
+        // until it hits a 429 (which is fine; the multiplicative
+        // decrease then snaps it down).
+        permit.observe(crate::rate_limit::RateOutcome::Success {
+            info: crate::rate_limit::ProviderRateInfo::default(),
+        });
 
         // Create SSE stream from response
         let sse_stream = SseStream::new("Anthropic", response.body);
@@ -831,6 +878,28 @@ pub(crate) fn convert_stream_event_stateful(
             // Keep-alive event - ignore
         }
         AnthropicStreamEvent::Error { error } => {
+            // Mid-stream rate limits (`overloaded_error` /
+            // `rate_limit_error`) arrive after a 200 has already gone
+            // out; normalise to the typed `Error::RateLimit` variant
+            // so caller-level retry loops and the rate limiter can
+            // both treat them like a pre-stream 429. Other mid-stream
+            // errors stay as `Error::Provider`.
+            //
+            // Note: the rate-limit permit was already observed at the
+            // HTTP-200 success site, so the limiter's AIMD model
+            // doesn't yet learn from this mid-stream event. Holding
+            // the permit through the stream consumption would fix
+            // that — tracked as a v2 refactor; for now the caller's
+            // retry loop carries the resilience signal.
+            if error.error_type == "rate_limit_error" || error.error_type == "overloaded_error" {
+                return Err(Error::rate_limit(
+                    None,
+                    format!(
+                        "Anthropic mid-stream {}: {}",
+                        error.error_type, error.message
+                    ),
+                ));
+            }
             return Err(Error::provider(
                 "Anthropic",
                 format!("{}: {}", error.error_type, error.message),
@@ -849,6 +918,49 @@ mod tests {
     fn provider() -> AnthropicViaVertexProvider {
         AnthropicViaVertexProvider::new("p".to_string(), "us-east5".to_string(), "tok".to_string())
             .unwrap()
+    }
+
+    /// Mid-stream `overloaded_error` and `rate_limit_error` events
+    /// must surface as the typed [`Error::RateLimit`] so caller-level
+    /// retry loops and the rate limiter can both recognise them.
+    /// Other mid-stream errors should still surface as the generic
+    /// [`Error::Provider`].
+    #[test]
+    fn mid_stream_rate_limit_normalises_to_typed_error() {
+        use crate::providers::vertex::anthropic_types::AnthropicErrorPayload;
+        let mut state = StreamState::default();
+        for kind in ["overloaded_error", "rate_limit_error"] {
+            let err = convert_stream_event_stateful(
+                AnthropicStreamEvent::Error {
+                    error: AnthropicErrorPayload {
+                        error_type: kind.to_string(),
+                        message: format!("simulated {kind}"),
+                    },
+                },
+                &mut state,
+            )
+            .expect_err("error event must produce Err");
+            assert!(
+                matches!(err, Error::RateLimit { .. }),
+                "{kind} should map to Error::RateLimit, got {err:?}",
+            );
+        }
+        // A non-rate-limit error stays generic so callers can branch
+        // appropriately (auth issues, server errors, etc.).
+        let err = convert_stream_event_stateful(
+            AnthropicStreamEvent::Error {
+                error: AnthropicErrorPayload {
+                    error_type: "api_error".to_string(),
+                    message: "internal".to_string(),
+                },
+            },
+            &mut state,
+        )
+        .expect_err("error event must produce Err");
+        assert!(
+            matches!(err, Error::Provider { .. }),
+            "non-rate-limit error should stay generic Provider, got {err:?}",
+        );
     }
 
     #[test]

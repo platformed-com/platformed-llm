@@ -540,6 +540,11 @@ pub struct MockProvider {
     mode: Mode,
     chunking: Chunking,
     log: Arc<Mutex<Vec<RecordedCall>>>,
+    /// Cooperative rate limiter consulted before each scripted reply
+    /// is yielded — included so multi-tenant / priority behaviour can
+    /// be tested without a network round-trip. Defaults to
+    /// [`crate::NoOpRateLimiter`].
+    rate_limiter: crate::rate_limit::SharedRateLimiter,
 }
 
 impl MockProvider {
@@ -548,6 +553,7 @@ impl MockProvider {
             mode,
             chunking,
             log: Arc::new(Mutex::new(Vec::new())),
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         }
     }
 
@@ -590,6 +596,16 @@ impl MockProvider {
         self
     }
 
+    /// Attach a shared [`crate::rate_limit::RateLimiter`]. The mock
+    /// honours the limiter exactly the way a hosted provider would
+    /// — acquire before "sending", observe `Success` after — so
+    /// downstream tests can exercise scheduling, fairness, and
+    /// rate-limit observation without standing up a real upstream.
+    pub fn with_rate_limiter(mut self, limiter: crate::rate_limit::SharedRateLimiter) -> Self {
+        self.rate_limiter = limiter;
+        self
+    }
+
     /// A cloneable handle to this provider's recorded calls. Grab it
     /// before moving the provider into the code under test.
     pub fn call_log(&self) -> CallLog {
@@ -627,9 +643,38 @@ impl Provider for MockProvider {
                 config: config.clone(),
             });
 
+        // Honour the rate limiter exactly like a hosted provider —
+        // acquire before yielding the scripted reply, observe with
+        // the outcome derived from the reply.
+        let scope = crate::rate_limit::RateScope {
+            provider: "Mock",
+            model: config.model.clone(),
+            tenant: config.tenant.clone().unwrap_or_default(),
+            priority: config.priority.unwrap_or_default(),
+            estimated_input_tokens: config.estimated_input_tokens,
+        };
+        let permit = self.rate_limiter.acquire(&scope).await?;
+
         match self.next_reply(prompt, config)? {
-            Reply::Fail(error) => Err(error),
+            Reply::Fail(error) => {
+                // Surface a scripted rate-limit error to the limiter
+                // so downstream tests can drive AIMD / parking
+                // behaviour from the scripted queue.
+                match &error {
+                    Error::RateLimit { retry_after, .. } => {
+                        permit.observe(crate::rate_limit::RateOutcome::RateLimited {
+                            retry_after: *retry_after,
+                            info: crate::rate_limit::ProviderRateInfo::default(),
+                        });
+                    }
+                    _ => permit.observe(crate::rate_limit::RateOutcome::OtherFailure),
+                }
+                Err(error)
+            }
             Reply::Respond(response) => {
+                permit.observe(crate::rate_limit::RateOutcome::Success {
+                    info: crate::rate_limit::ProviderRateInfo::default(),
+                });
                 let events = lower_response(response, &self.chunking);
                 Ok(Response::from_stream(futures_util::stream::iter(events)))
             }

@@ -24,6 +24,11 @@ pub mod middleware;
 /// Concrete provider implementations. Browse this module to see what
 /// backends the lib supports and how to construct each one.
 pub mod providers;
+/// Cooperative rate limiting for multi-tenant deployments — providers
+/// consult a shared [`rate_limit::RateLimiter`] before issuing the
+/// upstream HTTP call. See the module docs for the scheduling model
+/// and AIMD capacity tracking.
+pub mod rate_limit;
 /// Retry helpers for transient provider failures — [`RetryPolicy`]
 /// centralises backoff / `Retry-After` arithmetic, [`retry()`] wraps an
 /// async operation in the loop. See the module docs for the buffered
@@ -69,6 +74,10 @@ pub use error::Error;
 pub use factory::{ProviderConfig, ProviderFactory, ProviderType};
 pub use middleware::{generate, JsonCoercionMiddleware, Middleware};
 pub use provider::Provider;
+pub use rate_limit::{
+    InMemoryRateLimiter, NoOpRateLimiter, Priority, ProviderRateInfo, RateLimiter, RateOutcome,
+    RatePermit, RateScope, SharedRateLimiter,
+};
 pub use response::{CompleteResponse, Response};
 pub use retry::{retry, RetryPolicy};
 pub use types::{

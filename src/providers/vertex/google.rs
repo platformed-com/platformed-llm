@@ -40,6 +40,8 @@ pub struct GoogleProvider {
     /// Optional object-name prefix for uploaded files (default
     /// `platformed-llm/`).
     gcs_prefix: Option<String>,
+    /// Cooperative rate limiter consulted before every send.
+    rate_limiter: crate::rate_limit::SharedRateLimiter,
 }
 
 impl GoogleProvider {
@@ -51,6 +53,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         })
     }
 
@@ -68,6 +71,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         })
     }
 
@@ -79,6 +83,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         })
     }
 
@@ -92,6 +97,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         }
     }
 
@@ -128,6 +134,14 @@ impl GoogleProvider {
         self
     }
 
+    /// Attach a shared [`crate::rate_limit::RateLimiter`]. See the
+    /// equivalent method on the OpenAI provider for the model — same
+    /// trait, same semantics.
+    pub fn with_rate_limiter(mut self, limiter: crate::rate_limit::SharedRateLimiter) -> Self {
+        self.rate_limiter = limiter;
+        self
+    }
+
     /// The [`ProviderScope`] file handles are valid within — the GCP
     /// project + region.
     fn scope(&self) -> ProviderScope {
@@ -140,6 +154,7 @@ impl GoogleProvider {
             ),
         )
     }
+
 
     /// Swap the static access token before it expires (GCP tokens
     /// last ~1h). Errors if this provider was built with ADC, which
@@ -793,12 +808,35 @@ impl Provider for GoogleProvider {
             ],
             body,
         };
-        let response = self.transport.send(req).await?;
+
+        let scope = crate::rate_limit::RateScope {
+            provider: "Google",
+            model: config.model.clone(),
+            tenant: config.tenant.clone().unwrap_or_default(),
+            priority: config.priority.unwrap_or_default(),
+            estimated_input_tokens: config.estimated_input_tokens,
+        };
+        let permit = self.rate_limiter.acquire(&scope).await?;
+        let response = match self.transport.send(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                permit.observe(crate::rate_limit::RateOutcome::OtherFailure);
+                return Err(e);
+            }
+        };
 
         if !(200..300).contains(&response.status) {
             let status = response.status;
             // Read Retry-After before `collect_body` consumes the response.
             let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
+            if status == 429 {
+                permit.observe(crate::rate_limit::RateOutcome::RateLimited {
+                    retry_after: retry_after.map(std::time::Duration::from_secs),
+                    info: crate::rate_limit::ProviderRateInfo::default(),
+                });
+            } else {
+                permit.observe(crate::rate_limit::RateOutcome::OtherFailure);
+            }
             let body_bytes = response.collect_body().await.unwrap_or_default();
             let body_text = String::from_utf8_lossy(&body_bytes);
             // Vertex 4xx envelopes carry `"status": "UNAUTHENTICATED"` /
@@ -833,6 +871,14 @@ impl Provider for GoogleProvider {
                 ),
             });
         }
+
+        // Success path: no rate-limit headers from Vertex Gemini, so
+        // feed back an empty info struct. AIMD grows on success
+        // until a 429 multiplicatively decreases — see Anthropic
+        // provider for the same pattern.
+        permit.observe(crate::rate_limit::RateOutcome::Success {
+            info: crate::rate_limit::ProviderRateInfo::default(),
+        });
 
         // Create SSE stream from response (Gemini supports ?alt=sse)
         let sse_stream = SseStream::new("Google", response.body);
