@@ -222,6 +222,58 @@ impl Error {
     pub fn unsupported_input(provider: &'static str, modality: &'static str) -> Self {
         Error::UnsupportedInput { provider, modality }
     }
+
+    /// Whether this error represents a transient failure that is safe
+    /// to retry by re-issuing the same request.
+    ///
+    /// Returns `true` for [`Self::RateLimit`], [`Self::Transport`], and
+    /// [`Self::Provider`] when its `retryable` flag is set (5xx / 429).
+    /// All other variants are terminal — re-issuing the same request
+    /// won't change the outcome (bad auth, malformed prompt, model
+    /// unavailable, context-window-exceeded, etc.).
+    ///
+    /// [`Self::Streaming`] is **not** retryable: by the time it fires
+    /// the response has already started streaming, so the assistant
+    /// turn is partially constructed. Resuming from a partial stream is
+    /// caller-specific (you may have already shown tokens to the user
+    /// or persisted partial state) and out of scope for this primitive.
+    ///
+    /// Pair this with [`Self::retry_after`] when building a manual
+    /// retry loop, or hand off to [`crate::retry()`] /
+    /// [`crate::RetryPolicy`] which package both into a closure-based
+    /// helper. See the [`mod@crate::retry`] module docs for the
+    /// buffered vs streaming patterns.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            #[cfg(feature = "reqwest")]
+            Error::Transport(_) => true,
+            Error::RateLimit { .. } => true,
+            Error::Provider { retryable, .. } => *retryable,
+            Error::Auth { .. }
+            | Error::Serialization(_)
+            | Error::Config(_)
+            | Error::InvalidPrompt(_)
+            | Error::Streaming(_)
+            | Error::ModelNotAvailable(_)
+            | Error::ContextWindowExceeded { .. }
+            | Error::UnsupportedInput { .. }
+            | Error::Compaction { .. } => false,
+        }
+    }
+
+    /// Provider-suggested wait duration before retrying, parsed from a
+    /// `Retry-After` header (or equivalent) on a 429.
+    ///
+    /// Returns `Some(d)` only for [`Self::RateLimit`] when the provider
+    /// supplied a hint; `None` for every other variant *and* for rate
+    /// limits with no header. Callers that get `None` from a retryable
+    /// error should fall back to their own backoff policy.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Error::RateLimit { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 /// Status fragment for the `Provider` Display. Returns only the
@@ -353,5 +405,44 @@ mod tests {
         let err = Error::config("Invalid model name");
         assert!(err.to_string().contains("invalid configuration"));
         assert!(err.to_string().contains("Invalid model name"));
+    }
+
+    #[test]
+    fn is_retryable_covers_transient_variants() {
+        assert!(Error::rate_limit(Some(5), "slow down").is_retryable());
+        assert!(Error::rate_limit(None, "slow down").is_retryable());
+        assert!(Error::provider_with_status("OpenAI", 503, "down").is_retryable());
+        assert!(Error::provider_with_status("OpenAI", 429, "slow").is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_rejects_terminal_variants() {
+        // Status-bearing 4xx that aren't 429 are explicitly non-retryable.
+        assert!(!Error::provider_with_status("OpenAI", 400, "bad").is_retryable());
+        assert!(!Error::provider("OpenAI", "default non-retryable").is_retryable());
+        assert!(!Error::auth("bad key").is_retryable());
+        assert!(!Error::auth_with_status(401, "bad key").is_retryable());
+        assert!(!Error::config("nope").is_retryable());
+        assert!(!Error::invalid_prompt("nope").is_retryable());
+        assert!(!Error::ModelNotAvailable("gpt-x".into()).is_retryable());
+        assert!(!Error::context_window_exceeded("OpenAI", "too long").is_retryable());
+        assert!(!Error::compaction("empty memo").is_retryable());
+        // Mid-stream errors are intentionally non-retryable — the
+        // assistant turn is already partially constructed.
+        assert!(!Error::streaming("connection reset").is_retryable());
+    }
+
+    #[test]
+    fn retry_after_surfaces_rate_limit_hint() {
+        let with_hint = Error::rate_limit(Some(42), "slow down");
+        assert_eq!(with_hint.retry_after(), Some(Duration::from_secs(42)));
+
+        let without_hint = Error::rate_limit(None, "slow down");
+        assert_eq!(without_hint.retry_after(), None);
+
+        // Non-rate-limit variants never report a retry_after, even if
+        // they're otherwise retryable.
+        let provider_5xx = Error::provider_with_status("OpenAI", 503, "down");
+        assert_eq!(provider_5xx.retry_after(), None);
     }
 }

@@ -24,6 +24,11 @@ pub mod middleware;
 /// Concrete provider implementations. Browse this module to see what
 /// backends the lib supports and how to construct each one.
 pub mod providers;
+/// Retry helpers for transient provider failures — [`RetryPolicy`]
+/// centralises backoff / `Retry-After` arithmetic, [`retry()`] wraps an
+/// async operation in the loop. See the module docs for the buffered
+/// vs streaming patterns.
+pub mod retry;
 /// Server-Sent Events parser used by the default streaming response
 /// path. Exposed for callers plugging a custom [`transport`] into a
 /// non-default backend.
@@ -65,6 +70,7 @@ pub use factory::{ProviderConfig, ProviderFactory, ProviderType};
 pub use middleware::{generate, JsonCoercionMiddleware, Middleware};
 pub use provider::Provider;
 pub use response::{CompleteResponse, Response};
+pub use retry::{retry, RetryPolicy};
 pub use types::{
     Annotation, AnnotationKind, AssistantPart, ComputerUseConfig, Config, ConfigBuilder,
     FileResolver, FileSource, FinishReason, Function, FunctionCall, InputItem, LruFileResolver,
