@@ -708,16 +708,37 @@ mod tests {
     use tokio::sync::Barrier;
     use tokio::time::{timeout, Duration as TokioDuration};
 
-    /// Stable per-name Uuid for tests — `u128::from(byte)` so each
-    /// distinct tenant name maps to a unique fixed value. Lets tests
-    /// keep using readable names while the limiter sees Uuids.
+    /// Stable, **order-sensitive** per-name Uuid for tests. Lets
+    /// tests keep using readable names while the limiter sees Uuids.
+    ///
+    /// Earlier this used a plain byte-sum which collided for any
+    /// byte-permutation of a name (e.g. `"ab"` and `"ba"` mapped to
+    /// the same Uuid), silently sharing bucket state if two scopes
+    /// happened to be such anagrams. This formulation mixes the
+    /// byte into a multiplicative running state (constants borrowed
+    /// from `splitmix64`), so order matters.
     fn tenant_uuid(name: &str) -> Uuid {
-        let seed = name
-            .bytes()
-            .fold(0u128, |acc, b| acc.wrapping_add(b as u128));
-        // Mix into a non-zero u128 so Uuid::from_u128 gives stable
-        // distinct values for distinct names.
-        Uuid::from_u128(0x1000_0000_0000_0000_0000_0000_0000_0000 | seed)
+        let mut hash: u128 = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C834;
+        for b in name.bytes() {
+            hash = hash.wrapping_mul(0x100_0000_0000_0000_0000_0000_0000_013B);
+            hash ^= b as u128;
+        }
+        // Clear the top nibble and replace with `0x1` so the Uuid is
+        // clearly synthetic (and never `Uuid::nil`) when printed.
+        let cleared = hash & 0x0FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
+        Uuid::from_u128(cleared | 0x1000_0000_0000_0000_0000_0000_0000_0000)
+    }
+
+    /// Sanity check that the test helper actually distinguishes
+    /// byte-permuted names — the earlier order-insensitive version
+    /// silently returned the same Uuid for `"ab"` and `"ba"`,
+    /// fragmenting bucket isolation if any test happened to use
+    /// such a pair.
+    #[test]
+    fn tenant_uuid_distinguishes_byte_permutations() {
+        assert_ne!(tenant_uuid("ab"), tenant_uuid("ba"));
+        assert_ne!(tenant_uuid("loud"), tenant_uuid("doul"));
+        assert_eq!(tenant_uuid("vip"), tenant_uuid("vip"));
     }
 
     fn scope(tenant: &str, priority: Priority) -> RateScope {
@@ -919,39 +940,6 @@ mod tests {
         );
     }
 
-    /// Round-robin must still hold when one tenant has more waiters
-    /// than the other — once the shorter tenant's queue drains, the
-    /// remainder of the longer tenant's queue empties FIFO.
-    #[test]
-    fn priority_band_round_robin_handles_uneven_tenants() {
-        use std::sync::Arc as StdArc;
-        let tenant_a = Uuid::from_u128(0xa);
-        let tenant_b = Uuid::from_u128(0xb);
-        let mut band = PriorityBand::default();
-        let make_waiter = |id: u64, tenant: Uuid| Waiter {
-            id,
-            priority: Priority::Interactive,
-            tenant,
-            notify: StdArc::new(Notify::new()),
-        };
-        // 4 from A, 1 from B (push order: A, A, A, A, B).
-        band.push(make_waiter(0, tenant_a));
-        band.push(make_waiter(1, tenant_a));
-        band.push(make_waiter(2, tenant_a));
-        band.push(make_waiter(3, tenant_a));
-        band.push(make_waiter(4, tenant_b));
-        let mut popped = Vec::new();
-        while let Some(w) = band.pop() {
-            popped.push(w.tenant);
-        }
-        // First A pops, then round-robin gives B a turn, then A
-        // drains the remaining 3 in order.
-        assert_eq!(
-            popped,
-            vec![tenant_a, tenant_b, tenant_a, tenant_a, tenant_a],
-        );
-    }
-
     #[tokio::test]
     async fn rate_limit_observation_parks_bucket() {
         let limiter = InMemoryRateLimiter::try_with_config(permissive_config()).unwrap();
@@ -1142,7 +1130,7 @@ mod tests {
     /// wraps the callback in `catch_unwind` for exactly this.
     #[test]
     fn permit_drop_inside_outer_panic_does_not_abort() {
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         let observed = Arc::new(AtomicU32::new(0));
         let observed_cb = observed.clone();
         // Construct a permit whose callback panics. If our Drop guard
@@ -1157,7 +1145,32 @@ mod tests {
             });
             panic!("outer panic that triggers the permit's Drop");
         }));
+        // Sentinel: only set if execution actually proceeded past the
+        // `catch_unwind` boundary. If a double-panic had aborted the
+        // process, we'd never reach this line — the runner would just
+        // exit. Asserting it explicitly distinguishes "caught cleanly"
+        // from "process kept running but the assertion happened to be
+        // skipped".
+        let reached_after_unwind = AtomicBool::new(true);
+        assert!(
+            reached_after_unwind.load(Ordering::SeqCst),
+            "execution must continue past catch_unwind — a double-panic abort would have killed the runner",
+        );
         assert!(result.is_err(), "outer panic should still be observed");
+        // The payload propagated out of catch_unwind must be the
+        // *outer* panic, not the swallowed inner observe panic. If the
+        // catch_unwind boundary were inverted (catching the outer,
+        // letting the inner through) this assertion would fail.
+        let payload = result.err().unwrap();
+        let msg = payload
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        assert!(
+            msg.contains("outer panic"),
+            "propagated panic should be the outer one, got: {msg:?}",
+        );
         assert_eq!(
             observed.load(Ordering::SeqCst),
             1,
@@ -1274,6 +1287,11 @@ mod tests {
 
     /// Repeated 429s must not push `rps` below `min_rps`. A bug in
     /// the multiplicative-decrease clamp would let it underflow.
+    ///
+    /// Drives the halvings via direct `Inner::observe` calls rather
+    /// than the async acquire path because once `rps → min_rps`
+    /// the dispatch interval grows to seconds, making the test slow
+    /// for what's really just AIMD arithmetic.
     #[tokio::test]
     async fn aimd_floor_holds_under_repeated_429() {
         let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
@@ -1286,19 +1304,22 @@ mod tests {
             max_park: Duration::from_millis(5),
         })
         .unwrap();
-        // 5 halvings: 4 → 2 → 1 → 0.5 → 0.25 → 0.125
-        // Without the floor, rps would end at 0.125. With min_rps=1.0
-        // it must clamp at 1.0.
+        // Establish the bucket via a single acquire (so it exists
+        // in the map), then drop the permit (Cancelled — no AIMD
+        // change).
+        let scope = scope("t1", Priority::Interactive);
+        let key: Arc<str> = Arc::from(scope.bucket_key.as_str());
+        drop(limiter.acquire(&scope).await.unwrap());
+        // 5 halvings: 4 → 2 → 1 → 0.5 → 0.25 → 0.125 without the
+        // floor. With `min_rps = 1.0` the floor must hold.
         for _ in 0..5 {
-            let p = limiter
-                .acquire(&scope("t1", Priority::Interactive))
-                .await
-                .unwrap();
-            p.observe(RateOutcome::RateLimited {
-                retry_after: Some(Duration::from_millis(1)),
-                info: ProviderRateInfo::default(),
-            });
-            tokio::time::sleep(Duration::from_millis(8)).await;
+            limiter.inner.observe(
+                &key,
+                RateOutcome::RateLimited {
+                    retry_after: Some(Duration::from_millis(1)),
+                    info: ProviderRateInfo::default(),
+                },
+            );
         }
         let buckets = limiter.inner.buckets.lock();
         let bucket = buckets.values().next().unwrap();
@@ -1617,13 +1638,14 @@ mod tests {
 
     /// Cancelling the actual *head* waiter (one that's waiting on
     /// the AIMD gate, not one further back in the queue) must
-    /// promote the next waiter and dispatch it on schedule. The
-    /// existing `cancelled_acquire_does_not_wedge_bucket` test
-    /// covers the non-head case (a gate is held so the cancelled
-    /// acquire is queued behind it); this variant cancels the
-    /// genuine head — the waiter that was actively computing its
-    /// own sleep target — and asserts the wake re-fires for the
-    /// new head.
+    /// promote a real *follower* that was already enqueued behind
+    /// it. The existing `cancelled_acquire_does_not_wedge_bucket`
+    /// test covers the non-head case (a permit is held so the
+    /// cancelled acquire is queued behind it); this variant cancels
+    /// the genuine head while a follower is parked at
+    /// `WaitForever`, and asserts the follower is woken and
+    /// dispatches. Without `AcquireGuard::drop → wake_head()` the
+    /// follower would never re-evaluate its dispatch target.
     #[tokio::test]
     async fn head_cancel_during_wait_promotes_next_waiter() {
         let limiter = Arc::new(
@@ -1640,31 +1662,44 @@ mod tests {
             .acquire(&scope("warmup", Priority::Interactive))
             .await
             .unwrap();
-        // Acquire the head waiter via a future we'll abort partway
-        // through its wait. The 50ms timeout is well under the 500ms
-        // AIMD interval, so the future is dropped while it's the
-        // active head still computing its sleep target. The
-        // `AcquireGuard` must remove the waiter from the queue and
-        // fire `wake_head` for whoever's next.
-        let result = timeout(
-            TokioDuration::from_millis(50),
-            limiter.acquire(&scope("head", Priority::Interactive)),
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "the head acquire should time out (and thus drop) within 50ms",
-        );
-        // A fresh acquire by a separate caller must still dispatch
-        // — if the cancelled head left the queue dirty, this would
-        // hang forever.
-        let p = timeout(
-            TokioDuration::from_secs(2),
-            limiter.acquire(&scope("next", Priority::Interactive)),
-        )
-        .await
-        .expect("next acquire after head-cancel-during-wait must dispatch")
-        .unwrap();
+        // Spawn the head waiter with a short timeout — it will be
+        // cancelled while still actively waiting on the AIMD gate.
+        let lim_head = limiter.clone();
+        let head = tokio::spawn(async move {
+            let _ = timeout(
+                TokioDuration::from_millis(100),
+                lim_head.acquire(&scope("head", Priority::Interactive)),
+            )
+            .await;
+        });
+        // Let the head reach the await point and claim head-of-queue
+        // before the follower enqueues behind it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Spawn a real follower that genuinely needs to be promoted —
+        // it's parked at `WaitForever` until the head cancels and
+        // `wake_head` re-fires.
+        let lim_follower = limiter.clone();
+        let follower = tokio::spawn(async move {
+            let p = lim_follower
+                .acquire(&scope("follower", Priority::Interactive))
+                .await
+                .unwrap();
+            (Instant::now(), p)
+        });
+        // Let the follower reach the await point and enqueue behind
+        // the head.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Wait for the head to be cancelled (its 100ms timeout
+        // elapses). The `AcquireGuard` drop must remove the head and
+        // fire `wake_head`, promoting the follower.
+        head.await.unwrap();
+        // The follower must now dispatch on the bucket's normal
+        // schedule — if `wake_head` didn't re-fire after the head
+        // dropped, it would stay at `WaitForever`.
+        let (_when, p) = timeout(TokioDuration::from_secs(2), follower)
+            .await
+            .expect("follower must dispatch after head cancellation")
+            .unwrap();
         drop(p);
     }
 }

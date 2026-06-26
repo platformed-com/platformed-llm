@@ -887,15 +887,13 @@ pub(crate) fn convert_stream_event_stateful(
             // `rate_limit_error`) arrive after a 200 has already gone
             // out; normalise to the typed `Error::RateLimit` variant
             // so caller-level retry loops and the rate limiter can
-            // both treat them like a pre-stream 429. Other mid-stream
+            // both treat them like a pre-stream 429. (The
+            // `ObservingStream` wrapper that holds the rate-limit
+            // permit across stream consumption picks up the
+            // `Err(Error::RateLimit { … })` here and feeds it back
+            // as `RateOutcome::RateLimited`, so the AIMD model does
+            // learn from this mid-stream event.) Other mid-stream
             // errors stay as `Error::Provider`.
-            //
-            // Note: the rate-limit permit was already observed at the
-            // HTTP-200 success site, so the limiter's AIMD model
-            // doesn't yet learn from this mid-stream event. Holding
-            // the permit through the stream consumption would fix
-            // that — tracked as a v2 refactor; for now the caller's
-            // retry loop carries the resilience signal.
             if error.error_type == "rate_limit_error" || error.error_type == "overloaded_error" {
                 return Err(Error::rate_limit(
                     None,
