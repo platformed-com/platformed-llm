@@ -218,13 +218,16 @@ impl Error {
     /// re-issuing the same request is likely to behave differently
     /// next time.
     ///
-    /// Returns `true` for [`Self::RateLimit`], [`Self::Transport`],
-    /// and [`Self::Provider`] when its `retryable` flag is set
-    /// (5xx / 429, mid-stream connection-drop errors that we
-    /// classified as transient at their site). All other variants
-    /// are terminal — re-issuing the same request won't change the
-    /// outcome (bad auth, malformed prompt, model unavailable,
-    /// context-window-exceeded, etc.).
+    /// Returns `true` for [`Self::RateLimit`], for [`Self::Transport`]
+    /// **only when** the wrapped `reqwest::Error` is a connect /
+    /// timeout / body-read failure (the genuinely transient network
+    /// shapes — request-build, body-decode, and startup errors stay
+    /// terminal), and for [`Self::Provider`] when its `retryable`
+    /// flag is set (5xx / 429, mid-stream connection-drop errors
+    /// that we classified as transient at their site). All other
+    /// variants are terminal — re-issuing the same request won't
+    /// change the outcome (bad auth, malformed prompt, model
+    /// unavailable, context-window-exceeded, etc.).
     ///
     /// **"Retryable" is not the same as "safe to retry without
     /// thought."** Every retry is a fresh request — the model's
@@ -243,7 +246,16 @@ impl Error {
     pub fn is_retryable(&self) -> bool {
         match self {
             #[cfg(feature = "reqwest")]
-            Error::Transport(_) => true,
+            Error::Transport(e) => {
+                // `reqwest::Error` is a grab bag. Only the network-
+                // layer failure shapes are genuinely transient; a
+                // request-build error, a response-body decode error,
+                // or a startup `ClientBuilder` failure won't behave
+                // differently on retry. Be explicit about the
+                // transient set so we don't burn 4× the latency on
+                // a deterministic failure.
+                e.is_connect() || e.is_timeout() || e.is_body()
+            }
             Error::RateLimit { .. } => true,
             Error::Provider { retryable, .. } => *retryable,
             Error::Auth { .. }

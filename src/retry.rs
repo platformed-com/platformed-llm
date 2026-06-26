@@ -109,18 +109,30 @@ impl RetryPolicy {
     ///
     /// `attempt` is the 1-indexed attempt number that just failed.
     /// `1` after the first failure, `2` after the second, …
+    ///
+    /// The fields on [`RetryPolicy`] are `pub` for ergonomics; a
+    /// caller setting nonsense values (`NaN`, negative multiplier,
+    /// overflow) saturates here rather than panicking. The clamp
+    /// keeps `Duration::from_secs_f64` away from its panic
+    /// preconditions.
     pub fn delay_after(&self, err: &Error, attempt: u32) -> Option<Duration> {
         if !err.is_retryable() || attempt >= self.max_attempts {
             return None;
         }
+        let max_secs = self.max_backoff.as_secs_f64();
         let nominal = err.retry_after().unwrap_or_else(|| {
-            let secs = self.initial_backoff.as_secs_f64()
-                * self.backoff_multiplier.powi((attempt as i32) - 1);
-            // `from_secs_f64` panics on NaN / negative; the multiplier
-            // is finite-positive by construction (`f64::powi` of a
-            // positive base) so this is safe under the documented
-            // contract.
-            Duration::from_secs_f64(secs)
+            let base = self.initial_backoff.as_secs_f64();
+            let mult = self.backoff_multiplier.powi((attempt as i32) - 1);
+            let secs = base * mult;
+            // Clamp away from `from_secs_f64`'s panic preconditions
+            // (negative, non-finite, overflow). The cap is `max_secs`
+            // anyway, so saturating up to that loses nothing.
+            let safe_secs = if secs.is_finite() && secs >= 0.0 {
+                secs.min(max_secs)
+            } else {
+                max_secs
+            };
+            Duration::from_secs_f64(safe_secs)
         });
         Some(nominal.min(self.max_backoff))
     }
@@ -249,6 +261,59 @@ mod tests {
         assert_eq!(policy.delay_after(&err, 2), Some(Duration::from_secs(2)));
         assert_eq!(policy.delay_after(&err, 3), Some(Duration::from_secs(4)));
         assert_eq!(policy.delay_after(&err, 4), Some(Duration::from_secs(8)));
+    }
+
+    /// Caller-set nonsense values on the public fields must
+    /// saturate to `max_backoff` rather than panic inside
+    /// `Duration::from_secs_f64`. Use attempt >= 2 because the
+    /// multiplier exponent is `attempt - 1` and any value (incl.
+    /// NaN) to the 0th power is 1.0 in IEEE 754.
+    #[test]
+    fn delay_after_saturates_on_pathological_inputs() {
+        let base = RetryPolicy {
+            max_attempts: 5,
+            initial_backoff: Duration::from_secs(1),
+            backoff_multiplier: f64::NAN,
+            max_backoff: Duration::from_secs(60),
+        };
+        let err = Error::rate_limit(None, "slow");
+        // NaN multiplier × non-zero exponent → NaN → must clamp,
+        // not panic.
+        assert_eq!(base.delay_after(&err, 2), Some(Duration::from_secs(60)));
+        // Negative multiplier × odd exponent → negative → must clamp.
+        let neg_policy = RetryPolicy {
+            backoff_multiplier: -2.0,
+            ..base
+        };
+        assert_eq!(
+            neg_policy.delay_after(&err, 2),
+            Some(Duration::from_secs(60)),
+        );
+        // Overflow: huge multiplier × attempts → +inf → must clamp.
+        let huge_policy = RetryPolicy {
+            backoff_multiplier: 1e300,
+            ..base
+        };
+        assert_eq!(
+            huge_policy.delay_after(&err, 3),
+            Some(Duration::from_secs(60)),
+        );
+    }
+
+    /// The cap on the *exponential* branch (when no provider hint)
+    /// must actually hold — a regression dropping `.min(max_backoff)`
+    /// from the no-hint path should fail this.
+    #[test]
+    fn delay_after_caps_exponential_branch_at_max_backoff() {
+        let policy = RetryPolicy {
+            max_attempts: 10,
+            initial_backoff: Duration::from_secs(10),
+            backoff_multiplier: 2.0,
+            max_backoff: Duration::from_secs(30),
+        };
+        // attempt 4 → 10 * 2^3 = 80s, capped at 30s.
+        let err = Error::rate_limit(None, "slow");
+        assert_eq!(policy.delay_after(&err, 4), Some(Duration::from_secs(30)));
     }
 
     /// Tight policy for tests — millisecond-scale delays so the

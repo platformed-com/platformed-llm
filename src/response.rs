@@ -98,11 +98,34 @@ pub struct Response {
 /// Unwrap the [`Arc<Error>`] carried by [`StreamEvent::Error`] into an
 /// owned [`Error`]. Tries [`Arc::try_unwrap`] first (the common case in
 /// our own `buffer` / `collect` paths where we hold the only Arc); if
-/// shared, falls back to a `Provider("Stream", …)` wrap built from the
-/// inner error's Display (since `Error` itself isn't `Clone`).
+/// shared, falls back to a synthetic wrap that preserves the
+/// **retryability classification** of the original error — without
+/// this, a shared `Error::RateLimit` mid-stream would silently
+/// downgrade to a non-retryable provider error and the caller's
+/// retry loop would give up.
 fn unwrap_stream_error(error: std::sync::Arc<Error>) -> Error {
-    std::sync::Arc::try_unwrap(error)
-        .unwrap_or_else(|arc| Error::provider("Stream", format!("mid-stream error: {arc}")))
+    std::sync::Arc::try_unwrap(error).unwrap_or_else(|arc| {
+        // `Error` isn't `Clone` (reqwest::Error inside Transport),
+        // so we synthesise a fresh one. Preserve the typed
+        // retry-after when present (rate limits) so callers still
+        // honour the provider hint; otherwise rebuild a
+        // `Provider("Stream", …)` carrying the inner's
+        // `is_retryable()` verdict so retry policies still match
+        // the source's intent.
+        if let Some(retry_after) = arc.retry_after() {
+            Error::RateLimit {
+                retry_after: Some(retry_after),
+                message: format!("mid-stream error (cloned): {arc}"),
+            }
+        } else {
+            Error::Provider {
+                provider: "Stream",
+                status: None,
+                retryable: arc.is_retryable(),
+                message: format!("mid-stream error (cloned): {arc}"),
+            }
+        }
+    })
 }
 
 impl Response {
@@ -267,6 +290,45 @@ mod tests {
         let stream = futures_util::stream::iter(events);
         let err = Response::from_stream(stream).buffer().await.expect_err("");
         assert!(err.to_string().contains("model internal error"));
+    }
+
+    /// The Arc-shared fallback path of `unwrap_stream_error` must
+    /// preserve the inner error's retryability so a downstream
+    /// retry policy still matches the source's intent. Without
+    /// this, a mid-stream `Error::RateLimit` whose Arc happened to
+    /// be shared (e.g. via the event log produced by `collect`)
+    /// would downgrade to a non-retryable `Provider("Stream", …)`
+    /// and the retry loop would give up.
+    #[test]
+    fn unwrap_stream_error_fallback_preserves_retry_after() {
+        let inner = std::sync::Arc::new(Error::rate_limit(Some(7), "overloaded"));
+        // Keep a second strong ref so `try_unwrap` fails.
+        let _other = inner.clone();
+        let unwrapped = unwrap_stream_error(inner);
+        match unwrapped {
+            Error::RateLimit { retry_after, .. } => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(7)));
+            }
+            other => panic!("expected RateLimit with retry_after preserved, got {other:?}"),
+        }
+    }
+
+    /// Same as above but for a transient `Provider` error: the
+    /// fallback path must carry the `retryable` flag through.
+    #[test]
+    fn unwrap_stream_error_fallback_preserves_retryable_flag() {
+        let inner = std::sync::Arc::new(Error::provider_with_status(
+            "OpenAI",
+            503,
+            "service unavailable",
+        ));
+        let _other = inner.clone();
+        let unwrapped = unwrap_stream_error(inner);
+        assert!(
+            unwrapped.is_retryable(),
+            "transient 5xx must remain retryable across the shared-Arc fallback, \
+             got {unwrapped:?}",
+        );
     }
 
     #[test]
