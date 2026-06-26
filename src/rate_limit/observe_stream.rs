@@ -191,7 +191,7 @@ mod tests {
     async fn mid_stream_other_error_observes_other_failure() {
         let (permit, count, kinds) = permit_counter();
         let events: Vec<Result<StreamEvent, Error>> =
-            vec![Err(Error::streaming("connection reset"))];
+            vec![Err(Error::provider("Stream", "connection reset"))];
         let stream = futures::stream::iter(events);
         let mut wrapped = observe_response_stream(stream, permit, ProviderRateInfo::default());
         while wrapped.next().await.is_some() {}
