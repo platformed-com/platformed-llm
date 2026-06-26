@@ -705,7 +705,6 @@ impl Bucket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::sync::Barrier;
     use tokio::time::{timeout, Duration as TokioDuration};
 
@@ -876,69 +875,81 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn tenant_fairness_within_priority_band() {
-        let limiter = Arc::new(
-            InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
-                initial_rps: 10.0, // 100ms interval
-                ..permissive_config()
-            })
-            .unwrap(),
+    /// Direct unit test of [`PriorityBand`]'s round-robin pop order.
+    ///
+    /// An earlier version of this test used the async acquire path
+    /// with a spin-wait counter that serialised the acquires — each
+    /// task waited for the previous one's `acquire().await` to
+    /// complete before its own enqueue. That meant only one waiter
+    /// was ever queued at a time and the round-robin pop logic was
+    /// never exercised: a FIFO `PriorityBand::pop` would have
+    /// passed. This version drives the data structure directly so
+    /// the invariant we care about — "alternating tenants A and B
+    /// each get one dispatch per rotation, regardless of insertion
+    /// order within the band" — is genuinely pinned.
+    #[test]
+    fn priority_band_round_robins_between_tenants() {
+        use std::sync::Arc as StdArc;
+        let tenant_a = Uuid::from_u128(0xa);
+        let tenant_b = Uuid::from_u128(0xb);
+        let mut band = PriorityBand::default();
+        let make_waiter = |id: u64, tenant: Uuid| Waiter {
+            id,
+            priority: Priority::Interactive,
+            tenant,
+            notify: StdArc::new(Notify::new()),
+        };
+        // Push 3 each in alternating order: a, b, a, b, a, b.
+        band.push(make_waiter(0, tenant_a));
+        band.push(make_waiter(1, tenant_b));
+        band.push(make_waiter(2, tenant_a));
+        band.push(make_waiter(3, tenant_b));
+        band.push(make_waiter(4, tenant_a));
+        band.push(make_waiter(5, tenant_b));
+        // Pop until empty; record the order of tenant ids.
+        let mut popped = Vec::new();
+        while let Some(w) = band.pop() {
+            popped.push(w.tenant);
+        }
+        // Round-robin: each pop alternates tenant, never two of the
+        // same tenant in a row while the other has waiters queued.
+        assert_eq!(
+            popped,
+            vec![tenant_a, tenant_b, tenant_a, tenant_b, tenant_a, tenant_b],
         );
-        // Hold the gate so subsequent acquires queue rather than
-        // each dispatching immediately at cold-start.
-        let _gate = limiter
-            .acquire(&scope("gate", Priority::Interactive))
-            .await
-            .unwrap();
-        // Barrier-synced enqueue: 6 tasks (3 per tenant) all reach
-        // the acquire point at the same logical instant. We
-        // additionally enforce enqueue *order* via a sequenced
-        // counter so the round-robin assertion is deterministic.
-        let order_counter = Arc::new(AtomicU32::new(0));
-        let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut handles = Vec::new();
-        for i in 0..6 {
-            let tenant = if i % 2 == 0 { "a" } else { "b" };
-            let seq = i;
-            let lim = limiter.clone();
-            let log = dispatched.clone();
-            let counter = order_counter.clone();
-            let t = tenant.to_string();
-            handles.push(tokio::spawn(async move {
-                // Spin-wait for our turn so the enqueue order is
-                // exactly the spawn order — independent of the
-                // task scheduler's whims.
-                while counter.load(Ordering::SeqCst) != seq {
-                    tokio::task::yield_now().await;
-                }
-                let permit = lim
-                    .acquire(&scope(&t, Priority::Interactive))
-                    .await
-                    .unwrap();
-                counter.fetch_add(1, Ordering::SeqCst);
-                log.lock().push(t);
-                drop(permit);
-            }));
+    }
+
+    /// Round-robin must still hold when one tenant has more waiters
+    /// than the other — once the shorter tenant's queue drains, the
+    /// remainder of the longer tenant's queue empties FIFO.
+    #[test]
+    fn priority_band_round_robin_handles_uneven_tenants() {
+        use std::sync::Arc as StdArc;
+        let tenant_a = Uuid::from_u128(0xa);
+        let tenant_b = Uuid::from_u128(0xb);
+        let mut band = PriorityBand::default();
+        let make_waiter = |id: u64, tenant: Uuid| Waiter {
+            id,
+            priority: Priority::Interactive,
+            tenant,
+            notify: StdArc::new(Notify::new()),
+        };
+        // 4 from A, 1 from B (push order: A, A, A, A, B).
+        band.push(make_waiter(0, tenant_a));
+        band.push(make_waiter(1, tenant_a));
+        band.push(make_waiter(2, tenant_a));
+        band.push(make_waiter(3, tenant_a));
+        band.push(make_waiter(4, tenant_b));
+        let mut popped = Vec::new();
+        while let Some(w) = band.pop() {
+            popped.push(w.tenant);
         }
-        // Wait long enough for all 6 to reach their spin-wait point.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        // Bump the counter so the first task can proceed; the others
-        // chain off each other's completion.
-        // Actually our counter is shared with completion-side, so
-        // increment to start the first task.
-        // Note: the `counter` is incremented inside acquire — but
-        // we need to start it. The first task needs counter==0,
-        // which is the initial value. So we just need to drop the
-        // gate to start the dispatch chain.
-        drop(_gate);
-        for h in handles {
-            h.await.unwrap();
-        }
-        let order = dispatched.lock().clone();
-        // Round-robin: spawn order alternates a/b/a/b/a/b and the
-        // limiter dispatches one per tenant in rotation per band.
-        assert_eq!(order, vec!["a", "b", "a", "b", "a", "b"]);
+        // First A pops, then round-robin gives B a turn, then A
+        // drains the remaining 3 in order.
+        assert_eq!(
+            popped,
+            vec![tenant_a, tenant_b, tenant_a, tenant_a, tenant_a],
+        );
     }
 
     #[tokio::test]
@@ -1157,7 +1168,9 @@ mod tests {
     /// Many simultaneous cancellations (acquire-then-drop-without-
     /// observe) must leave the bucket cleanly empty. This guards
     /// against the AcquireGuard / Drop interaction missing a
-    /// waiter under load.
+    /// waiter under load — including the harder case where multiple
+    /// waiters share a tenant, so `remove_waiter` exercises the
+    /// "queue not empty, leave tenant in `tenant_order`" branch.
     #[tokio::test]
     async fn concurrent_cancellations_leave_bucket_empty() {
         let limiter = Arc::new(
@@ -1171,6 +1184,12 @@ mod tests {
             .unwrap(),
         );
         let mut tasks = Vec::new();
+        // Two shared tenants ("a" / "b") across both priorities —
+        // so each tenant ends up with 5 waiters in its
+        // `interactive` band and 5 in its `background` band.
+        // Earlier versions used `format!("t{i}")` giving every
+        // task its own tenant, which never exercised the
+        // multi-waiter-per-tenant-queue cancellation path.
         for i in 0..20 {
             let lim = limiter.clone();
             let priority = if i % 2 == 0 {
@@ -1178,10 +1197,11 @@ mod tests {
             } else {
                 Priority::Background
             };
+            let tenant_name = if i % 4 < 2 { "a" } else { "b" };
             tasks.push(tokio::spawn(async move {
                 let _ = timeout(
                     TokioDuration::from_millis(50),
-                    lim.acquire(&scope(&format!("t{i}"), priority)),
+                    lim.acquire(&scope(tenant_name, priority)),
                 )
                 .await;
                 // permit either dispatched (then drops here) or
@@ -1595,41 +1615,55 @@ mod tests {
             .unwrap();
     }
 
-    /// Cancelling the actual *head* waiter (not just one further back
-    /// in the queue) must promote the next waiter and dispatch it on
-    /// schedule. The existing `cancelled_acquire_does_not_wedge_bucket`
-    /// test holds a gate so the cancelled acquire isn't the head;
-    /// this variant cancels the head directly.
+    /// Cancelling the actual *head* waiter (one that's waiting on
+    /// the AIMD gate, not one further back in the queue) must
+    /// promote the next waiter and dispatch it on schedule. The
+    /// existing `cancelled_acquire_does_not_wedge_bucket` test
+    /// covers the non-head case (a gate is held so the cancelled
+    /// acquire is queued behind it); this variant cancels the
+    /// genuine head — the waiter that was actively computing its
+    /// own sleep target — and asserts the wake re-fires for the
+    /// new head.
     #[tokio::test]
-    async fn head_cancel_promotes_next_waiter() {
+    async fn head_cancel_during_wait_promotes_next_waiter() {
         let limiter = Arc::new(
             InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
-                initial_rps: 2.0, // 500ms interval
+                initial_rps: 2.0, // 500ms interval — leaves plenty of cancel window
                 ..permissive_config()
             })
             .unwrap(),
         );
-        // No gate this time — cancelled task IS the head.
-        let lim_cancel = limiter.clone();
-        let cancelled = tokio::spawn(async move {
-            // Acquire immediately (first request → dispatches). Hold
-            // briefly, then drop without observe to trigger Cancelled.
-            let permit = lim_cancel
-                .acquire(&scope("first", Priority::Interactive))
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            drop(permit); // → Cancelled → wake_head fires
-        });
-        cancelled.await.unwrap();
-        // Second acquire — after the first one's dispatch interval
-        // elapses (~500ms), but must not hang forever.
+        // Burn the cold-start slot so the next acquire actually
+        // *waits* on the AIMD gate (rather than dispatching
+        // immediately).
+        let _p0 = limiter
+            .acquire(&scope("warmup", Priority::Interactive))
+            .await
+            .unwrap();
+        // Acquire the head waiter via a future we'll abort partway
+        // through its wait. The 50ms timeout is well under the 500ms
+        // AIMD interval, so the future is dropped while it's the
+        // active head still computing its sleep target. The
+        // `AcquireGuard` must remove the waiter from the queue and
+        // fire `wake_head` for whoever's next.
+        let result = timeout(
+            TokioDuration::from_millis(50),
+            limiter.acquire(&scope("head", Priority::Interactive)),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the head acquire should time out (and thus drop) within 50ms",
+        );
+        // A fresh acquire by a separate caller must still dispatch
+        // — if the cancelled head left the queue dirty, this would
+        // hang forever.
         let p = timeout(
             TokioDuration::from_secs(2),
-            limiter.acquire(&scope("second", Priority::Interactive)),
+            limiter.acquire(&scope("next", Priority::Interactive)),
         )
         .await
-        .expect("second acquire after head cancel must dispatch")
+        .expect("next acquire after head-cancel-during-wait must dispatch")
         .unwrap();
         drop(p);
     }

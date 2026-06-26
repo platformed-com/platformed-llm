@@ -27,6 +27,23 @@
 //! Pre-stream errors (transport failure, non-2xx HTTP) are still
 //! observed at the call site before the wrapper is even constructed;
 //! that path doesn't need the wrapper.
+//!
+//! # `info` field & per-provider asymmetry
+//!
+//! The `info: ProviderRateInfo` the wrapper holds is captured at
+//! HTTP-200 time from response headers. Only **OpenAI** currently
+//! populates it (`x-ratelimit-{remaining,reset}-*`); Anthropic-via-
+//! Vertex and Vertex-Gemini pass `ProviderRateInfo::default()`
+//! because Vertex doesn't expose comparable headers on its REST
+//! responses. The practical consequence inside
+//! [`super::InMemoryRateLimiter::observe_success`]: the
+//! observed-capacity ceiling — the cap that prevents AIMD from
+//! growing past what the provider's `remaining` budget suggests —
+//! only ever fires for OpenAI. Other providers grow via plain
+//! `additive_step` until a 429 multiplicatively halves them. That's
+//! the right behaviour given the headers we have (no signal → no
+//! ceiling), but it does mean the AIMD model is *less* informed for
+//! non-OpenAI providers.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
