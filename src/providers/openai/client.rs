@@ -968,9 +968,10 @@ impl OpenAIStreamState {
                 }
                 let key = (output_index, None);
                 let index = self.tracker.index_of(&key).ok_or_else(|| {
-                    Error::streaming(format!(
-                        "function_call_arguments.delta for unknown tool part {key:?}"
-                    ))
+                    Error::provider(
+                        "OpenAI",
+                        format!("function_call_arguments.delta for unknown tool part {key:?}"),
+                    )
                 })?;
                 self.fn_args_streamed.insert(key);
                 Ok(vec![StreamEvent::Delta { index, delta }])
@@ -983,7 +984,10 @@ impl OpenAIStreamState {
             } => {
                 let key = (output_index, Some(content_index));
                 let index = self.tracker.index_of(&key).ok_or_else(|| {
-                    Error::streaming(format!("annotation.added for unknown content part {key:?}"))
+                    Error::provider(
+                        "OpenAI",
+                        format!("annotation.added for unknown content part {key:?}"),
+                    )
                 })?;
                 let Some(annotation) = map_openai_annotation(annotation) else {
                     return Ok(vec![]);
@@ -1075,9 +1079,10 @@ impl OpenAIStreamState {
         }
         let key = (output_index, Some(content_index));
         let index = self.tracker.index_of(&key).ok_or_else(|| {
-            Error::streaming(format!(
-                "{kind_label}.delta for unknown content part {key:?}"
-            ))
+            Error::provider(
+                "OpenAI",
+                format!("{kind_label}.delta for unknown content part {key:?}"),
+            )
         })?;
         Ok(vec![StreamEvent::Delta { index, delta }])
     }
@@ -1106,9 +1111,10 @@ impl OpenAIStreamState {
             let (idx, start) = self.tracker.open(key, PartKind::Reasoning);
             return Ok(vec![start, StreamEvent::Delta { index: idx, delta }]);
         }
-        Err(Error::streaming(format!(
-            "reasoning delta for unknown reasoning part {key:?}"
-        )))
+        Err(Error::provider(
+            "OpenAI",
+            format!("reasoning delta for unknown reasoning part {key:?}"),
+        ))
     }
 }
 
@@ -1292,7 +1298,7 @@ impl Provider for OpenAIProvider {
                 // panicking this task too.
                 let mut guard = state_for_stream
                     .lock()
-                    .map_err(|_| Error::streaming("OpenAI stream state lock poisoned"))?;
+                    .map_err(|_| Error::provider("OpenAI", "stream state lock poisoned"))?;
                 guard.process(stream_event)
             })
             .flat_map(|result| match result {

@@ -58,10 +58,6 @@ pub enum Error {
     #[error("invalid prompt: {0}")]
     InvalidPrompt(String),
 
-    /// Mid-stream / SSE parsing failure.
-    #[error("streaming error: {0}")]
-    Streaming(String),
-
     /// Rate limit hit (HTTP 429). `retry_after` is the parsed
     /// `Retry-After` header or equivalent, if any.
     #[error("rate limit exceeded{}{}", retry_after_suffix(*retry_after), .message)]
@@ -185,11 +181,6 @@ impl Error {
         }
     }
 
-    /// Build a streaming error (SSE parse failure, out-of-order events, etc.).
-    pub fn streaming(message: impl Into<String>) -> Self {
-        Error::Streaming(message.into())
-    }
-
     /// Build a rate-limit error. `retry_after_seconds` is parsed from
     /// the provider's `Retry-After` header or equivalent.
     pub fn rate_limit(retry_after_seconds: Option<u64>, message: impl Into<String>) -> Self {
@@ -228,10 +219,10 @@ impl Error {
     /// next time.
     ///
     /// Returns `true` for [`Self::RateLimit`], [`Self::Transport`],
-    /// [`Self::Streaming`] (SSE parse failure / mid-stream connection
-    /// drop — also transient), and [`Self::Provider`] when its
-    /// `retryable` flag is set (5xx / 429). All other variants are
-    /// terminal — re-issuing the same request won't change the
+    /// and [`Self::Provider`] when its `retryable` flag is set
+    /// (5xx / 429, mid-stream connection-drop errors that we
+    /// classified as transient at their site). All other variants
+    /// are terminal — re-issuing the same request won't change the
     /// outcome (bad auth, malformed prompt, model unavailable,
     /// context-window-exceeded, etc.).
     ///
@@ -241,9 +232,8 @@ impl Error {
     /// If the caller has already shown partial output to a user or
     /// committed it downstream, the new attempt's output won't
     /// stitch cleanly with what was shown. That's a caller-policy
-    /// concern (the same partial-state question applies to a
-    /// mid-stream [`Self::RateLimit`] as to [`Self::Streaming`], so
-    /// the variant alone doesn't carry that information).
+    /// concern — pre-stream vs mid-stream timing isn't a variant
+    /// property.
     ///
     /// Pair this with [`Self::retry_after`] when building a manual
     /// retry loop, or hand off to [`crate::retry()`] /
@@ -255,7 +245,6 @@ impl Error {
             #[cfg(feature = "reqwest")]
             Error::Transport(_) => true,
             Error::RateLimit { .. } => true,
-            Error::Streaming(_) => true,
             Error::Provider { retryable, .. } => *retryable,
             Error::Auth { .. }
             | Error::Serialization(_)
@@ -420,12 +409,6 @@ mod tests {
         assert!(Error::rate_limit(None, "slow down").is_retryable());
         assert!(Error::provider_with_status("OpenAI", 503, "down").is_retryable());
         assert!(Error::provider_with_status("OpenAI", 429, "slow").is_retryable());
-        // SSE parse failure / mid-stream drop is a transient failure
-        // (a fresh request may succeed). Whether the caller can
-        // safely retry given partial output already shown to a user
-        // is policy, not an error-variant property — same question
-        // applies to a mid-stream RateLimit.
-        assert!(Error::streaming("connection reset").is_retryable());
     }
 
     #[test]

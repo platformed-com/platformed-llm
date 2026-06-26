@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn translate_suppresses_done_after_upstream_error() {
-        let events = events_from(vec![Err(Error::streaming("boom"))]);
+        let events = events_from(vec![Err(Error::provider("Stream", "boom"))]);
         assert!(
             events.iter().any(|r| r.is_err()),
             "expected an error to surface"

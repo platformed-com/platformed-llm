@@ -81,8 +81,12 @@ impl EventBuffer {
     }
 
     fn process_line(&mut self, line: &[u8]) -> Result<(), Error> {
-        let line = std::str::from_utf8(line)
-            .map_err(|e| Error::streaming(format!("Invalid UTF-8 in SSE event: {e}")))?;
+        let line = std::str::from_utf8(line).map_err(|e| {
+            // Provider-agnostic SSE-layer error: malformed UTF-8 on
+            // the wire. Not retryable — the next attempt would hit
+            // the same shape.
+            Error::provider("Stream", format!("Invalid UTF-8 in SSE event: {e}"))
+        })?;
 
         if line.is_empty() {
             // A blank line terminates the in-flight event. Crucially, return
@@ -178,12 +182,22 @@ where
                 return Poll::Ready(Some(Ok(event)));
             }
 
-            // No buffered events, poll the underlying stream for more data
-            if let Some(chunk) = ready!(self
-                .inner
-                .poll_next_unpin(cx)
-                .map_err(|e| Error::streaming(format!("Stream error: {}", e.into())))?)
-            {
+            // No buffered events, poll the underlying stream for more data.
+            // The inner stream is type-erased (`E: Into<Box<dyn Error>>`),
+            // so we can't recover the typed source; surface as a
+            // retryable provider-level stream error since failures at
+            // this layer are usually transient (connection drop, read
+            // timeout). Callers with a concrete typed source can wrap
+            // the body in their own classifying adapter before passing
+            // it to `SseStream`.
+            if let Some(chunk) = ready!(self.inner.poll_next_unpin(cx).map_err(|e| {
+                Error::Provider {
+                    provider: "Stream",
+                    status: None,
+                    retryable: true,
+                    message: format!("Stream error: {}", e.into()),
+                }
+            })?) {
                 self.parse_buffer(&chunk)?;
             } else {
                 // EOF. Per the SSE spec, dispatch any in-flight event

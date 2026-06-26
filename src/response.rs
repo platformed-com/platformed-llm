@@ -95,6 +95,16 @@ pub struct Response {
     stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>>,
 }
 
+/// Unwrap the [`Arc<Error>`] carried by [`StreamEvent::Error`] into an
+/// owned [`Error`]. Tries [`Arc::try_unwrap`] first (the common case in
+/// our own `buffer` / `collect` paths where we hold the only Arc); if
+/// shared, falls back to a `Provider("Stream", …)` wrap built from the
+/// inner error's Display (since `Error` itself isn't `Clone`).
+fn unwrap_stream_error(error: std::sync::Arc<Error>) -> Error {
+    std::sync::Arc::try_unwrap(error)
+        .unwrap_or_else(|arc| Error::provider("Stream", format!("mid-stream error: {arc}")))
+}
+
 impl Response {
     /// Wrap an arbitrary stream of [`StreamEvent`]s as a [`Response`].
     /// Mainly useful for tests and for callers that drive their own
@@ -120,15 +130,13 @@ impl Response {
         let mut stream = self.stream;
         while let Some(event_result) = stream.next().await {
             let event = event_result?;
-            match &event {
-                StreamEvent::Error { error } => {
-                    return Err(Error::streaming(error.clone()));
-                }
-                StreamEvent::Done { .. } => {
-                    accumulator.process_event(event)?;
-                    break;
-                }
-                _ => accumulator.process_event(event)?,
+            if let StreamEvent::Error { error } = event {
+                return Err(unwrap_stream_error(error));
+            }
+            let done = matches!(event, StreamEvent::Done { .. });
+            accumulator.process_event(event)?;
+            if done {
+                break;
             }
         }
         accumulator.finalize()
@@ -161,14 +169,14 @@ impl Response {
         let mut stream = self.stream;
         while let Some(event_result) = stream.next().await {
             let event = event_result?;
+            if let StreamEvent::Error { error } = event {
+                return Err(unwrap_stream_error(error));
+            }
             match &event {
                 StreamEvent::Done { .. } => {
                     events.push(event.clone());
                     accumulator.process_event(event)?;
                     break;
-                }
-                StreamEvent::Error { error } => {
-                    return Err(Error::streaming(error.clone()));
                 }
                 _ => {
                     events.push(event.clone());
@@ -225,7 +233,7 @@ mod tests {
                 index: 0,
                 delta: "partial".to_string(),
             }),
-            Err(Error::streaming("connection reset mid-stream")),
+            Err(Error::provider("Stream", "connection reset mid-stream")),
             Ok(StreamEvent::Done {
                 finish_reason: FinishReason::Stop,
                 usage: Usage::default(),
@@ -233,7 +241,7 @@ mod tests {
         ];
         let stream = futures_util::stream::iter(events);
         let err = Response::from_stream(stream).buffer().await.expect_err("");
-        assert!(matches!(err, Error::Streaming(_)));
+        assert!(matches!(err, Error::Provider { .. }));
         assert!(err.to_string().contains("connection reset"));
     }
 
@@ -249,7 +257,7 @@ mod tests {
                 delta: "partial".to_string(),
             }),
             Ok(StreamEvent::Error {
-                error: "model internal error".to_string(),
+                error: std::sync::Arc::new(Error::provider("OpenAI", "model internal error")),
             }),
             Ok(StreamEvent::Done {
                 finish_reason: FinishReason::Stop,

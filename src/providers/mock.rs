@@ -158,11 +158,15 @@ enum Repr {
     /// Synthesize events from these parts (chunking applies), then a
     /// terminal `Done` — unless `stream_error` is set, in which case a
     /// `StreamEvent::Error` is emitted after the content instead.
+    /// Held in an `Arc` because `Error` isn't `Clone` (and we need
+    /// `MockResponse: Clone` for `MockProvider::Always` mode) — it
+    /// also moves directly into the emitted `StreamEvent::Error`
+    /// without an extra wrap.
     Parts {
         content: Vec<AssistantPart>,
         finish_reason: FinishReason,
         usage: Usage,
-        stream_error: Option<String>,
+        stream_error: Option<std::sync::Arc<Error>>,
     },
     /// Emit these events verbatim. Chunking does *not* apply; the caller
     /// is responsible for a well-formed sequence (monotonic part indices,
@@ -232,15 +236,18 @@ impl MockResponse {
     }
 
     /// Make the turn fail *mid-stream*: after streaming any content parts,
-    /// emit a [`StreamEvent::Error`] (and no terminal `Done`), so
-    /// [`Response::buffer`] / [`Response::text`] surface an
-    /// [`Error::Streaming`]. Use this to test partial-then-failed
-    /// streaming; for a failure *before any* stream is returned, script
+    /// emit a [`StreamEvent::Error`] carrying `err` (and no terminal
+    /// `Done`), so [`Response::buffer`] / [`Response::text`] surface
+    /// that exact typed error. Use this to test partial-then-failed
+    /// streaming with any [`Error`] variant — e.g.
+    /// `with_stream_error(Error::rate_limit(Some(0), "overloaded"))`
+    /// to simulate an Anthropic mid-stream rate limit. For a failure
+    /// *before any* stream is returned, script
     /// [`MockProviderBuilder::fail`] instead. No-op on a
     /// [`MockResponse::raw_events`] response.
-    pub fn with_stream_error(mut self, message: impl Into<String>) -> Self {
+    pub fn with_stream_error(mut self, err: Error) -> Self {
         if let Repr::Parts { stream_error, .. } = &mut self.0 {
-            *stream_error = Some(message.into());
+            *stream_error = Some(std::sync::Arc::new(err));
         }
         self
     }
@@ -761,7 +768,10 @@ mod tests {
     #[tokio::test]
     async fn stream_error_surfaces_after_partial_content() {
         let provider = MockProvider::builder()
-            .reply(MockResponse::text("partial").with_stream_error("connection reset"))
+            .reply(
+                MockResponse::text("partial")
+                    .with_stream_error(Error::provider("Mock", "connection reset")),
+            )
             .build();
         let err = provider
             .generate(&Prompt::user("x"), &cfg())
@@ -770,7 +780,13 @@ mod tests {
             .buffer()
             .await
             .expect_err("mid-stream error");
-        assert!(matches!(err, Error::Streaming(_)));
+        assert!(matches!(
+            err,
+            Error::Provider {
+                provider: "Mock",
+                ..
+            }
+        ));
         assert!(err.to_string().contains("connection reset"));
     }
 

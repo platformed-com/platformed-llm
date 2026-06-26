@@ -310,26 +310,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_recovers_from_streaming_error() {
-        // `Error::Streaming` is retryable (transient SSE / connection
-        // failure); verify the helper actually re-enters the closure
-        // rather than propagating immediately.
-        let policy = fast_policy();
-        let count = Cell::new(0u32);
-        let result: Result<&'static str, Error> = retry(&policy, async |_| {
-            count.set(count.get() + 1);
-            if count.get() == 1 {
-                Err(Error::streaming("connection reset"))
-            } else {
-                Ok("recovered")
-            }
-        })
-        .await;
-        assert_eq!(result.unwrap(), "recovered");
-        assert_eq!(count.get(), 2);
-    }
-
-    #[tokio::test]
     async fn retry_passes_attempt_number_to_closure() {
         let policy = fast_policy();
         let observed: Cell<u32> = Cell::new(0);

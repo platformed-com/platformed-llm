@@ -765,9 +765,10 @@ pub(crate) fn convert_stream_event_stateful(
             let lib_idx = match state.tracker.index_of(&index) {
                 Some(i) => i,
                 None => {
-                    return Err(Error::streaming(format!(
-                        "Anthropic content_block_delta for unknown index {index}"
-                    )));
+                    return Err(Error::provider(
+                        "Anthropic",
+                        format!("content_block_delta for unknown index {index}"),
+                    ));
                 }
             };
             match delta {

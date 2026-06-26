@@ -56,10 +56,16 @@ pub enum StreamEvent {
         usage: Usage,
     },
 
-    /// Mid-stream fatal error.
+    /// Mid-stream fatal error. Carries the typed [`crate::Error`]
+    /// behind an `Arc` so `StreamEvent` stays cheaply `Clone`-able
+    /// even though `Error` itself isn't `Clone` (`reqwest::Error`
+    /// inside `Transport` isn't). Real providers translate their
+    /// wire errors directly to `Result::Err`; this variant exists
+    /// primarily for the mock provider's `with_stream_error` test
+    /// path.
     Error {
-        /// Human-readable error description.
-        error: String,
+        /// The error to surface to the caller.
+        error: std::sync::Arc<crate::Error>,
     },
 }
 
