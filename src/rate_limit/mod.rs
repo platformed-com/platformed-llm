@@ -259,7 +259,20 @@ impl Drop for RatePermit {
             // bookkeeping; the AIMD model isn't updated since we
             // don't know whether the cancellation reflects real
             // capacity pressure.
-            callback(RateOutcome::Cancelled);
+            //
+            // `catch_unwind` here is a trust-boundary guard, not a
+            // panic-recovery trick: the callback is supplied by an
+            // arbitrary [`RateLimiter`] impl (the in-tree
+            // [`InMemoryRateLimiter`] is panic-free by construction
+            // — its own `observe` uses a Drop guard for `wake_head`
+            // — but a custom impl might not be). A permit can drop
+            // *during* an outer user-code panic, and a panicking
+            // callback at that point would compound into a process
+            // abort. We swallow at the boundary to keep the outer
+            // panic propagating cleanly.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                callback(RateOutcome::Cancelled);
+            }));
         }
     }
 }

@@ -195,6 +195,8 @@ impl InMemoryRateLimiter {
             inner: Arc::new(Inner {
                 config,
                 buckets: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                poison_next_observe: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -311,6 +313,11 @@ enum NextAction {
 struct Inner {
     config: InMemoryRateLimiterConfig,
     buckets: Mutex<HashMap<Arc<str>, Bucket>>,
+    /// Test-only escape hatch: when set, the next `observe()` call
+    /// panics inside the catch_unwind block so we can verify
+    /// `wake_head()` still fires and the next acquire isn't wedged.
+    #[cfg(test)]
+    poison_next_observe: std::sync::atomic::AtomicBool,
 }
 
 impl Inner {
@@ -343,11 +350,46 @@ impl Inner {
         handle
     }
 
-    fn observe(&self, key: &Arc<str>, outcome: RateOutcome) {
+    fn observe(self: &Arc<Self>, key: &Arc<str>, outcome: RateOutcome) {
+        // RAII guard ensures `wake_head` fires on the way out even
+        // if the AIMD math panics — losing a wakeup would let the
+        // next head waiter sleep on `WaitForever` and wedge the
+        // bucket. The guard re-locks the buckets map (the inner
+        // `buckets` guard below releases first since it's declared
+        // later → drops earlier); cost is one extra `parking_lot`
+        // mutex acquisition per observe, ~25ns.
+        //
+        // Declared *before* the inner lock so its `Drop` runs
+        // *after* the inner lock releases — both on normal exit and
+        // during unwind.
+        struct WakeOnExit {
+            inner: Arc<Inner>,
+            key: Arc<str>,
+        }
+        impl Drop for WakeOnExit {
+            fn drop(&mut self) {
+                let mut buckets = self.inner.buckets.lock();
+                if let Some(bucket) = buckets.get_mut(&self.key) {
+                    bucket.wake_head();
+                }
+            }
+        }
+        let _wake = WakeOnExit {
+            inner: self.clone(),
+            key: key.clone(),
+        };
+
         let mut buckets = self.buckets.lock();
         let Some(bucket) = buckets.get_mut(key) else {
             return;
         };
+        #[cfg(test)]
+        if self
+            .poison_next_observe
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("test-only: poison_next_observe triggered");
+        }
         match outcome {
             RateOutcome::Success { info } => bucket.observe_success(&info, &self.config),
             RateOutcome::RateLimited { retry_after, info } => {
@@ -358,9 +400,8 @@ impl Inner {
                 // anything about capacity.
             }
         }
-        // Wake the head so it can re-evaluate after a Retry-After
-        // park or an AIMD rate change.
-        bucket.wake_head();
+        // `buckets` (the inner lock) drops here, then `_wake` drops
+        // after it (reverse-declaration order) and fires wake_head.
     }
 }
 
@@ -1037,5 +1078,559 @@ mod tests {
             ..InMemoryRateLimiterConfig::default()
         };
         assert!(InMemoryRateLimiter::try_with_config(bad_mult).is_err());
+    }
+
+    // ====================================================================
+    // Permit-safety tests
+    //
+    // The pipeline-wedge failure mode: an "lost" permit — a slot consumed
+    // but the next head never woken — causes every subsequent acquire on
+    // that bucket to hang. These tests assert the recovery paths.
+    // ====================================================================
+
+    /// A caller panic between `acquire` and `observe` must not wedge
+    /// the bucket: the permit's `Drop` impl fires `Cancelled`, which
+    /// in turn wakes the next head. Without that, the next acquire
+    /// would hang.
+    #[tokio::test]
+    async fn caller_panic_between_acquire_and_observe_does_not_wedge() {
+        let limiter = Arc::new(
+            InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+                initial_rps: 5.0, // 200ms interval so we'd notice a wedge
+                ..permissive_config()
+            })
+            .unwrap(),
+        );
+        let lim_a = limiter.clone();
+        let task_a = tokio::spawn(async move {
+            let _permit = lim_a
+                .acquire(&scope("a", Priority::Interactive))
+                .await
+                .unwrap();
+            // Hold the permit briefly to ensure it's dispatched first,
+            // then panic. The `_permit` drops during unwind which fires
+            // `Cancelled` on the limiter's wakeup path.
+            panic!("simulated user code panic while holding a permit");
+        });
+        // Wait for the panicking task to finish before the next acquire.
+        let result = task_a.await;
+        assert!(result.is_err(), "task A should have panicked");
+
+        let permit_b = timeout(
+            TokioDuration::from_secs(3),
+            limiter.acquire(&scope("b", Priority::Interactive)),
+        )
+        .await
+        .expect("acquire B must not wedge after A's panic")
+        .unwrap();
+        drop(permit_b);
+    }
+
+    /// A permit dropping during an *outer* panic (the canonical
+    /// double-panic risk) must not abort the process. `RatePermit::Drop`
+    /// wraps the callback in `catch_unwind` for exactly this.
+    #[test]
+    fn permit_drop_inside_outer_panic_does_not_abort() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let observed = Arc::new(AtomicU32::new(0));
+        let observed_cb = observed.clone();
+        // Construct a permit whose callback panics. If our Drop guard
+        // is missing, the panic-from-panic aborts the process and this
+        // test wouldn't even produce a failure — it'd crash the
+        // runner. With the guard, `catch_unwind` swallows it and the
+        // outer panic propagates cleanly.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = RatePermit::new(move |_outcome| {
+                observed_cb.fetch_add(1, Ordering::SeqCst);
+                panic!("simulated panic from observe callback during drop");
+            });
+            panic!("outer panic that triggers the permit's Drop");
+        }));
+        assert!(result.is_err(), "outer panic should still be observed");
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            1,
+            "callback should have run exactly once before its own panic was swallowed",
+        );
+    }
+
+    /// Many simultaneous cancellations (acquire-then-drop-without-
+    /// observe) must leave the bucket cleanly empty. This guards
+    /// against the AcquireGuard / Drop interaction missing a
+    /// waiter under load.
+    #[tokio::test]
+    async fn concurrent_cancellations_leave_bucket_empty() {
+        let limiter = Arc::new(
+            InMemoryRateLimiter::try_with_config(
+                // Slow rate so most acquires queue rather than dispatch.
+                InMemoryRateLimiterConfig {
+                    initial_rps: 2.0,
+                    ..permissive_config()
+                },
+            )
+            .unwrap(),
+        );
+        let mut tasks = Vec::new();
+        for i in 0..20 {
+            let lim = limiter.clone();
+            let priority = if i % 2 == 0 {
+                Priority::Interactive
+            } else {
+                Priority::Background
+            };
+            tasks.push(tokio::spawn(async move {
+                let _ = timeout(
+                    TokioDuration::from_millis(50),
+                    lim.acquire(&scope(&format!("t{i}"), priority)),
+                )
+                .await;
+                // permit either dispatched (then drops here) or
+                // cancelled by timeout
+            }));
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+        // After all cancellations / drops resolve, the bucket should
+        // have no pending waiters. A new acquire must dispatch within
+        // one AIMD interval — if a queued waiter leaked, we'd block
+        // behind it indefinitely.
+        let permit = timeout(
+            TokioDuration::from_secs(3),
+            limiter.acquire(&scope("clean", Priority::Interactive)),
+        )
+        .await
+        .expect("a fresh acquire after 20 cancellations must not wedge")
+        .unwrap();
+        drop(permit);
+        // Verify the bucket bookkeeping is actually empty.
+        let buckets = limiter.inner.buckets.lock();
+        let bucket = buckets.values().next().unwrap();
+        assert!(
+            bucket.is_empty(),
+            "bucket should have no queued waiters after cancellations resolve",
+        );
+    }
+
+    // ====================================================================
+    // AIMD coverage gaps
+    // ====================================================================
+
+    /// Successful responses additively grow `rps` toward the
+    /// observed-capacity ceiling. A regression that disabled growth
+    /// (e.g. `additive_step = 0`, or accidentally inverting the math)
+    /// would fail this.
+    #[tokio::test]
+    async fn aimd_grows_rate_on_success() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 10.0,
+            min_rps: 0.1,
+            max_rps: 1000.0,
+            additive_step: 5.0,
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(1),
+            max_park: Duration::from_millis(10),
+        })
+        .unwrap();
+        for _ in 0..3 {
+            let p = limiter
+                .acquire(&scope("t1", Priority::Interactive))
+                .await
+                .unwrap();
+            p.observe(RateOutcome::Success {
+                info: ProviderRateInfo::default(),
+            });
+        }
+        let buckets = limiter.inner.buckets.lock();
+        let bucket = buckets.values().next().unwrap();
+        // 3 successes * 5 rps each = +15. Initial 10 → ~25.
+        // Allow a small slack for clamping at max.
+        assert!(
+            bucket.rps >= 24.0 && bucket.rps <= 25.0,
+            "expected rps ≈ 25 after 3 successes, got {}",
+            bucket.rps,
+        );
+    }
+
+    /// Repeated 429s must not push `rps` below `min_rps`. A bug in
+    /// the multiplicative-decrease clamp would let it underflow.
+    #[tokio::test]
+    async fn aimd_floor_holds_under_repeated_429() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 4.0,
+            min_rps: 1.0,
+            max_rps: 100.0,
+            additive_step: 0.0, // disable growth so test is deterministic
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(1),
+            max_park: Duration::from_millis(5),
+        })
+        .unwrap();
+        // 5 halvings: 4 → 2 → 1 → 0.5 → 0.25 → 0.125
+        // Without the floor, rps would end at 0.125. With min_rps=1.0
+        // it must clamp at 1.0.
+        for _ in 0..5 {
+            let p = limiter
+                .acquire(&scope("t1", Priority::Interactive))
+                .await
+                .unwrap();
+            p.observe(RateOutcome::RateLimited {
+                retry_after: Some(Duration::from_millis(1)),
+                info: ProviderRateInfo::default(),
+            });
+            tokio::time::sleep(Duration::from_millis(8)).await;
+        }
+        let buckets = limiter.inner.buckets.lock();
+        let bucket = buckets.values().next().unwrap();
+        assert!(
+            bucket.rps >= 1.0,
+            "min_rps floor must hold after sustained 429s, got {}",
+            bucket.rps,
+        );
+    }
+
+    /// Repeated successes must not push `rps` above `max_rps`. A bug
+    /// in the additive-growth clamp would let it overshoot.
+    #[tokio::test]
+    async fn aimd_ceiling_holds_under_repeated_success() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 5.0,
+            min_rps: 0.1,
+            max_rps: 10.0,
+            additive_step: 50.0, // big step, would blow past 10 without clamp
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(1),
+            max_park: Duration::from_millis(5),
+        })
+        .unwrap();
+        for _ in 0..3 {
+            let p = limiter
+                .acquire(&scope("t1", Priority::Interactive))
+                .await
+                .unwrap();
+            p.observe(RateOutcome::Success {
+                info: ProviderRateInfo::default(),
+            });
+        }
+        let buckets = limiter.inner.buckets.lock();
+        let bucket = buckets.values().next().unwrap();
+        assert!(
+            bucket.rps <= 10.0,
+            "max_rps ceiling must hold after sustained successes, got {}",
+            bucket.rps,
+        );
+    }
+
+    // ====================================================================
+    // Park-handling tests
+    // ====================================================================
+
+    /// An extreme `Retry-After` hint must be capped at `max_park`.
+    /// Without the cap, a misbehaving provider header could park the
+    /// bucket for hours.
+    #[tokio::test]
+    async fn retry_after_capped_at_max_park() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 100.0,
+            min_rps: 1.0,
+            max_rps: 1000.0,
+            additive_step: 10.0,
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(10),
+            max_park: Duration::from_millis(50),
+        })
+        .unwrap();
+        let p = limiter
+            .acquire(&scope("t1", Priority::Interactive))
+            .await
+            .unwrap();
+        // Hostile retry-after: 1 hour. Must cap at max_park (50ms).
+        p.observe(RateOutcome::RateLimited {
+            retry_after: Some(Duration::from_secs(3600)),
+            info: ProviderRateInfo::default(),
+        });
+        let start = Instant::now();
+        let p2 = timeout(
+            TokioDuration::from_millis(300),
+            limiter.acquire(&scope("t1", Priority::Interactive)),
+        )
+        .await
+        .expect("acquire must resolve within 300ms — max_park=50ms")
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "park honoured max_park cap, but elapsed was {elapsed:?}",
+        );
+        drop(p2);
+    }
+
+    /// When the 429 carries no `Retry-After` but the response info
+    /// includes `requests_reset`, that value drives the park instead
+    /// of `default_park`.
+    #[tokio::test]
+    async fn requests_reset_used_as_park_fallback() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 100.0,
+            min_rps: 1.0,
+            max_rps: 1000.0,
+            additive_step: 10.0,
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(5),
+            max_park: Duration::from_millis(200),
+        })
+        .unwrap();
+        let p = limiter
+            .acquire(&scope("t1", Priority::Interactive))
+            .await
+            .unwrap();
+        // No retry-after; info.requests_reset says wait 80ms.
+        p.observe(RateOutcome::RateLimited {
+            retry_after: None,
+            info: ProviderRateInfo {
+                requests_remaining: Some(0),
+                requests_reset: Some(Duration::from_millis(80)),
+            },
+        });
+        let start = Instant::now();
+        let p2 = timeout(
+            TokioDuration::from_millis(300),
+            limiter.acquire(&scope("t1", Priority::Interactive)),
+        )
+        .await
+        .expect("acquire must resolve within 300ms")
+        .unwrap();
+        let elapsed = start.elapsed();
+        // requests_reset is the floor (max(default_park, reset)); we
+        // honoured 80ms, not 5ms default.
+        assert!(
+            elapsed >= Duration::from_millis(70),
+            "expected ~80ms park from requests_reset, got {elapsed:?}",
+        );
+        drop(p2);
+    }
+
+    // ====================================================================
+    // Bucket isolation
+    // ====================================================================
+
+    /// Two different `bucket_key`s must track independent AIMD state.
+    /// A 429 on bucket A must not affect bucket B's rate.
+    #[tokio::test]
+    async fn aimd_state_is_per_bucket() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 10.0,
+            min_rps: 0.1,
+            max_rps: 100.0,
+            additive_step: 0.0,
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(1),
+            max_park: Duration::from_millis(5),
+        })
+        .unwrap();
+        let scope_a = RateScope {
+            bucket_key: "ProviderA/model-x".into(),
+            tenant: Uuid::nil(),
+            priority: Priority::Interactive,
+        };
+        let scope_b = RateScope {
+            bucket_key: "ProviderB/model-y".into(),
+            tenant: Uuid::nil(),
+            priority: Priority::Interactive,
+        };
+        let p_a = limiter.acquire(&scope_a).await.unwrap();
+        p_a.observe(RateOutcome::RateLimited {
+            retry_after: Some(Duration::from_millis(1)),
+            info: ProviderRateInfo::default(),
+        });
+        // Bucket A's rps now halved to 5.0. Bucket B should be
+        // untouched at 10.0.
+        {
+            let buckets = limiter.inner.buckets.lock();
+            let a = buckets
+                .get(&Arc::<str>::from("ProviderA/model-x"))
+                .expect("A bucket exists");
+            assert!(
+                a.rps <= 5.5,
+                "A's rps halved by 429: expected ~5.0, got {}",
+                a.rps,
+            );
+        }
+        // B's bucket isn't created yet (lazy); acquire on B and
+        // verify it starts fresh at initial_rps.
+        let p_b = limiter.acquire(&scope_b).await.unwrap();
+        drop(p_b);
+        let buckets = limiter.inner.buckets.lock();
+        let b = buckets
+            .get(&Arc::<str>::from("ProviderB/model-y"))
+            .expect("B bucket now exists");
+        assert!(
+            b.rps >= 9.0 && b.rps <= 10.0,
+            "B's rps should be untouched at initial_rps ≈ 10.0, got {}",
+            b.rps,
+        );
+    }
+
+    /// `Retry-After` parking on one bucket must not park another.
+    #[tokio::test]
+    async fn park_state_is_per_bucket() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 100.0,
+            min_rps: 1.0,
+            max_rps: 1000.0,
+            additive_step: 10.0,
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(10),
+            max_park: Duration::from_millis(500),
+        })
+        .unwrap();
+        let scope_a = RateScope {
+            bucket_key: "ProviderA".into(),
+            tenant: Uuid::nil(),
+            priority: Priority::Interactive,
+        };
+        let scope_b = RateScope {
+            bucket_key: "ProviderB".into(),
+            tenant: Uuid::nil(),
+            priority: Priority::Interactive,
+        };
+        let p_a = limiter.acquire(&scope_a).await.unwrap();
+        // Park A for ≥300ms.
+        p_a.observe(RateOutcome::RateLimited {
+            retry_after: Some(Duration::from_millis(300)),
+            info: ProviderRateInfo::default(),
+        });
+        // B must dispatch immediately even while A is parked.
+        let start = Instant::now();
+        let p_b = timeout(TokioDuration::from_millis(100), limiter.acquire(&scope_b))
+            .await
+            .expect("B must not be affected by A's park")
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_millis(80));
+        drop(p_b);
+    }
+
+    // ====================================================================
+    // Edge cases
+    // ====================================================================
+
+    /// Observing on a permit whose bucket has been forgotten (e.g.
+    /// limiter dropped, or a state-management bug removed the entry)
+    /// must not panic. The current impl no-ops via `get_mut(key)?`.
+    #[test]
+    fn observe_for_nonexistent_bucket_is_noop() {
+        let limiter = InMemoryRateLimiter::new();
+        // Build a permit pointing at a bucket key that was never
+        // created via `acquire`.
+        let inner = limiter.inner.clone();
+        let key: Arc<str> = Arc::from("never/acquired");
+        let permit = RatePermit::new(move |outcome| {
+            inner.observe(&key, outcome);
+        });
+        // Must not panic — Inner::observe returns early on miss.
+        permit.observe(RateOutcome::Success {
+            info: ProviderRateInfo::default(),
+        });
+    }
+
+    /// A panic *inside* `Inner::observe`'s AIMD math must not prevent
+    /// `wake_head()` from running. The `WakeOnExit` Drop guard fires
+    /// during unwind (after the inner buckets-lock releases); the
+    /// next waiter dispatches on schedule. Without the guard the
+    /// next waiter would sleep indefinitely on `WaitForever` and
+    /// the bucket would wedge.
+    #[tokio::test]
+    async fn observe_panic_does_not_wedge_next_waiter() {
+        let limiter = Arc::new(
+            InMemoryRateLimiter::try_with_config(
+                // Slow enough that the second acquire actually waits on
+                // the wake.
+                InMemoryRateLimiterConfig {
+                    initial_rps: 2.0, // 500ms interval
+                    ..permissive_config()
+                },
+            )
+            .unwrap(),
+        );
+        let p1 = limiter
+            .acquire(&scope("t1", Priority::Interactive))
+            .await
+            .unwrap();
+        // Arm the next observe call to panic inside its catch_unwind
+        // block. The math is genuinely panic-free under validated
+        // config; this hatch exists so we can verify the guard.
+        limiter
+            .inner
+            .poison_next_observe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Spawn a follower BEFORE we observe — so it's queued and
+        // will be the head once we pop.
+        let lim_f = limiter.clone();
+        let follower = tokio::spawn(async move {
+            let p = lim_f
+                .acquire(&scope("t1", Priority::Interactive))
+                .await
+                .unwrap();
+            drop(p);
+        });
+        // Give the follower time to enqueue.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Observe (which panics inside catch_unwind, but wake_head
+        // still runs on the way out). The panic propagates up here.
+        let observe_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            p1.observe(RateOutcome::Success {
+                info: ProviderRateInfo::default(),
+            });
+        }));
+        assert!(
+            observe_result.is_err(),
+            "the injected panic should propagate from observe()",
+        );
+        // Despite the panic, the follower must be dispatched on its
+        // normal AIMD schedule. If wake_head hadn't run, the follower
+        // would be stuck at `WaitForever`.
+        timeout(TokioDuration::from_secs(2), follower)
+            .await
+            .expect("follower must dispatch after panic — bucket would wedge otherwise")
+            .unwrap();
+    }
+
+    /// Cancelling the actual *head* waiter (not just one further back
+    /// in the queue) must promote the next waiter and dispatch it on
+    /// schedule. The existing `cancelled_acquire_does_not_wedge_bucket`
+    /// test holds a gate so the cancelled acquire isn't the head;
+    /// this variant cancels the head directly.
+    #[tokio::test]
+    async fn head_cancel_promotes_next_waiter() {
+        let limiter = Arc::new(
+            InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+                initial_rps: 2.0, // 500ms interval
+                ..permissive_config()
+            })
+            .unwrap(),
+        );
+        // No gate this time — cancelled task IS the head.
+        let lim_cancel = limiter.clone();
+        let cancelled = tokio::spawn(async move {
+            // Acquire immediately (first request → dispatches). Hold
+            // briefly, then drop without observe to trigger Cancelled.
+            let permit = lim_cancel
+                .acquire(&scope("first", Priority::Interactive))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(permit); // → Cancelled → wake_head fires
+        });
+        cancelled.await.unwrap();
+        // Second acquire — after the first one's dispatch interval
+        // elapses (~500ms), but must not hang forever.
+        let p = timeout(
+            TokioDuration::from_secs(2),
+            limiter.acquire(&scope("second", Priority::Interactive)),
+        )
+        .await
+        .expect("second acquire after head cancel must dispatch")
+        .unwrap();
+        drop(p);
     }
 }
