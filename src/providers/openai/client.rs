@@ -128,7 +128,6 @@ impl OpenAIProvider {
         ProviderScope::new(ProviderType::OpenAI, account)
     }
 
-
     /// Convert internal request to OpenAI Responses API format.
     ///
     /// `resolved` maps each file-`Ref` id to its wire-ready reference, built
