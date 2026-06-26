@@ -337,7 +337,6 @@ fn rewrite_synth_tool_stream(
                             )))
                         }
                     }
-                    StreamEvent::Error { error } => Some(Ok(StreamEvent::Error { error })),
                 }
             })
             .filter_map(futures_util::future::ready),

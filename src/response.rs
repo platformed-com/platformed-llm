@@ -95,11 +95,6 @@ pub struct Response {
     stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>>,
 }
 
-// Stream-error unwrap lives on `Error` as a `pub(crate)` helper so
-// `response::buffer/collect` and `accumulator::process_event` share
-// the same classification-preserving fallback. See
-// `Error::from_stream_event_arc` for the contract.
-
 impl Response {
     /// Wrap an arbitrary stream of [`StreamEvent`]s as a [`Response`].
     /// Mainly useful for tests and for callers that drive their own
@@ -125,9 +120,6 @@ impl Response {
         let mut stream = self.stream;
         while let Some(event_result) = stream.next().await {
             let event = event_result?;
-            if let StreamEvent::Error { error } = event {
-                return Err(Error::from_stream_event_arc(error));
-            }
             let done = matches!(event, StreamEvent::Done { .. });
             accumulator.process_event(event)?;
             if done {
@@ -164,19 +156,11 @@ impl Response {
         let mut stream = self.stream;
         while let Some(event_result) = stream.next().await {
             let event = event_result?;
-            if let StreamEvent::Error { error } = event {
-                return Err(Error::from_stream_event_arc(error));
-            }
-            match &event {
-                StreamEvent::Done { .. } => {
-                    events.push(event.clone());
-                    accumulator.process_event(event)?;
-                    break;
-                }
-                _ => {
-                    events.push(event.clone());
-                    accumulator.process_event(event)?;
-                }
+            let done = matches!(event, StreamEvent::Done { .. });
+            events.push(event.clone());
+            accumulator.process_event(event)?;
+            if done {
+                break;
             }
         }
 
@@ -251,56 +235,11 @@ mod tests {
                 index: 0,
                 delta: "partial".to_string(),
             }),
-            Ok(StreamEvent::Error {
-                error: std::sync::Arc::new(Error::provider("OpenAI", "model internal error")),
-            }),
-            Ok(StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-                usage: Usage::default(),
-            }),
+            Err(Error::provider("OpenAI", "model internal error")),
         ];
         let stream = futures_util::stream::iter(events);
         let err = Response::from_stream(stream).buffer().await.expect_err("");
         assert!(err.to_string().contains("model internal error"));
-    }
-
-    /// The Arc-shared fallback path of `unwrap_stream_error` must
-    /// preserve the inner error's retryability so a downstream
-    /// retry policy still matches the source's intent. Without
-    /// this, a mid-stream `Error::RateLimit` whose Arc happened to
-    /// be shared (e.g. via the event log produced by `collect`)
-    /// would downgrade to a non-retryable `Provider("Stream", …)`
-    /// and the retry loop would give up.
-    #[test]
-    fn unwrap_stream_error_fallback_preserves_retry_after() {
-        let inner = std::sync::Arc::new(Error::rate_limit(Some(7), "overloaded"));
-        // Keep a second strong ref so `try_unwrap` fails.
-        let _other = inner.clone();
-        let unwrapped = Error::from_stream_event_arc(inner);
-        match unwrapped {
-            Error::RateLimit { retry_after, .. } => {
-                assert_eq!(retry_after, Some(std::time::Duration::from_secs(7)));
-            }
-            other => panic!("expected RateLimit with retry_after preserved, got {other:?}"),
-        }
-    }
-
-    /// Same as above but for a transient `Provider` error: the
-    /// fallback path must carry the `retryable` flag through.
-    #[test]
-    fn unwrap_stream_error_fallback_preserves_retryable_flag() {
-        let inner = std::sync::Arc::new(Error::provider_with_status(
-            "OpenAI",
-            503,
-            "service unavailable",
-        ));
-        let _other = inner.clone();
-        let unwrapped = Error::from_stream_event_arc(inner);
-        assert!(
-            unwrapped.is_retryable(),
-            "transient 5xx must remain retryable across the shared-Arc fallback, \
-             got {unwrapped:?}",
-        );
     }
 
     #[test]

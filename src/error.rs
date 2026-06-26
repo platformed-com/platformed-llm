@@ -278,48 +278,6 @@ impl Error {
         }
     }
 
-    /// Extract an owned [`Error`] from an [`std::sync::Arc<Error>`]
-    /// (the wrapper [`crate::StreamEvent::Error`] uses), preserving
-    /// the inner error's **retryability classification**.
-    ///
-    /// Tries [`std::sync::Arc::try_unwrap`] first (the common case
-    /// in our own `buffer` / `collect` paths where we hold the only
-    /// `Arc`); if the `Arc` is shared, falls back to a synthetic
-    /// wrap that preserves [`Self::retry_after`] when present and
-    /// [`Self::is_retryable`] otherwise. Without that preservation,
-    /// a shared mid-stream `Error::RateLimit` would silently
-    /// downgrade to a non-retryable provider error and the caller's
-    /// retry loop would give up.
-    ///
-    /// `pub(crate)` because the shape is an internal contract
-    /// between the streaming pipeline (`response`, `accumulator`)
-    /// and `Error`; external callers should already hold an owned
-    /// [`Error`] by the time they're branching on it.
-    pub(crate) fn from_stream_event_arc(error: std::sync::Arc<Error>) -> Error {
-        std::sync::Arc::try_unwrap(error).unwrap_or_else(|arc| {
-            // `Error` isn't `Clone` (reqwest::Error inside Transport),
-            // so we synthesise a fresh one. Preserve the typed
-            // retry-after when present (rate limits) so callers still
-            // honour the provider hint; otherwise rebuild a
-            // `Provider("Stream", …)` carrying the inner's
-            // `is_retryable()` verdict so retry policies still match
-            // the source's intent.
-            if let Some(retry_after) = arc.retry_after() {
-                Error::RateLimit {
-                    retry_after: Some(retry_after),
-                    message: format!("mid-stream error (cloned): {arc}"),
-                }
-            } else {
-                Error::Provider {
-                    provider: "Stream",
-                    status: None,
-                    retryable: arc.is_retryable(),
-                    message: format!("mid-stream error (cloned): {arc}"),
-                }
-            }
-        })
-    }
-
     /// Provider-suggested wait duration before retrying, parsed from a
     /// `Retry-After` header (or equivalent) on a 429.
     ///

@@ -296,9 +296,6 @@ fn format_events(events: &[StreamEvent]) -> String {
                     "Done finish={finish_reason:?} input=<n> output=<n>\n"
                 ));
             }
-            StreamEvent::Error { error } => {
-                out.push_str(&format!("Error {error:?}\n"));
-            }
         }
     }
     out
