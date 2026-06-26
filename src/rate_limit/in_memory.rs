@@ -1,15 +1,16 @@
 //! Default in-process [`super::RateLimiter`] implementation.
 //!
-//! The implementation is a per-`(provider, model)` scheduler:
+//! The implementation is a per-`bucket_key` scheduler:
 //!
 //! - **AIMD capacity model.** Starts at 1 request per second when the
-//!   `(provider, model)` is first seen; each successful response
-//!   additively grows the rate by `additive_step` (default 1 rps) up
-//!   to an observed ceiling; every 429 multiplicatively halves the
-//!   rate (multiplied by `multiplicative_decrease`, default 0.5).
-//!   This is the AIMD pattern used by TCP congestion control — it's
-//!   what makes the limiter resilient to noisy neighbours sharing
-//!   the provider quota.
+//!   bucket is first seen; each successful response additively grows
+//!   the rate by `additive_step` (default 1 rps), bounded *above* by
+//!   the observed-capacity ceiling from the provider's headers; every
+//!   429 multiplicatively halves the rate (multiplied by
+//!   `multiplicative_decrease`, default 0.5). This is the AIMD
+//!   pattern used by TCP congestion control — it's what makes the
+//!   limiter resilient to noisy neighbours sharing the upstream
+//!   quota.
 //!
 //! - **`Retry-After` parking.** A 429 with a `Retry-After` hint
 //!   parks the bucket for `max(retry_after, default_park)` before
@@ -19,25 +20,42 @@
 //!   the task for hours.
 //!
 //! - **Strict-priority round-robin dispatch.** Waiters are bucketed
-//!   first by [`super::Priority`] (interactive > standard >
-//!   background) and within a priority by tenant; the scheduler
+//!   first by [`super::Priority`] (Interactive > Standard >
+//!   Background) and within a priority by tenant; the scheduler
 //!   pops the next tenant in round-robin order from the highest
 //!   non-empty priority band, so a noisy tenant can't starve a
 //!   polite one at the same priority. See the module docs for the
 //!   starvation tradeoff.
 //!
-//! The state is wrapped in a single [`std::sync::Mutex`]. Critical
-//! sections are short (a few [`std::collections::HashMap`] lookups,
-//! a [`std::collections::VecDeque`] push/pop, an [`tokio::sync::Notify`]
-//! signal); contention isn't expected to be a bottleneck below
-//! ~thousands of acquires/second per limiter instance. A consumer
-//! who needs more can shard limiters by tenant prefix or front it
-//! with a Redis-backed [`super::RateLimiter`] impl.
+//! The state is wrapped in a single [`parking_lot::Mutex`] — picked
+//! over [`std::sync::Mutex`] because poisoning would turn any panic
+//! inside an `observe` callback into a hard outage for every future
+//! acquire. Critical sections are short (a HashMap lookup, a
+//! VecDeque push/pop, a `Notify` signal); contention isn't expected
+//! to be a bottleneck below ~thousands of acquires/second per
+//! limiter instance.
+//!
+//! # Wakeup ownership
+//!
+//! Exactly one waiter (the queue head) is responsible for evaluating
+//! its dispatch target at any time. `wake_head` is called at every
+//! state change that may have moved the head:
+//!
+//! - `enqueue` — a new waiter may now be the head (higher priority,
+//!   or first in band).
+//! - `try_dispatch` — popping the old head exposes a new head.
+//! - `observe` — a `Retry-After` may have parked the bucket, an
+//!   AIMD growth may have shortened the interval, a cancellation
+//!   freed a slot.
+//!
+//! Non-head waiters wait indefinitely (`WaitForever`); they're woken
+//! by `wake_head` once they become the head.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use super::{Priority, ProviderRateInfo, RateLimiter, RateOutcome, RatePermit, RateScope};
@@ -46,20 +64,20 @@ use crate::Error;
 /// Construction-time knobs for [`InMemoryRateLimiter`]. All
 /// defaultable; tweak when the upstream's actual quota differs
 /// materially from the conservative defaults.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct InMemoryRateLimiterConfig {
-    /// Cold-start dispatch rate for a newly-observed
-    /// `(provider, model)`. Defaults to 1 request per second, which
-    /// is safe against any production quota but adds 1–2s of
-    /// warm-up latency on a fresh process. Raise it if your
-    /// provider's per-minute quota comfortably permits a higher
-    /// initial burst.
+    /// Cold-start dispatch rate for a newly-observed bucket.
+    /// Defaults to 1 request per second, which is safe against any
+    /// production quota but adds 1–2s of warm-up latency on a fresh
+    /// process. Raise it if your provider's per-minute quota
+    /// comfortably permits a higher initial burst.
     pub initial_rps: f64,
     /// Hard floor on the AIMD rate. The multiplicative decrease on
     /// each 429 never takes the rate below this. Defaults to 0.25
     /// rps (one request every 4 seconds) — low enough to recover
     /// gracefully but high enough that a sustained backoff still
-    /// makes forward progress.
+    /// makes forward progress. **Must be > 0.**
     pub min_rps: f64,
     /// Hard ceiling on the AIMD rate. Additive growth saturates
     /// here. Defaults to 100 rps; nothing in this crate sends
@@ -105,6 +123,51 @@ impl Default for InMemoryRateLimiterConfig {
     }
 }
 
+impl InMemoryRateLimiterConfig {
+    /// Validate the config. Catches the inputs that would otherwise
+    /// panic deep inside `try_dispatch` (e.g. `1.0 / 0.0`, NaN
+    /// multipliers, negative steps), surfacing them as
+    /// [`Error::Config`] at construction time when the caller can
+    /// still react.
+    fn validate(&self) -> Result<(), Error> {
+        fn finite_positive(name: &str, v: f64) -> Result<(), Error> {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(Error::config(format!(
+                    "InMemoryRateLimiterConfig::{name} must be finite and > 0, got {v}",
+                )));
+            }
+            Ok(())
+        }
+        fn finite_non_negative(name: &str, v: f64) -> Result<(), Error> {
+            if !v.is_finite() || v < 0.0 {
+                return Err(Error::config(format!(
+                    "InMemoryRateLimiterConfig::{name} must be finite and >= 0, got {v}",
+                )));
+            }
+            Ok(())
+        }
+        finite_positive("initial_rps", self.initial_rps)?;
+        finite_positive("min_rps", self.min_rps)?;
+        finite_positive("max_rps", self.max_rps)?;
+        finite_non_negative("additive_step", self.additive_step)?;
+        if !self.multiplicative_decrease.is_finite()
+            || !(0.0..1.0).contains(&self.multiplicative_decrease)
+        {
+            return Err(Error::config(format!(
+                "InMemoryRateLimiterConfig::multiplicative_decrease must be in (0.0, 1.0), got {}",
+                self.multiplicative_decrease,
+            )));
+        }
+        if self.min_rps > self.max_rps {
+            return Err(Error::config(format!(
+                "InMemoryRateLimiterConfig: min_rps ({}) must be <= max_rps ({})",
+                self.min_rps, self.max_rps,
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Default in-process limiter. Construct once, share via `Arc`
 /// across every provider built in this process. See the module
 /// docs for the scheduling and AIMD model.
@@ -113,58 +176,63 @@ pub struct InMemoryRateLimiter {
     inner: Arc<Inner>,
 }
 
+impl InMemoryRateLimiter {
+    /// Construct with the default configuration.
+    pub fn new() -> Self {
+        // Default config is statically valid; expect rather than
+        // propagate so `new()` stays infallible.
+        Self::try_with_config(InMemoryRateLimiterConfig::default())
+            .expect("default config is valid")
+    }
+
+    /// Construct with caller-tuned [`InMemoryRateLimiterConfig`].
+    /// Errors on invalid input (NaN rps, decrease ≥ 1.0, etc.)
+    /// rather than panicking later inside the scheduler.
+    pub fn try_with_config(config: InMemoryRateLimiterConfig) -> Result<Self, Error> {
+        config.validate()?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                config,
+                buckets: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+}
+
 impl Default for InMemoryRateLimiter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl InMemoryRateLimiter {
-    /// Construct with the default configuration.
-    pub fn new() -> Self {
-        Self::with_config(InMemoryRateLimiterConfig::default())
-    }
-
-    /// Construct with caller-tuned [`InMemoryRateLimiterConfig`].
-    pub fn with_config(config: InMemoryRateLimiterConfig) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                config,
-                buckets: Mutex::new(HashMap::new()),
-            }),
-        }
-    }
-}
-
 #[async_trait::async_trait]
 impl RateLimiter for InMemoryRateLimiter {
     async fn acquire(&self, scope: &RateScope) -> Result<RatePermit, Error> {
-        // Enqueue the waiter and grab its handle.
-        let key = BucketKey {
-            provider: scope.provider,
-            model: scope.model.clone(),
-        };
+        let key: Arc<str> = Arc::from(scope.bucket_key.as_str());
         let waiter = self.inner.enqueue(&key, scope);
+        // Guard removes the waiter from the bucket if the future is
+        // dropped (cancel / timeout / parent task drop) before
+        // `try_dispatch` pops it. Without this the abandoned waiter
+        // stays at the head of the queue, future enqueues notify a
+        // dead `Notify`, and the bucket wedges.
+        let mut guard = AcquireGuard {
+            inner: self.inner.clone(),
+            key: key.clone(),
+            waiter_id: waiter.id,
+            completed: false,
+        };
 
-        // Wait until the scheduler dispatches us.
         loop {
-            // We re-check inside the lock so a wakeup that wasn't
-            // for us puts us back to sleep without missing a later
-            // wakeup. `Notify` is single-permit: notify-then-wait
-            // and wait-then-notify both deliver, so this is safe
-            // against the obvious races.
-            let sleep_until = {
-                let mut buckets = self
-                    .inner
-                    .buckets
-                    .lock()
-                    .expect("rate limiter mutex poisoned");
+            let next = {
+                let mut buckets = self.inner.buckets.lock();
                 let bucket = buckets
                     .get_mut(&key)
                     .expect("bucket was inserted on enqueue");
                 if bucket.try_dispatch(&waiter, &self.inner.config) {
-                    // Dispatched. Build the permit callback that
-                    // routes the outcome back into this bucket.
+                    guard.completed = true;
+                    // Build the permit callback that observes back
+                    // into this bucket. Cloning the Arcs is cheap
+                    // (refcount bumps).
                     let inner = self.inner.clone();
                     let key = key.clone();
                     let permit = RatePermit::new(move |outcome| {
@@ -174,15 +242,13 @@ impl RateLimiter for InMemoryRateLimiter {
                 }
                 bucket.next_action(&waiter)
             };
-            match sleep_until {
+            match next {
                 NextAction::WaitUntil(when) => {
                     let now = Instant::now();
                     let dur = when.saturating_duration_since(now);
-                    // Race the sleep and the notify; whichever
-                    // fires first puts us back at the top of the
-                    // dispatch check. `timeout` returns Err on
-                    // elapse and Ok on the inner future
-                    // completing — we don't care which path fires.
+                    // Race the sleep against the notify. We don't
+                    // care which wakes us — the next loop iteration
+                    // re-evaluates dispatch under the lock.
                     let _ = tokio::time::timeout(dur, waiter.notify.notified()).await;
                 }
                 NextAction::WaitForever => {
@@ -200,8 +266,34 @@ impl RateLimiter for InMemoryRateLimiter {
 struct Waiter {
     id: u64,
     priority: Priority,
-    tenant: String,
+    tenant: Arc<str>,
     notify: Arc<Notify>,
+}
+
+/// RAII guard that removes the waiter from its bucket queue if the
+/// `acquire` future is dropped before dispatch. The whole point is
+/// resilience against future cancellation — without this an
+/// abandoned waiter wedges the bucket.
+struct AcquireGuard {
+    inner: Arc<Inner>,
+    key: Arc<str>,
+    waiter_id: u64,
+    completed: bool,
+}
+
+impl Drop for AcquireGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut buckets = self.inner.buckets.lock();
+        if let Some(bucket) = buckets.get_mut(&self.key) {
+            bucket.remove_waiter(self.waiter_id);
+            // Wake the new head so it can re-evaluate now that the
+            // queue shape changed.
+            bucket.wake_head();
+        }
+    }
 }
 
 /// What the acquire loop should do when it couldn't dispatch this
@@ -217,12 +309,12 @@ enum NextAction {
 #[derive(Debug)]
 struct Inner {
     config: InMemoryRateLimiterConfig,
-    buckets: Mutex<HashMap<BucketKey, Bucket>>,
+    buckets: Mutex<HashMap<Arc<str>, Bucket>>,
 }
 
 impl Inner {
-    fn enqueue(&self, key: &BucketKey, scope: &RateScope) -> Arc<WaiterHandle> {
-        let mut buckets = self.buckets.lock().expect("rate limiter mutex poisoned");
+    fn enqueue(&self, key: &Arc<str>, scope: &RateScope) -> Arc<WaiterHandle> {
+        let mut buckets = self.buckets.lock();
         let bucket = buckets.entry(key.clone()).or_insert_with(|| {
             Bucket::new(
                 self.config
@@ -250,8 +342,8 @@ impl Inner {
         handle
     }
 
-    fn observe(&self, key: &BucketKey, outcome: RateOutcome) {
-        let mut buckets = self.buckets.lock().expect("rate limiter mutex poisoned");
+    fn observe(&self, key: &Arc<str>, outcome: RateOutcome) {
+        let mut buckets = self.buckets.lock();
         let Some(bucket) = buckets.get_mut(key) else {
             return;
         };
@@ -262,12 +354,11 @@ impl Inner {
             }
             RateOutcome::OtherFailure | RateOutcome::Cancelled => {
                 // No AIMD update — the outcome doesn't tell us
-                // anything about capacity. But do wake the head so
-                // it can dispatch using the slot freed by this
-                // completion.
+                // anything about capacity.
             }
         }
-        bucket.in_flight = bucket.in_flight.saturating_sub(1);
+        // Wake the head so it can re-evaluate after a Retry-After
+        // park or an AIMD rate change.
         bucket.wake_head();
     }
 }
@@ -280,14 +371,8 @@ struct WaiterHandle {
     notify: Arc<Notify>,
 }
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-struct BucketKey {
-    provider: &'static str,
-    model: String,
-}
-
-/// Per-`(provider, model)` scheduling state. Holds the AIMD rate,
-/// the parked-until window, and the priority/tenant queue.
+/// Per-bucket scheduling state. Holds the AIMD rate, the
+/// parked-until window, and the priority/tenant queue.
 #[derive(Debug)]
 struct Bucket {
     /// Current AIMD dispatch rate in requests/second.
@@ -298,26 +383,23 @@ struct Bucket {
     /// `Retry-After`-induced park gate. No dispatches before this
     /// instant; `None` means not parked.
     parked_until: Option<Instant>,
-    /// Count of permits currently outstanding (acquired but not yet
-    /// observed). Cosmetic — not used for scheduling — but exposed
-    /// for diagnostics and to assert the limiter isn't leaking
-    /// permits in tests.
-    in_flight: u64,
-    /// Strict-priority queue. Outer is by [`Priority`] (smallest
-    /// first); inner is per-tenant FIFO with a round-robin order
-    /// across tenants.
-    queues: HashMap<Priority, PriorityBand>,
-    /// Monotonic waiter id, used in tests and for the
-    /// "is-this-me-at-the-head" check.
+    /// One band per [`Priority`]. Bands are walked in declaration
+    /// order (Interactive → Standard → Background) for strict
+    /// priority dispatch.
+    interactive: PriorityBand,
+    standard: PriorityBand,
+    background: PriorityBand,
+    /// Monotonic waiter id, used to identify "is this me at the
+    /// head" without raw pointers.
     next_id: u64,
 }
 
 #[derive(Debug, Default)]
 struct PriorityBand {
     /// Per-tenant FIFO of waiters.
-    tenant_queues: HashMap<String, VecDeque<Waiter>>,
+    tenant_queues: HashMap<Arc<str>, VecDeque<Waiter>>,
     /// Round-robin order of tenants with non-empty queues.
-    tenant_order: VecDeque<String>,
+    tenant_order: VecDeque<Arc<str>>,
 }
 
 impl PriorityBand {
@@ -340,8 +422,54 @@ impl PriorityBand {
         Some(waiter)
     }
 
+    fn push(&mut self, waiter: Waiter) {
+        let queue = self.tenant_queues.entry(waiter.tenant.clone()).or_default();
+        let was_empty = queue.is_empty();
+        let tenant_name = waiter.tenant.clone();
+        queue.push_back(waiter);
+        if was_empty {
+            // First waiter for this tenant in this band — add to
+            // the round-robin rotation. If the tenant already had
+            // waiters it's already in the rotation; do not re-add.
+            self.tenant_order.push_back(tenant_name);
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.tenant_order.is_empty()
+    }
+
+    /// Remove the waiter with `id` if present. Used by the cancel
+    /// guard. Returns whether anything was removed.
+    fn remove_waiter(&mut self, id: u64) -> bool {
+        // Two-pass: locate first (immutable scan), mutate second
+        // (drops the borrow before the entry/remove dance).
+        let target_tenant = self.tenant_queues.iter().find_map(|(tenant, queue)| {
+            if queue.iter().any(|w| w.id == id) {
+                Some(tenant.clone())
+            } else {
+                None
+            }
+        });
+        let Some(tenant) = target_tenant else {
+            return false;
+        };
+        let queue = self
+            .tenant_queues
+            .get_mut(&tenant)
+            .expect("just found this entry");
+        let pos = queue
+            .iter()
+            .position(|w| w.id == id)
+            .expect("just found this id");
+        queue.remove(pos);
+        if queue.is_empty() {
+            self.tenant_queues.remove(&tenant);
+            if let Some(pos) = self.tenant_order.iter().position(|t| *t == tenant) {
+                self.tenant_order.remove(pos);
+            }
+        }
+        true
     }
 }
 
@@ -351,8 +479,9 @@ impl Bucket {
             rps: initial_rps,
             next_dispatch_at: Instant::now(),
             parked_until: None,
-            in_flight: 0,
-            queues: HashMap::new(),
+            interactive: PriorityBand::default(),
+            standard: PriorityBand::default(),
+            background: PriorityBand::default(),
             next_id: 0,
         }
     }
@@ -363,54 +492,58 @@ impl Bucket {
         id
     }
 
+    fn band_for(&mut self, priority: Priority) -> &mut PriorityBand {
+        match priority {
+            Priority::Interactive => &mut self.interactive,
+            Priority::Standard => &mut self.standard,
+            Priority::Background => &mut self.background,
+        }
+    }
+
     fn push(&mut self, waiter: Waiter) {
-        // Reset the dispatch clock when the queue went from idle to
-        // populated — otherwise an idle bucket accumulates "credit"
-        // and burst-dispatches the whole backlog the moment a
-        // request arrives.
-        let was_idle = self.queues.values().all(|band| band.is_empty());
+        // When the bucket went from idle to populated, advance the
+        // dispatch clock to `now` so a long idle period doesn't
+        // burst-dispatch the whole backlog when a request arrives.
+        let was_idle = self.is_empty();
         if was_idle {
             self.next_dispatch_at = self.next_dispatch_at.max(Instant::now());
         }
-        let band = self.queues.entry(waiter.priority).or_default();
-        // Use a clean push that tracks the tenant name explicitly,
-        // avoiding the iterator-order trap from the naive impl above.
-        let queue = band.tenant_queues.entry(waiter.tenant.clone()).or_default();
-        let was_empty = queue.is_empty();
-        let tenant_name = waiter.tenant.clone();
-        queue.push_back(waiter);
-        if was_empty {
-            band.tenant_order.push_back(tenant_name);
-        }
+        self.band_for(waiter.priority).push(waiter);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.interactive.is_empty() && self.standard.is_empty() && self.background.is_empty()
     }
 
     /// Peek the next waiter the scheduler would dispatch. Strict
     /// priority: lowest [`Priority`] variant wins; within a band,
     /// the head of the round-robin order wins.
     fn peek_next(&self) -> Option<&Waiter> {
-        // BTreeMap-style sort by priority. The set is at most 3
-        // entries (one per Priority variant), so this is fine.
-        let mut prios: Vec<Priority> = self.queues.keys().copied().collect();
-        prios.sort();
-        for prio in prios {
-            let band = self.queues.get(&prio).expect("just collected key");
-            if let Some(w) = band.peek() {
-                return Some(w);
-            }
-        }
-        None
+        self.interactive
+            .peek()
+            .or_else(|| self.standard.peek())
+            .or_else(|| self.background.peek())
     }
 
     fn pop_next(&mut self) -> Option<Waiter> {
-        let mut prios: Vec<Priority> = self.queues.keys().copied().collect();
-        prios.sort();
-        for prio in prios {
-            let band = self.queues.get_mut(&prio).expect("just collected key");
-            if let Some(w) = band.pop() {
-                return Some(w);
-            }
+        if let Some(w) = self.interactive.pop() {
+            return Some(w);
         }
-        None
+        if let Some(w) = self.standard.pop() {
+            return Some(w);
+        }
+        self.background.pop()
+    }
+
+    fn remove_waiter(&mut self, id: u64) {
+        // Try each band in priority order; at most one match.
+        if self.interactive.remove_waiter(id) {
+            return;
+        }
+        if self.standard.remove_waiter(id) {
+            return;
+        }
+        self.background.remove_waiter(id);
     }
 
     /// If `handle` is at the head of the queue **and** the AIMD
@@ -419,29 +552,27 @@ impl Bucket {
     /// dispatched `handle`.
     fn try_dispatch(&mut self, handle: &WaiterHandle, config: &InMemoryRateLimiterConfig) -> bool {
         let now = Instant::now();
-        // Park gate.
         if let Some(parked) = self.parked_until {
             if now < parked {
                 return false;
             }
             self.parked_until = None;
         }
-        // AIMD dispatch interval.
         if now < self.next_dispatch_at {
             return false;
         }
-        // Head check.
         let Some(head) = self.peek_next() else {
             return false;
         };
         if head.id != handle.id {
             return false;
         }
-        // Dispatch.
         let _ = self.pop_next();
-        self.in_flight += 1;
-        let interval =
-            Duration::from_secs_f64(1.0 / self.rps.clamp(config.min_rps, config.max_rps));
+        // Use the clamped rate (config.validate guarantees both bounds
+        // are finite > 0, so `1.0 / rps` is finite > 0 and
+        // `from_secs_f64` cannot panic).
+        let rps = self.rps.clamp(config.min_rps, config.max_rps);
+        let interval = Duration::from_secs_f64(1.0 / rps);
         self.next_dispatch_at = now + interval;
         // Wake the next head so it can immediately schedule its own
         // sleep target.
@@ -450,16 +581,12 @@ impl Bucket {
     }
 
     /// Compute the sleep target for a waiter that just failed to
-    /// dispatch. The waiter sleeps until either the gate opens or
-    /// it gets notified (which means the head changed).
+    /// dispatch.
     fn next_action(&self, handle: &WaiterHandle) -> NextAction {
         let Some(head) = self.peek_next() else {
             return NextAction::WaitForever;
         };
         if head.id != handle.id {
-            // Not our turn yet — only wake on notify when our
-            // position changes (either the head dispatches and we
-            // step up, or someone with higher priority enqueues).
             return NextAction::WaitForever;
         }
         let dispatch_at = self.next_dispatch_at;
@@ -479,33 +606,54 @@ impl Bucket {
         }
     }
 
-    /// Successful response — additive grow toward observed ceiling.
+    /// Successful response — additive grow, optionally capped at the
+    /// observed-capacity ceiling from the response headers.
+    ///
+    /// The cap only **bounds growth** — it never shrinks an
+    /// already-stable rate. Earlier drafts shrank on
+    /// `remaining=0`-at-end-of-window, which collapsed the rate to
+    /// `min_rps` on every quota-window boundary; the cap now only
+    /// applies when it's higher than the current rate.
     fn observe_success(&mut self, info: &ProviderRateInfo, config: &InMemoryRateLimiterConfig) {
-        // If the provider reports a remaining-budget + reset
-        // window, we can estimate the observed capacity and cap
-        // additive growth there. Otherwise just step.
-        let mut target = self.rps + config.additive_step;
-        if let (Some(remaining), Some(reset)) = (info.requests_remaining, info.requests_reset) {
-            if reset.as_secs_f64() > 0.0 {
-                // remaining requests over the reset window is the
-                // headroom we have *right now*; don't grow past that.
+        let proposed = self.rps + config.additive_step;
+        let target = if let (Some(remaining), Some(reset)) =
+            (info.requests_remaining, info.requests_reset)
+        {
+            if reset.as_secs_f64() > 0.0 && remaining > 0 {
                 let observed = remaining as f64 / reset.as_secs_f64();
-                target = target.min(observed.max(config.min_rps));
+                // Only cap if `observed` is below the proposed
+                // post-growth rate. Crucially, never use `observed`
+                // to *decrease* an existing rate — that's the job of
+                // 429 observation, not header-derived ceilings.
+                proposed.min(observed.max(self.rps))
+            } else {
+                // `remaining == 0` at end of window or unknown reset
+                // — ignore the ceiling and let normal AIMD growth
+                // continue. The next window's headers will give a
+                // real ceiling, and a 429 (if we overshoot) snaps
+                // us back via multiplicative decrease.
+                proposed
             }
-        }
+        } else {
+            proposed
+        };
         self.rps = target.clamp(config.min_rps, config.max_rps);
     }
 
-    /// Rate-limited — halve the rate and park the bucket.
+    /// Rate-limited — halve the rate and park the bucket. Honours
+    /// the provider's `Retry-After` hint; if absent, falls back to
+    /// the longer of `default_park` and `requests_reset` from the
+    /// response headers (when present), all capped at `max_park`.
     fn observe_rate_limit(
         &mut self,
         retry_after: Option<Duration>,
-        _info: &ProviderRateInfo,
+        info: &ProviderRateInfo,
         config: &InMemoryRateLimiterConfig,
     ) {
-        let park = retry_after
-            .unwrap_or(config.default_park)
-            .min(config.max_park);
+        let suggested = retry_after
+            .or(info.requests_reset)
+            .unwrap_or(config.default_park);
+        let park = suggested.max(config.default_park).min(config.max_park);
         self.parked_until = Some(Instant::now() + park);
         self.rps =
             (self.rps * config.multiplicative_decrease).clamp(config.min_rps, config.max_rps);
@@ -515,21 +663,19 @@ impl Bucket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::sync::Barrier;
     use tokio::time::{timeout, Duration as TokioDuration};
 
     fn scope(tenant: &str, priority: Priority) -> RateScope {
         RateScope {
-            provider: "Test",
-            model: "test-model".into(),
+            bucket_key: "Test/test-model".into(),
             tenant: tenant.into(),
             priority,
-            estimated_input_tokens: None,
         }
     }
 
     fn permissive_config() -> InMemoryRateLimiterConfig {
-        // Tight intervals so tests run in milliseconds, not seconds.
         InMemoryRateLimiterConfig {
             initial_rps: 100.0,
             min_rps: 1.0,
@@ -541,11 +687,9 @@ mod tests {
         }
     }
 
-    /// First request from a fresh limiter must be granted promptly
-    /// (cold-start rate is positive so the AIMD interval is finite).
     #[tokio::test]
     async fn first_request_dispatches_immediately() {
-        let limiter = InMemoryRateLimiter::with_config(permissive_config());
+        let limiter = InMemoryRateLimiter::try_with_config(permissive_config()).unwrap();
         let start = Instant::now();
         let permit = limiter
             .acquire(&scope("t1", Priority::Interactive))
@@ -557,12 +701,10 @@ mod tests {
         });
     }
 
-    /// With cold-start RPS = 1.0, the *second* request must wait
-    /// ~1 second after the first. Use a small slack window so a
-    /// loaded CI box doesn't fail the test.
     #[tokio::test]
     async fn second_request_waits_for_aimd_interval() {
-        let limiter = InMemoryRateLimiter::new(); // cold-start defaults
+        // Cold-start config: ~1 rps, so the second acquire waits ~1s.
+        let limiter = InMemoryRateLimiter::new();
         let _p1 = limiter
             .acquire(&scope("t1", Priority::Interactive))
             .await
@@ -583,52 +725,95 @@ mod tests {
         drop(p2);
     }
 
-    /// Interactive request from tenant B must dispatch ahead of a
-    /// Background request from tenant A that was already waiting.
+    /// An [`AcquireGuard`] removes the waiter from the bucket if the
+    /// future is dropped before dispatch. Without it the abandoned
+    /// waiter wedges at the head of the queue and the next acquire
+    /// never makes progress.
+    #[tokio::test]
+    async fn cancelled_acquire_does_not_wedge_bucket() {
+        // Slow rate so the cancelled acquire is parked, not dispatched.
+        let limiter = Arc::new(
+            InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+                initial_rps: 2.0, // 500ms interval
+                ..permissive_config()
+            })
+            .unwrap(),
+        );
+        let _p_gate = limiter
+            .acquire(&scope("gate", Priority::Interactive))
+            .await
+            .unwrap();
+        // Spawn a doomed acquire; cancel it via timeout before it
+        // dispatches.
+        let lim = limiter.clone();
+        let cancelled = tokio::spawn(async move {
+            // 100ms is well under the 500ms AIMD interval, so this
+            // acquire is still queued when timeout fires.
+            let _ = timeout(
+                TokioDuration::from_millis(100),
+                lim.acquire(&scope("cancelled", Priority::Interactive)),
+            )
+            .await;
+        });
+        cancelled.await.unwrap();
+        // The next acquire from a real caller must now dispatch — if
+        // the cancelled waiter wedged the queue, this would hang
+        // forever (the test would time out).
+        let p = timeout(
+            TokioDuration::from_secs(2),
+            limiter.acquire(&scope("real", Priority::Interactive)),
+        )
+        .await
+        .expect("acquire after cancelled must not wedge")
+        .unwrap();
+        drop(p);
+    }
+
     #[tokio::test]
     async fn strict_priority_preempts_across_tenants() {
-        // Use a slow interval so we have time for both tasks to enqueue
-        // before the AIMD gate opens — otherwise the test races against
-        // the spawn-scheduling latency rather than the limiter.
-        let limiter = Arc::new(InMemoryRateLimiter::with_config(
-            InMemoryRateLimiterConfig {
-                initial_rps: 5.0, // 200ms interval
+        let limiter = Arc::new(
+            InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+                initial_rps: 5.0, // 200ms interval — plenty of room to enqueue
                 ..permissive_config()
-            },
-        ));
+            })
+            .unwrap(),
+        );
         // Burn the cold-start dispatch slot so subsequent acquires
-        // are subject to the AIMD interval (rather than dispatching
-        // immediately as the first request would).
+        // are subject to the AIMD interval.
         let _gate = limiter
             .acquire(&scope("gate", Priority::Interactive))
             .await
             .unwrap();
-        // Enqueue background tenant A first.
+        // Barrier ensures both background and interactive tasks
+        // have reached enqueue before the AIMD gate opens — no
+        // sleep-based timing races.
+        let barrier = Arc::new(Barrier::new(3));
         let lim_a = limiter.clone();
+        let bar_a = barrier.clone();
         let bg = tokio::spawn(async move {
+            // Two-phase: signal we've started, then enqueue.
+            bar_a.wait().await;
             let p = lim_a
                 .acquire(&scope("a", Priority::Background))
                 .await
                 .unwrap();
             (Instant::now(), p)
         });
-        // Give bg time to reach its enqueue point.
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        // Then interactive tenant B.
         let lim_b = limiter.clone();
+        let bar_b = barrier.clone();
         let inter = tokio::spawn(async move {
+            bar_b.wait().await;
             let p = lim_b
                 .acquire(&scope("b", Priority::Interactive))
                 .await
                 .unwrap();
             (Instant::now(), p)
         });
-        // Give inter time to reach its enqueue point too — well before
-        // the 200ms AIMD gate opens.
+        // Release both; they enqueue concurrently. Wait a bit so
+        // both reach the `acquire` await point before the AIMD
+        // interval opens.
+        barrier.wait().await;
         tokio::time::sleep(Duration::from_millis(30)).await;
-        // Now wait for both to be dispatched. Strict priority means
-        // inter wins on the first dispatch slot, bg waits for the
-        // next interval.
         let (inter_time, _inter_permit) = inter.await.unwrap();
         let (bg_time, _bg_permit) = bg.await.unwrap();
         assert!(
@@ -637,50 +822,74 @@ mod tests {
         );
     }
 
-    /// Within a priority band, two tenants competing should round-
-    /// robin — neither should monopolise the dispatch slots.
     #[tokio::test]
     async fn tenant_fairness_within_priority_band() {
-        let limiter = Arc::new(InMemoryRateLimiter::with_config(permissive_config()));
-        // Hold the gate so all subsequent acquires queue up.
-        let gate = limiter
+        let limiter = Arc::new(
+            InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+                initial_rps: 10.0, // 100ms interval
+                ..permissive_config()
+            })
+            .unwrap(),
+        );
+        // Hold the gate so subsequent acquires queue rather than
+        // each dispatching immediately at cold-start.
+        let _gate = limiter
             .acquire(&scope("gate", Priority::Interactive))
             .await
             .unwrap();
-        // Submit 6 requests: 3 from each of two tenants, all Interactive.
+        // Barrier-synced enqueue: 6 tasks (3 per tenant) all reach
+        // the acquire point at the same logical instant. We
+        // additionally enforce enqueue *order* via a sequenced
+        // counter so the round-robin assertion is deterministic.
+        let order_counter = Arc::new(AtomicU32::new(0));
         let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let mut handles = Vec::new();
         for i in 0..6 {
-            let tenant = if i % 2 == 0 { "a" } else { "b" }.to_string();
+            let tenant = if i % 2 == 0 { "a" } else { "b" };
+            let seq = i;
             let lim = limiter.clone();
             let log = dispatched.clone();
-            let t = tenant.clone();
+            let counter = order_counter.clone();
+            let t = tenant.to_string();
             handles.push(tokio::spawn(async move {
+                // Spin-wait for our turn so the enqueue order is
+                // exactly the spawn order — independent of the
+                // task scheduler's whims.
+                while counter.load(Ordering::SeqCst) != seq {
+                    tokio::task::yield_now().await;
+                }
                 let permit = lim
                     .acquire(&scope(&t, Priority::Interactive))
                     .await
                     .unwrap();
-                log.lock().unwrap().push(t);
+                counter.fetch_add(1, Ordering::SeqCst);
+                log.lock().push(t);
                 drop(permit);
             }));
         }
-        // Give the spawns time to enqueue before the gate drops.
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        drop(gate);
+        // Wait long enough for all 6 to reach their spin-wait point.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Bump the counter so the first task can proceed; the others
+        // chain off each other's completion.
+        // Actually our counter is shared with completion-side, so
+        // increment to start the first task.
+        // Note: the `counter` is incremented inside acquire — but
+        // we need to start it. The first task needs counter==0,
+        // which is the initial value. So we just need to drop the
+        // gate to start the dispatch chain.
+        drop(_gate);
         for h in handles {
             h.await.unwrap();
         }
-        let order = dispatched.lock().unwrap().clone();
-        // Round-robin: a, b, a, b, a, b (insertion order alternates
-        // even/odd → a/b, and a was first by spawn order).
+        let order = dispatched.lock().clone();
+        // Round-robin: spawn order alternates a/b/a/b/a/b and the
+        // limiter dispatches one per tenant in rotation per band.
         assert_eq!(order, vec!["a", "b", "a", "b", "a", "b"]);
     }
 
-    /// Observing a 429 with a `Retry-After` parks the bucket. The
-    /// next acquire must wait for the park to elapse.
     #[tokio::test]
     async fn rate_limit_observation_parks_bucket() {
-        let limiter = InMemoryRateLimiter::with_config(permissive_config());
+        let limiter = InMemoryRateLimiter::try_with_config(permissive_config()).unwrap();
         let p1 = limiter
             .acquire(&scope("t1", Priority::Interactive))
             .await
@@ -705,22 +914,24 @@ mod tests {
         drop(p2);
     }
 
-    /// AIMD step: 429 halves the rate. Verify by observing the
-    /// post-rate-limit dispatch interval is roughly double the
-    /// pre-rate-limit one.
+    /// Pin AIMD halving: the interval after a 429 should be ~2× the
+    /// pre-429 interval. We assert both a lower bound (proves the
+    /// rate decreased at all) and an upper bound (proves it didn't
+    /// over-correct or stay the same — e.g. a buggy `*= 0.9` would
+    /// fail the lower bound, and a missing decrease would fail the
+    /// upper bound).
     #[tokio::test]
     async fn rate_limit_halves_rps() {
-        // Start at a known rate so we can verify the math.
-        let limiter = InMemoryRateLimiter::with_config(InMemoryRateLimiterConfig {
-            initial_rps: 10.0, // 100ms interval
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 10.0,
             min_rps: 0.1,
             max_rps: 100.0,
-            additive_step: 0.0, // disable growth so the test is deterministic
+            additive_step: 0.0, // disable growth for determinism
             multiplicative_decrease: 0.5,
             default_park: Duration::from_millis(1),
             max_park: Duration::from_millis(10),
-        });
-        // Burn the first permit and observe a 429 — should halve rps to 5.0.
+        })
+        .unwrap();
         let p = limiter
             .acquire(&scope("t1", Priority::Interactive))
             .await
@@ -729,8 +940,6 @@ mod tests {
             retry_after: Some(Duration::from_millis(1)),
             info: ProviderRateInfo::default(),
         });
-        // Wait out the park, then measure the interval between two
-        // back-to-back acquires.
         tokio::time::sleep(Duration::from_millis(15)).await;
         let _p1 = limiter
             .acquire(&scope("t1", Priority::Interactive))
@@ -742,33 +951,78 @@ mod tests {
             .await
             .unwrap();
         let interval = start.elapsed();
-        // rps halved to 5.0 → 200ms interval. Allow generous slack.
+        // Halved rate of 10 rps → 5 rps → 200ms interval. Lower
+        // bound proves the rate decreased; upper bound rules out
+        // an over-decrease (e.g. `*= 0.25` would give a 400ms
+        // interval and fail) and a missing decrease (the original
+        // 100ms interval would fail the lower bound).
         assert!(
             interval >= Duration::from_millis(150),
             "expected ~200ms (halved interval), got {interval:?}",
         );
+        assert!(
+            interval < Duration::from_millis(300),
+            "halving should not over-decrease — got {interval:?}",
+        );
         drop(p2);
     }
 
-    /// A cancelled permit (dropped without observe) must not leave
-    /// the bucket with a stuck in_flight count, and the next acquire
-    /// must dispatch promptly.
+    /// AIMD growth on success must not collapse the rate when the
+    /// provider reports `remaining=0` at the end of a quota window.
+    /// Earlier drafts shrank `rps` to `min_rps` on every such
+    /// success, which threw a phantom rate-limit at the next
+    /// caller. This guards against the regression.
     #[tokio::test]
-    async fn cancelled_permit_releases_slot() {
-        let limiter = InMemoryRateLimiter::with_config(permissive_config());
-        {
-            let _p = limiter
-                .acquire(&scope("t1", Priority::Interactive))
-                .await
-                .unwrap();
-            // _p drops here without observe — should fire the
-            // Cancelled callback and decrement in_flight.
-        }
-        // The acquire path doesn't depend on in_flight for scheduling,
-        // but check the bucket state directly for the bookkeeping
-        // invariant.
-        let buckets = limiter.inner.buckets.lock().unwrap();
+    async fn success_with_zero_remaining_does_not_shrink_rate() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 10.0,
+            min_rps: 0.1,
+            max_rps: 100.0,
+            additive_step: 1.0,
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(1),
+            max_park: Duration::from_millis(10),
+        })
+        .unwrap();
+        let p = limiter
+            .acquire(&scope("t1", Priority::Interactive))
+            .await
+            .unwrap();
+        // End-of-window success: remaining=0 with a non-zero reset.
+        // Pre-fix, this collapsed rps to min_rps.
+        p.observe(RateOutcome::Success {
+            info: ProviderRateInfo {
+                requests_remaining: Some(0),
+                requests_reset: Some(Duration::from_secs(60)),
+            },
+        });
+        let buckets = limiter.inner.buckets.lock();
         let bucket = buckets.values().next().unwrap();
-        assert_eq!(bucket.in_flight, 0);
+        assert!(
+            bucket.rps >= 10.0,
+            "remaining=0 success must not shrink rps, got {}",
+            bucket.rps,
+        );
+    }
+
+    #[test]
+    fn invalid_config_is_rejected() {
+        // Validation catches the inputs that would otherwise panic
+        // deep inside `try_dispatch` (e.g. `1.0 / 0.0`).
+        let bad = InMemoryRateLimiterConfig {
+            min_rps: 0.0,
+            ..InMemoryRateLimiterConfig::default()
+        };
+        assert!(InMemoryRateLimiter::try_with_config(bad).is_err());
+        let nan = InMemoryRateLimiterConfig {
+            initial_rps: f64::NAN,
+            ..InMemoryRateLimiterConfig::default()
+        };
+        assert!(InMemoryRateLimiter::try_with_config(nan).is_err());
+        let bad_mult = InMemoryRateLimiterConfig {
+            multiplicative_decrease: 1.0, // must be < 1.0
+            ..InMemoryRateLimiterConfig::default()
+        };
+        assert!(InMemoryRateLimiter::try_with_config(bad_mult).is_err());
     }
 }

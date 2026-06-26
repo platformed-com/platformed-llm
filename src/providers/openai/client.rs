@@ -493,12 +493,6 @@ fn parse_openai_rate_info(
         requests_reset: response
             .header("x-ratelimit-reset-requests")
             .and_then(parse_openai_reset),
-        tokens_remaining: response
-            .header("x-ratelimit-remaining-tokens")
-            .and_then(|v| v.trim().parse().ok()),
-        tokens_reset: response
-            .header("x-ratelimit-reset-tokens")
-            .and_then(parse_openai_reset),
     }
 }
 
@@ -1417,11 +1411,12 @@ impl Provider for OpenAIProvider {
         // and prioritises us. The permit's `observe()` feeds the
         // response's normalised headers back to the limiter.
         let scope = crate::rate_limit::RateScope {
-            provider: "OpenAI",
-            model: config.model.clone(),
-            tenant: config.tenant.clone().unwrap_or_default(),
+            bucket_key: format!("OpenAI/{}", config.model),
+            tenant: config
+                .tenant
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::from("")),
             priority: config.priority.unwrap_or_default(),
-            estimated_input_tokens: config.estimated_input_tokens,
         };
         let permit = self.rate_limiter.acquire(&scope).await?;
         let response = match self.transport.send(req).await {
@@ -1455,10 +1450,10 @@ impl Provider for OpenAIProvider {
             return Err(parse_openai_error(status, retry_after, &body_str));
         }
 
-        // Success path: report the response's rate-limit headers so
-        // the limiter's AIMD step grows toward observed capacity.
+        // Success path: defer the limiter observation until the
+        // stream terminates so an in-stream rate-limit / connection
+        // drop is observed correctly. See `rate_limit::observe_stream`.
         let info = parse_openai_rate_info(&response);
-        permit.observe(crate::rate_limit::RateOutcome::Success { info });
 
         use crate::sse_stream::SseStreamExt;
         let state = Arc::new(Mutex::new(OpenAIStreamState::new()));
@@ -1494,7 +1489,8 @@ impl Provider for OpenAIProvider {
         // poll the state at end-of-stream if we want this populated on
         // the streaming-only path too.
         let _ = state; // keep state alive (the closure also clones it)
-        Ok(Response::from_stream(event_stream))
+        let observed = crate::rate_limit::observe_response_stream(event_stream, permit, info);
+        Ok(Response::from_stream(observed))
     }
 }
 

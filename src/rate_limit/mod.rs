@@ -121,61 +121,66 @@ pub enum Priority {
 /// The per-request context the [`RateLimiter`] needs to schedule a
 /// dispatch and update its model. Constructed by the provider just
 /// before calling [`RateLimiter::acquire`].
+///
+/// The `bucket_key` is **opaque to the limiter** — providers compute
+/// it from whatever combination of fields actually shares a rate-limit
+/// bucket on the upstream. OpenAI uses `"OpenAI/{model}"`; Vertex
+/// providers add the region (`"Vertex-Anthropic/{location}/{model}"`)
+/// because each Vertex region has an independent quota. Two requests
+/// with the same `bucket_key` share AIMD state; two with different
+/// keys are tracked independently.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct RateScope {
-    /// Short identifier of the upstream provider (e.g. `"OpenAI"`,
-    /// `"Google"`, `"Anthropic"`). The limiter tracks quota
-    /// independently per provider.
-    pub provider: &'static str,
-    /// Provider-specific model identifier. The limiter tracks quota
-    /// independently per model.
-    pub model: String,
-    /// Opaque tenant key for fairness. The limiter round-robins
-    /// between tenants within a priority band so one tenant's
-    /// burst can't starve another at the same priority.
-    pub tenant: String,
+    /// Opaque bucket identifier. The limiter tracks AIMD and parking
+    /// state per unique value. Providers compute this — see the
+    /// struct docs.
+    pub bucket_key: String,
+    /// Opaque tenant key for fairness. Stored as [`Arc<str>`](Arc) so a
+    /// single tenant string can be cheaply cloned into many requests
+    /// (refcount bump, no allocation). The limiter round-robins
+    /// between tenants within a priority band so one tenant's burst
+    /// can't starve another at the same priority.
+    pub tenant: Arc<str>,
     /// Latency priority. See [`Priority`].
     pub priority: Priority,
-    /// Caller-supplied estimate of the input prompt token count, if
-    /// known. The limiter uses this to make token-aware decisions
-    /// when the provider reports a token-budget remaining (OpenAI).
-    /// `None` is fine — the limiter falls back to request-count
-    /// budgeting and still respects `Retry-After`.
-    pub estimated_input_tokens: Option<u32>,
 }
 
 /// Normalised rate-limit information parsed from a provider's
 /// response. Each provider implementation populates the fields it
 /// reports; the limiter's AIMD step reads `requests_remaining` /
-/// `tokens_remaining` to understand observed capacity.
+/// `requests_reset` to understand observed capacity.
+///
+/// Token-budget headers were exposed in an earlier draft but no
+/// in-tree limiter consumed them, so they've been removed for now —
+/// adding them back is a non-breaking change thanks to
+/// [`#[non_exhaustive]`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct ProviderRateInfo {
     /// Remaining request budget for the current window, if reported.
     pub requests_remaining: Option<u32>,
     /// Time until the request budget refills, if reported.
     pub requests_reset: Option<Duration>,
-    /// Remaining token budget for the current window, if reported.
-    pub tokens_remaining: Option<u32>,
-    /// Time until the token budget refills, if reported.
-    pub tokens_reset: Option<Duration>,
 }
 
 /// What happened to the in-flight request the permit was issued for.
 /// Reported via [`RatePermit::observe`]; updates the limiter's AIMD
 /// state and `Retry-After` parking.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum RateOutcome {
-    /// The request completed (the provider may still have streamed
-    /// an error mid-response, but the rate-limit signal is "we got
-    /// past the gate"). Includes any normalised header info.
+    /// The request completed cleanly (HTTP 2xx, stream terminated
+    /// with `Done`). Includes any normalised header info parsed from
+    /// the response.
     Success {
         /// Normalised rate-limit headers from the response.
         info: ProviderRateInfo,
     },
     /// The provider rate-limited us, either pre-stream (HTTP 429) or
     /// mid-stream (Anthropic `overloaded_error`). The limiter parks
-    /// the [`(provider, model)`] bucket for `retry_after` and halves
-    /// the available rate.
+    /// the bucket for `retry_after` (or its own default if `None`)
+    /// and multiplicatively halves the available rate.
     RateLimited {
         /// Provider-supplied wait hint, if any. The limiter parks
         /// for at least this duration before resuming.
@@ -203,6 +208,12 @@ pub enum RateOutcome {
 /// If the permit is dropped without `observe`, the limiter is
 /// notified with [`RateOutcome::Cancelled`] — important so a
 /// cancelled future / panic doesn't leak the slot.
+///
+/// `#[must_use]`: silently dropping a permit reports the request as
+/// cancelled to the limiter, which mutes AIMD growth. That's the
+/// right behaviour for actual cancellation but is usually a bug if
+/// the caller forgot to call `observe` after a real response.
+#[must_use = "drop a permit only on cancellation; otherwise call observe() with the request outcome"]
 pub struct RatePermit {
     callback: Option<Box<dyn FnOnce(RateOutcome) + Send + 'static>>,
 }
@@ -304,21 +315,29 @@ impl RateLimiter for NoOpRateLimiter {
 /// `Arc::new(my_impl) as Arc<dyn RateLimiter>` cast.
 pub type SharedRateLimiter = Arc<dyn RateLimiter>;
 
-/// Default `Arc<dyn RateLimiter>` — a [`NoOpRateLimiter`]. Each
-/// provider holds one of these unless the caller overrides via
-/// `.with_rate_limiter(...)`.
+/// Default `Arc<dyn RateLimiter>` — a single shared
+/// [`NoOpRateLimiter`] every provider falls back to until the caller
+/// overrides via `.with_rate_limiter(...)`.
+///
+/// Shares one `Arc` across every provider construction in the
+/// process via [`std::sync::OnceLock`] so the no-op default doesn't
+/// allocate per provider.
 ///
 /// `dead_code` allowed for the no-feature build: only the hosted
 /// providers (`openai`, `google`, `anthropic-vertex`) consume this,
 /// and they're all behind cargo features.
 #[allow(dead_code)]
 pub(crate) fn default_shared_limiter() -> SharedRateLimiter {
-    Arc::new(NoOpRateLimiter)
+    use std::sync::OnceLock;
+    static DEFAULT: OnceLock<SharedRateLimiter> = OnceLock::new();
+    DEFAULT.get_or_init(|| Arc::new(NoOpRateLimiter)).clone()
 }
 
 mod in_memory;
+mod observe_stream;
 
 pub use in_memory::{InMemoryRateLimiter, InMemoryRateLimiterConfig};
+pub(crate) use observe_stream::observe_response_stream;
 
 #[cfg(test)]
 mod tests {
@@ -328,11 +347,9 @@ mod tests {
     async fn noop_limiter_grants_immediately() {
         let limiter = NoOpRateLimiter;
         let scope = RateScope {
-            provider: "Test",
-            model: "test-model".into(),
+            bucket_key: "Test/test-model".into(),
             tenant: "t1".into(),
             priority: Priority::Interactive,
-            estimated_input_tokens: None,
         };
         let permit = limiter.acquire(&scope).await.unwrap();
         permit.observe(RateOutcome::Success {

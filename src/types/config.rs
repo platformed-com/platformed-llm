@@ -218,19 +218,15 @@ pub struct RawConfig {
     /// collapses to a single anonymous tenant — fine for
     /// single-tenant deployments; multi-tenant callers should set
     /// this per request so the limiter can isolate one tenant's
-    /// burst from another.
-    pub tenant: Option<String>,
+    /// burst from another. Stored as [`Arc<str>`](std::sync::Arc) so the same
+    /// tenant identifier can be cheaply cloned into many requests.
+    pub tenant: Option<std::sync::Arc<str>>,
     /// Latency priority for the rate limiter. Defaults to
     /// [`crate::Priority::Interactive`] when unset — most callers
     /// run user-facing requests, so we minimise their queueing
     /// latency by default. Background batches should explicitly
     /// pick [`crate::Priority::Background`].
     pub priority: Option<crate::rate_limit::Priority>,
-    /// Best-effort estimate of the input prompt's token count. The
-    /// rate limiter uses this to make token-aware decisions when
-    /// the provider reports a token-budget remaining (currently
-    /// OpenAI). `None` falls back to request-count budgeting.
-    pub estimated_input_tokens: Option<u32>,
 }
 
 /// User-facing request spec. Bundles the [`RawConfig`] payload with
@@ -314,9 +310,8 @@ pub struct ConfigBuilder {
     store: Option<bool>,
     reasoning: Option<ReasoningConfig>,
     response_format: Option<ResponseFormat>,
-    tenant: Option<String>,
+    tenant: Option<std::sync::Arc<str>>,
     priority: Option<crate::rate_limit::Priority>,
-    estimated_input_tokens: Option<u32>,
     #[allow(clippy::type_complexity)]
     middleware_override: Option<Vec<std::sync::Arc<dyn crate::middleware::Middleware>>>,
 }
@@ -342,7 +337,6 @@ impl ConfigBuilder {
             response_format: None,
             tenant: None,
             priority: None,
-            estimated_input_tokens: None,
             middleware_override: None,
         }
     }
@@ -455,7 +449,11 @@ impl ConfigBuilder {
     /// single noisy caller can starve every other request through
     /// the shared limiter. The string is opaque; pick whatever
     /// identifies a quota-isolated unit (user id, workspace id, …).
-    pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
+    ///
+    /// Accepts anything that converts into [`Arc<str>`](std::sync::Arc) (e.g. a
+    /// `&str` or `String`); the same tenant string can be cheaply
+    /// reused across many requests via `Arc::clone`.
+    pub fn tenant(mut self, tenant: impl Into<std::sync::Arc<str>>) -> Self {
         self.tenant = Some(tenant.into());
         self
     }
@@ -465,16 +463,6 @@ impl ConfigBuilder {
     /// background, strictly, across tenants.
     pub fn priority(mut self, priority: crate::rate_limit::Priority) -> Self {
         self.priority = Some(priority);
-        self
-    }
-
-    /// Best-effort estimate of the input prompt's token count.
-    /// Passed to the rate limiter for token-aware budgeting on
-    /// providers that report a token-budget remaining. Optional —
-    /// the limiter falls back to request-count budgeting when
-    /// absent.
-    pub fn estimated_input_tokens(mut self, tokens: u32) -> Self {
-        self.estimated_input_tokens = Some(tokens);
         self
     }
 
@@ -514,7 +502,6 @@ impl ConfigBuilder {
                 response_format: self.response_format,
                 tenant: self.tenant,
                 priority: self.priority,
-                estimated_input_tokens: self.estimated_input_tokens,
             },
             middleware_override: self.middleware_override,
         }

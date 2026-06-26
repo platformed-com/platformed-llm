@@ -521,11 +521,18 @@ impl Provider for AnthropicViaVertexProvider {
         let req = TransportRequest { url, headers, body };
 
         let scope = crate::rate_limit::RateScope {
-            provider: "Anthropic",
-            model: config.model.clone(),
-            tenant: config.tenant.clone().unwrap_or_default(),
+            // Vertex regions have independent quotas — include the
+            // location so per-region buckets stay separate.
+            bucket_key: format!(
+                "Vertex-Anthropic/{}/{}",
+                self.endpoint.location(),
+                config.model,
+            ),
+            tenant: config
+                .tenant
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::from("")),
             priority: config.priority.unwrap_or_default(),
-            estimated_input_tokens: config.estimated_input_tokens,
         };
         let permit = self.rate_limiter.acquire(&scope).await?;
         let response = match self.transport.send(req).await {
@@ -581,15 +588,11 @@ impl Provider for AnthropicViaVertexProvider {
             });
         }
 
-        // Success path: no rate-limit headers from Anthropic-via-Vertex,
-        // so we feed back an empty info struct. The AIMD step still
-        // grows by `additive_step` per success — the limiter just has
-        // no observed ceiling to cap growth at, so it'll keep growing
-        // until it hits a 429 (which is fine; the multiplicative
-        // decrease then snaps it down).
-        permit.observe(crate::rate_limit::RateOutcome::Success {
-            info: crate::rate_limit::ProviderRateInfo::default(),
-        });
+        // Success path: defer the limiter observation until the
+        // stream terminates so a mid-stream `overloaded_error` /
+        // `rate_limit_error` (which we map to `Error::RateLimit`
+        // below) is fed back as `RateLimited`, not `Success`. See
+        // `rate_limit::observe_stream`.
 
         // Create SSE stream from response
         let sse_stream = SseStream::new("Anthropic", response.body);
@@ -632,7 +635,12 @@ impl Provider for AnthropicViaVertexProvider {
             .map(|events| futures_util::stream::iter(events.into_iter()))
             .flatten();
 
-        Ok(Response::from_stream(event_stream))
+        let observed = crate::rate_limit::observe_response_stream(
+            event_stream,
+            permit,
+            crate::rate_limit::ProviderRateInfo::default(),
+        );
+        Ok(Response::from_stream(observed))
     }
 }
 

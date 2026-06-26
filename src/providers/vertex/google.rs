@@ -810,11 +810,18 @@ impl Provider for GoogleProvider {
         };
 
         let scope = crate::rate_limit::RateScope {
-            provider: "Google",
-            model: config.model.clone(),
-            tenant: config.tenant.clone().unwrap_or_default(),
+            // Vertex regions have independent quotas — include the
+            // location so per-region buckets stay separate.
+            bucket_key: format!(
+                "Vertex-Google/{}/{}",
+                self.endpoint.location(),
+                config.model,
+            ),
+            tenant: config
+                .tenant
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::from("")),
             priority: config.priority.unwrap_or_default(),
-            estimated_input_tokens: config.estimated_input_tokens,
         };
         let permit = self.rate_limiter.acquire(&scope).await?;
         let response = match self.transport.send(req).await {
@@ -872,13 +879,11 @@ impl Provider for GoogleProvider {
             });
         }
 
-        // Success path: no rate-limit headers from Vertex Gemini, so
-        // feed back an empty info struct. AIMD grows on success
-        // until a 429 multiplicatively decreases — see Anthropic
-        // provider for the same pattern.
-        permit.observe(crate::rate_limit::RateOutcome::Success {
-            info: crate::rate_limit::ProviderRateInfo::default(),
-        });
+        // Success path: defer the limiter observation to stream-end
+        // — see `rate_limit::observe_stream`. We do this even though
+        // Vertex Gemini doesn't have a known mid-stream rate-limit
+        // signal yet, so transport drops mid-response are reported as
+        // `OtherFailure` rather than `Success`.
 
         // Create SSE stream from response (Gemini supports ?alt=sse)
         let sse_stream = SseStream::new("Google", response.body);
@@ -924,7 +929,12 @@ impl Provider for GoogleProvider {
             .map(|events| futures_util::stream::iter(events.into_iter()))
             .flatten();
 
-        Ok(Response::from_stream(event_stream))
+        let observed = crate::rate_limit::observe_response_stream(
+            event_stream,
+            permit,
+            crate::rate_limit::ProviderRateInfo::default(),
+        );
+        Ok(Response::from_stream(observed))
     }
 }
 

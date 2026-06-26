@@ -647,11 +647,12 @@ impl Provider for MockProvider {
         // acquire before yielding the scripted reply, observe with
         // the outcome derived from the reply.
         let scope = crate::rate_limit::RateScope {
-            provider: "Mock",
-            model: config.model.clone(),
-            tenant: config.tenant.clone().unwrap_or_default(),
+            bucket_key: format!("Mock/{}", config.model),
+            tenant: config
+                .tenant
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::from("")),
             priority: config.priority.unwrap_or_default(),
-            estimated_input_tokens: config.estimated_input_tokens,
         };
         let permit = self.rate_limiter.acquire(&scope).await?;
 
@@ -672,11 +673,17 @@ impl Provider for MockProvider {
                 Err(error)
             }
             Reply::Respond(response) => {
-                permit.observe(crate::rate_limit::RateOutcome::Success {
-                    info: crate::rate_limit::ProviderRateInfo::default(),
-                });
+                // Defer observation to stream-end so a scripted
+                // `with_stream_error` mid-stream produces an
+                // `OtherFailure` rather than a misleading `Success`.
                 let events = lower_response(response, &self.chunking);
-                Ok(Response::from_stream(futures_util::stream::iter(events)))
+                let stream = futures_util::stream::iter(events);
+                let observed = crate::rate_limit::observe_response_stream(
+                    stream,
+                    permit,
+                    crate::rate_limit::ProviderRateInfo::default(),
+                );
+                Ok(Response::from_stream(observed))
             }
         }
     }
