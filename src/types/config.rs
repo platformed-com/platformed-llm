@@ -213,14 +213,17 @@ pub struct RawConfig {
     /// Structured-output constraint (JSON mode / JSON schema). `None`
     /// means unconstrained text output.
     pub response_format: Option<ResponseFormat>,
-    /// Opaque tenant key consulted by the provider's
+    /// Opaque tenant identifier consulted by the provider's
     /// [`crate::rate_limit::RateLimiter`] for fair queueing. `None`
-    /// collapses to a single anonymous tenant — fine for
-    /// single-tenant deployments; multi-tenant callers should set
-    /// this per request so the limiter can isolate one tenant's
-    /// burst from another. Stored as [`Arc<str>`](std::sync::Arc) so the same
-    /// tenant identifier can be cheaply cloned into many requests.
-    pub tenant: Option<std::sync::Arc<str>>,
+    /// collapses to a single anonymous tenant ([`Uuid::nil`](uuid::Uuid::nil)) —
+    /// fine for single-tenant deployments; multi-tenant callers
+    /// should set this per request so the limiter can isolate one
+    /// tenant's burst from another.
+    ///
+    /// Map your own tenant identifier (workspace id, user id, …) to
+    /// a stable [`Uuid`](uuid::Uuid) once per tenant — e.g. UUIDv5 over your
+    /// identifier namespace — and reuse it across requests.
+    pub tenant: Option<uuid::Uuid>,
     /// Latency priority for the rate limiter. Defaults to
     /// [`crate::Priority::Interactive`] when unset — most callers
     /// run user-facing requests, so we minimise their queueing
@@ -310,7 +313,7 @@ pub struct ConfigBuilder {
     store: Option<bool>,
     reasoning: Option<ReasoningConfig>,
     response_format: Option<ResponseFormat>,
-    tenant: Option<std::sync::Arc<str>>,
+    tenant: Option<uuid::Uuid>,
     priority: Option<crate::rate_limit::Priority>,
     #[allow(clippy::type_complexity)]
     middleware_override: Option<Vec<std::sync::Arc<dyn crate::middleware::Middleware>>>,
@@ -442,19 +445,17 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the opaque tenant key the provider's
+    /// Set the opaque tenant identifier the provider's
     /// [`crate::rate_limit::RateLimiter`] uses for fair queueing.
     /// Required for multi-tenant deployments — a missing tenant
-    /// collapses every request into one anonymous tenant, so a
-    /// single noisy caller can starve every other request through
-    /// the shared limiter. The string is opaque; pick whatever
-    /// identifies a quota-isolated unit (user id, workspace id, …).
+    /// collapses every request into one anonymous tenant
+    /// ([`uuid::Uuid::nil`]), so a single noisy caller can starve
+    /// every other request through the shared limiter.
     ///
-    /// Accepts anything that converts into [`Arc<str>`](std::sync::Arc) (e.g. a
-    /// `&str` or `String`); the same tenant string can be cheaply
-    /// reused across many requests via `Arc::clone`.
-    pub fn tenant(mut self, tenant: impl Into<std::sync::Arc<str>>) -> Self {
-        self.tenant = Some(tenant.into());
+    /// Map your own tenant identifier to a stable [`Uuid`](uuid::Uuid) once per
+    /// tenant (e.g. UUIDv5 over your id namespace) and reuse it.
+    pub fn tenant(mut self, tenant: uuid::Uuid) -> Self {
+        self.tenant = Some(tenant);
         self
     }
 

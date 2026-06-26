@@ -95,6 +95,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use uuid::Uuid;
+
 use crate::Error;
 
 /// Latency priority for a request within a tenant. Strictly ordered
@@ -136,12 +138,14 @@ pub struct RateScope {
     /// state per unique value. Providers compute this — see the
     /// struct docs.
     pub bucket_key: String,
-    /// Opaque tenant key for fairness. Stored as [`Arc<str>`](Arc) so a
-    /// single tenant string can be cheaply cloned into many requests
-    /// (refcount bump, no allocation). The limiter round-robins
-    /// between tenants within a priority band so one tenant's burst
-    /// can't starve another at the same priority.
-    pub tenant: Arc<str>,
+    /// Opaque tenant identifier for fairness. The limiter
+    /// round-robins between tenants within a priority band so one
+    /// tenant's burst can't starve another at the same priority.
+    /// [`Uuid`] is `Copy` and fixed-size (16 bytes) — pass it by
+    /// value, no allocation per request. Map your own tenant
+    /// identifier (workspace id, user id, …) to a stable UUID once
+    /// per tenant (e.g. UUIDv5 over your id namespace) and reuse it.
+    pub tenant: Uuid,
     /// Latency priority. See [`Priority`].
     pub priority: Priority,
 }
@@ -337,6 +341,10 @@ mod in_memory;
 mod observe_stream;
 
 pub use in_memory::{InMemoryRateLimiter, InMemoryRateLimiterConfig};
+// Used by every hosted provider's `generate()` to wrap the success-path
+// stream. `dead_code` allowed for the no-feature build where no provider
+// imports it.
+#[allow(unused_imports)]
 pub(crate) use observe_stream::observe_response_stream;
 
 #[cfg(test)]
@@ -348,7 +356,7 @@ mod tests {
         let limiter = NoOpRateLimiter;
         let scope = RateScope {
             bucket_key: "Test/test-model".into(),
-            tenant: "t1".into(),
+            tenant: Uuid::nil(),
             priority: Priority::Interactive,
         };
         let permit = limiter.acquire(&scope).await.unwrap();

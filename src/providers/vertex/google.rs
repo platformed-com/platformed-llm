@@ -817,10 +817,7 @@ impl Provider for GoogleProvider {
                 self.endpoint.location(),
                 config.model,
             ),
-            tenant: config
-                .tenant
-                .clone()
-                .unwrap_or_else(|| std::sync::Arc::from("")),
+            tenant: config.tenant.unwrap_or(uuid::Uuid::nil()),
             priority: config.priority.unwrap_or_default(),
         };
         let permit = self.rate_limiter.acquire(&scope).await?;

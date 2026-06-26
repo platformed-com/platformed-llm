@@ -40,6 +40,12 @@ use crate::Error;
 /// Wrap a success-path SSE stream so the rate-limit permit observes
 /// the terminal event rather than the HTTP-200 status. See the
 /// module docs for the rationale.
+///
+/// `dead_code` allowed for the no-provider-feature build: every
+/// hosted provider (`openai`, `google`, `anthropic-vertex`,
+/// `mock`) calls this, but a `--no-default-features` build has
+/// none of them enabled and clippy complains.
+#[allow(dead_code)]
 pub(crate) fn observe_response_stream<S>(
     inner: S,
     permit: RatePermit,

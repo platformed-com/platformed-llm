@@ -40,8 +40,11 @@ reqwest = { version = "0.12", features = [
 ijson = { version = "0.1", optional = true }
 # Application Default Credentials provider for Vertex.
 gcp_auth = { version = "0.12", optional = true }
-# UUID generation — synthetic call_ids for Gemini function calls.
-uuid = { version = "1.0", features = ["v4"], optional = true }
+# UUID is the tenant identifier in the rate-limit scope (`RateScope::tenant`)
+# and is also used for Gemini's synthetic function-call IDs. Core dep so the
+# `vertex` feature can layer the `v4` (random generation) feature on top
+# without re-declaring the crate.
+uuid = "1.0"
 # Local GGUF inference for the `llama-gguf` provider.
 llama-gguf = { version = "0.14", optional = true, default-features = false }
 # Procedural `stream!` generators for the local provider's
@@ -113,7 +116,9 @@ reqwest = ["dep:reqwest"]
 # Cloud providers.
 openai = ["reqwest", "dep:ijson"]
 # Shared base for Gemini and Claude-via-Vertex. Pulls in HTTP + Google auth.
-vertex = ["reqwest", "dep:gcp_auth", "dep:ijson", "dep:uuid"]
+# Layers the `v4` random-UUID feature on the always-on `uuid` core dep so
+# Gemini's synthetic function-call IDs can be minted.
+vertex = ["reqwest", "dep:gcp_auth", "dep:ijson", "uuid/v4"]
 google = ["vertex"]
 # Anthropic Claude *via Vertex* (the only Anthropic transport this
 # crate implements); named to reflect that.

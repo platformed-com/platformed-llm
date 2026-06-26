@@ -57,6 +57,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 use super::{Priority, ProviderRateInfo, RateLimiter, RateOutcome, RatePermit, RateScope};
 use crate::Error;
@@ -266,7 +267,7 @@ impl RateLimiter for InMemoryRateLimiter {
 struct Waiter {
     id: u64,
     priority: Priority,
-    tenant: Arc<str>,
+    tenant: Uuid,
     notify: Arc<Notify>,
 }
 
@@ -331,7 +332,7 @@ impl Inner {
         let waiter = Waiter {
             id,
             priority: scope.priority,
-            tenant: scope.tenant.clone(),
+            tenant: scope.tenant,
             notify,
         };
         bucket.push(waiter);
@@ -397,9 +398,9 @@ struct Bucket {
 #[derive(Debug, Default)]
 struct PriorityBand {
     /// Per-tenant FIFO of waiters.
-    tenant_queues: HashMap<Arc<str>, VecDeque<Waiter>>,
+    tenant_queues: HashMap<Uuid, VecDeque<Waiter>>,
     /// Round-robin order of tenants with non-empty queues.
-    tenant_order: VecDeque<Arc<str>>,
+    tenant_order: VecDeque<Uuid>,
 }
 
 impl PriorityBand {
@@ -423,15 +424,15 @@ impl PriorityBand {
     }
 
     fn push(&mut self, waiter: Waiter) {
-        let queue = self.tenant_queues.entry(waiter.tenant.clone()).or_default();
+        let tenant = waiter.tenant;
+        let queue = self.tenant_queues.entry(tenant).or_default();
         let was_empty = queue.is_empty();
-        let tenant_name = waiter.tenant.clone();
         queue.push_back(waiter);
         if was_empty {
             // First waiter for this tenant in this band — add to
             // the round-robin rotation. If the tenant already had
             // waiters it's already in the rotation; do not re-add.
-            self.tenant_order.push_back(tenant_name);
+            self.tenant_order.push_back(tenant);
         }
     }
 
@@ -446,7 +447,7 @@ impl PriorityBand {
         // (drops the borrow before the entry/remove dance).
         let target_tenant = self.tenant_queues.iter().find_map(|(tenant, queue)| {
             if queue.iter().any(|w| w.id == id) {
-                Some(tenant.clone())
+                Some(*tenant)
             } else {
                 None
             }
@@ -667,10 +668,22 @@ mod tests {
     use tokio::sync::Barrier;
     use tokio::time::{timeout, Duration as TokioDuration};
 
+    /// Stable per-name Uuid for tests — `u128::from(byte)` so each
+    /// distinct tenant name maps to a unique fixed value. Lets tests
+    /// keep using readable names while the limiter sees Uuids.
+    fn tenant_uuid(name: &str) -> Uuid {
+        let seed = name
+            .bytes()
+            .fold(0u128, |acc, b| acc.wrapping_add(b as u128));
+        // Mix into a non-zero u128 so Uuid::from_u128 gives stable
+        // distinct values for distinct names.
+        Uuid::from_u128(0x1000_0000_0000_0000_0000_0000_0000_0000 | seed)
+    }
+
     fn scope(tenant: &str, priority: Priority) -> RateScope {
         RateScope {
             bucket_key: "Test/test-model".into(),
-            tenant: tenant.into(),
+            tenant: tenant_uuid(tenant),
             priority,
         }
     }

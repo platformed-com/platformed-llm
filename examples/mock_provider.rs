@@ -22,6 +22,7 @@ use platformed_llm::{
     generate, retry, Config, Error, FunctionCall, InMemoryRateLimiter, Priority, Prompt, Provider,
     RetryPolicy, SharedRateLimiter,
 };
+use uuid::Uuid;
 
 /// A toy "agent loop" — exactly the kind of code you'd want to test
 /// against a mock. It asks the model, runs any tool call, feeds the
@@ -31,7 +32,7 @@ use platformed_llm::{
 /// lifetime headaches from async closures crossing `tokio::spawn`).
 async fn run_agent(
     provider: &dyn Provider,
-    tenant: &str,
+    tenant: Uuid,
     priority: Priority,
     question: &str,
 ) -> Result<String, Error> {
@@ -77,12 +78,18 @@ async fn main() -> Result<(), Error> {
         .reply("It is sunny in Paris.")
         .build();
 
+    // Tenant IDs are opaque Uuids — pick a real strategy for your
+    // app (UUIDv5 over workspace ids, your DB's pre-existing UUID
+    // pk, etc.). Hard-coded constants suffice for this example;
+    // `Uuid::new_v4()` would also work if the `v4` cargo feature
+    // on the `uuid` crate is enabled (the lib defaults don't).
+    let weather_service = Uuid::from_u128(0x1);
     let log = provider.call_log();
     let policy = RetryPolicy::standard();
     let answer = retry(&policy, async |_attempt| {
         run_agent(
             &provider,
-            "weather-service",
+            weather_service,
             Priority::Interactive,
             "What's the weather in Paris?",
         )
@@ -107,6 +114,8 @@ async fn main() -> Result<(), Error> {
     let limiter: SharedRateLimiter = Arc::new(InMemoryRateLimiter::new());
     let provider = Arc::new(MockProvider::with_text("ok").with_rate_limiter(limiter.clone()));
 
+    let loud_tenant = Uuid::from_u128(0x2);
+    let vip_tenant = Uuid::from_u128(0x3);
     let start = Instant::now();
     let mut tasks = Vec::new();
 
@@ -116,7 +125,7 @@ async fn main() -> Result<(), Error> {
         tasks.push(tokio::spawn(async move {
             run_agent(
                 &*p,
-                "loud",
+                loud_tenant,
                 Priority::Background,
                 &format!("loud request {i}"),
             )
@@ -129,7 +138,7 @@ async fn main() -> Result<(), Error> {
     // VIP tenant: one interactive request, fired late.
     let p = provider.clone();
     tasks.push(tokio::spawn(async move {
-        run_agent(&*p, "vip", Priority::Interactive, "vip request")
+        run_agent(&*p, vip_tenant, Priority::Interactive, "vip request")
             .await
             .map(|_| ("vip", Instant::now()))
     }));

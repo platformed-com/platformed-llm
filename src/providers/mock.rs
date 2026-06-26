@@ -648,10 +648,7 @@ impl Provider for MockProvider {
         // the outcome derived from the reply.
         let scope = crate::rate_limit::RateScope {
             bucket_key: format!("Mock/{}", config.model),
-            tenant: config
-                .tenant
-                .clone()
-                .unwrap_or_else(|| std::sync::Arc::from("")),
+            tenant: config.tenant.unwrap_or(uuid::Uuid::nil()),
             priority: config.priority.unwrap_or_default(),
         };
         let permit = self.rate_limiter.acquire(&scope).await?;
