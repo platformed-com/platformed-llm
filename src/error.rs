@@ -219,15 +219,16 @@ impl Error {
     /// next time.
     ///
     /// Returns `true` for [`Self::RateLimit`], for [`Self::Transport`]
-    /// **only when** the wrapped `reqwest::Error` is a connect /
-    /// timeout / body-read failure (the genuinely transient network
-    /// shapes — request-build, body-decode, and startup errors stay
-    /// terminal), and for [`Self::Provider`] when its `retryable`
-    /// flag is set (5xx / 429, mid-stream connection-drop errors
-    /// that we classified as transient at their site). All other
-    /// variants are terminal — re-issuing the same request won't
-    /// change the outcome (bad auth, malformed prompt, model
-    /// unavailable, context-window-exceeded, etc.).
+    /// **only when** the wrapped `reqwest::Error` is a connect or
+    /// timeout failure (the unambiguously transient network shapes
+    /// — request-build, body-read, decode, and startup errors stay
+    /// terminal because they could equally be deterministic bugs),
+    /// and for [`Self::Provider`] when its `retryable` flag is set
+    /// (5xx / 429, mid-stream connection-drop errors that we
+    /// classified as transient at their site). All other variants
+    /// are terminal — re-issuing the same request won't change the
+    /// outcome (bad auth, malformed prompt, model unavailable,
+    /// context-window-exceeded, etc.).
     ///
     /// **"Retryable" is not the same as "safe to retry without
     /// thought."** Every retry is a fresh request — the model's
@@ -251,10 +252,18 @@ impl Error {
                 // layer failure shapes are genuinely transient; a
                 // request-build error, a response-body decode error,
                 // or a startup `ClientBuilder` failure won't behave
-                // differently on retry. Be explicit about the
-                // transient set so we don't burn 4× the latency on
-                // a deterministic failure.
-                e.is_connect() || e.is_timeout() || e.is_body()
+                // differently on retry.
+                //
+                // `is_body()` is intentionally *not* in the transient
+                // set: it fires both for legitimate mid-body
+                // connection drops *and* deterministic decode
+                // failures (gzip corruption, broken UTF-8). Retrying
+                // a deterministic decode failure would burn 4× the
+                // latency for the same outcome. We prefer the
+                // false-negative (don't retry a real transient
+                // body-read drop) — the caller's own retry loop can
+                // still re-issue if it knows the operation is safe.
+                e.is_connect() || e.is_timeout()
             }
             Error::RateLimit { .. } => true,
             Error::Provider { retryable, .. } => *retryable,
@@ -267,6 +276,48 @@ impl Error {
             | Error::UnsupportedInput { .. }
             | Error::Compaction { .. } => false,
         }
+    }
+
+    /// Extract an owned [`Error`] from an [`std::sync::Arc<Error>`]
+    /// (the wrapper [`crate::StreamEvent::Error`] uses), preserving
+    /// the inner error's **retryability classification**.
+    ///
+    /// Tries [`std::sync::Arc::try_unwrap`] first (the common case
+    /// in our own `buffer` / `collect` paths where we hold the only
+    /// `Arc`); if the `Arc` is shared, falls back to a synthetic
+    /// wrap that preserves [`Self::retry_after`] when present and
+    /// [`Self::is_retryable`] otherwise. Without that preservation,
+    /// a shared mid-stream `Error::RateLimit` would silently
+    /// downgrade to a non-retryable provider error and the caller's
+    /// retry loop would give up.
+    ///
+    /// `pub(crate)` because the shape is an internal contract
+    /// between the streaming pipeline (`response`, `accumulator`)
+    /// and `Error`; external callers should already hold an owned
+    /// [`Error`] by the time they're branching on it.
+    pub(crate) fn from_stream_event_arc(error: std::sync::Arc<Error>) -> Error {
+        std::sync::Arc::try_unwrap(error).unwrap_or_else(|arc| {
+            // `Error` isn't `Clone` (reqwest::Error inside Transport),
+            // so we synthesise a fresh one. Preserve the typed
+            // retry-after when present (rate limits) so callers still
+            // honour the provider hint; otherwise rebuild a
+            // `Provider("Stream", …)` carrying the inner's
+            // `is_retryable()` verdict so retry policies still match
+            // the source's intent.
+            if let Some(retry_after) = arc.retry_after() {
+                Error::RateLimit {
+                    retry_after: Some(retry_after),
+                    message: format!("mid-stream error (cloned): {arc}"),
+                }
+            } else {
+                Error::Provider {
+                    provider: "Stream",
+                    status: None,
+                    retryable: arc.is_retryable(),
+                    message: format!("mid-stream error (cloned): {arc}"),
+                }
+            }
+        })
     }
 
     /// Provider-suggested wait duration before retrying, parsed from a

@@ -95,38 +95,10 @@ pub struct Response {
     stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>>,
 }
 
-/// Unwrap the [`Arc<Error>`] carried by [`StreamEvent::Error`] into an
-/// owned [`Error`]. Tries [`Arc::try_unwrap`] first (the common case in
-/// our own `buffer` / `collect` paths where we hold the only Arc); if
-/// shared, falls back to a synthetic wrap that preserves the
-/// **retryability classification** of the original error — without
-/// this, a shared `Error::RateLimit` mid-stream would silently
-/// downgrade to a non-retryable provider error and the caller's
-/// retry loop would give up.
-fn unwrap_stream_error(error: std::sync::Arc<Error>) -> Error {
-    std::sync::Arc::try_unwrap(error).unwrap_or_else(|arc| {
-        // `Error` isn't `Clone` (reqwest::Error inside Transport),
-        // so we synthesise a fresh one. Preserve the typed
-        // retry-after when present (rate limits) so callers still
-        // honour the provider hint; otherwise rebuild a
-        // `Provider("Stream", …)` carrying the inner's
-        // `is_retryable()` verdict so retry policies still match
-        // the source's intent.
-        if let Some(retry_after) = arc.retry_after() {
-            Error::RateLimit {
-                retry_after: Some(retry_after),
-                message: format!("mid-stream error (cloned): {arc}"),
-            }
-        } else {
-            Error::Provider {
-                provider: "Stream",
-                status: None,
-                retryable: arc.is_retryable(),
-                message: format!("mid-stream error (cloned): {arc}"),
-            }
-        }
-    })
-}
+// Stream-error unwrap lives on `Error` as a `pub(crate)` helper so
+// `response::buffer/collect` and `accumulator::process_event` share
+// the same classification-preserving fallback. See
+// `Error::from_stream_event_arc` for the contract.
 
 impl Response {
     /// Wrap an arbitrary stream of [`StreamEvent`]s as a [`Response`].
@@ -154,7 +126,7 @@ impl Response {
         while let Some(event_result) = stream.next().await {
             let event = event_result?;
             if let StreamEvent::Error { error } = event {
-                return Err(unwrap_stream_error(error));
+                return Err(Error::from_stream_event_arc(error));
             }
             let done = matches!(event, StreamEvent::Done { .. });
             accumulator.process_event(event)?;
@@ -193,7 +165,7 @@ impl Response {
         while let Some(event_result) = stream.next().await {
             let event = event_result?;
             if let StreamEvent::Error { error } = event {
-                return Err(unwrap_stream_error(error));
+                return Err(Error::from_stream_event_arc(error));
             }
             match &event {
                 StreamEvent::Done { .. } => {
@@ -304,7 +276,7 @@ mod tests {
         let inner = std::sync::Arc::new(Error::rate_limit(Some(7), "overloaded"));
         // Keep a second strong ref so `try_unwrap` fails.
         let _other = inner.clone();
-        let unwrapped = unwrap_stream_error(inner);
+        let unwrapped = Error::from_stream_event_arc(inner);
         match unwrapped {
             Error::RateLimit { retry_after, .. } => {
                 assert_eq!(retry_after, Some(std::time::Duration::from_secs(7)));
@@ -323,7 +295,7 @@ mod tests {
             "service unavailable",
         ));
         let _other = inner.clone();
-        let unwrapped = unwrap_stream_error(inner);
+        let unwrapped = Error::from_stream_event_arc(inner);
         assert!(
             unwrapped.is_retryable(),
             "transient 5xx must remain retryable across the shared-Arc fallback, \

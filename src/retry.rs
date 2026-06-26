@@ -116,7 +116,12 @@ impl RetryPolicy {
     /// keeps `Duration::from_secs_f64` away from its panic
     /// preconditions.
     pub fn delay_after(&self, err: &Error, attempt: u32) -> Option<Duration> {
-        if !err.is_retryable() || attempt >= self.max_attempts {
+        // `attempt` is documented as 1-indexed (1 after the first
+        // failure). `0` is undefined input from this method's POV
+        // and would compute `multiplier ** -1 = 1 / multiplier`,
+        // returning a delay even when `RetryPolicy::none()` was
+        // explicitly chosen. Treat it as terminal.
+        if attempt == 0 || !err.is_retryable() || attempt >= self.max_attempts {
             return None;
         }
         let max_secs = self.max_backoff.as_secs_f64();
@@ -298,6 +303,21 @@ mod tests {
             huge_policy.delay_after(&err, 3),
             Some(Duration::from_secs(60)),
         );
+    }
+
+    /// `delay_after(_, 0)` must return `None` rather than computing
+    /// `multiplier^-1 × initial_backoff` (which would suggest a
+    /// retry even for `RetryPolicy::none()`). `attempt` is documented
+    /// 1-indexed; `0` is undefined input.
+    #[test]
+    fn delay_after_with_zero_attempt_returns_none() {
+        let policy = RetryPolicy::standard();
+        let err = Error::rate_limit(None, "slow");
+        assert_eq!(policy.delay_after(&err, 0), None);
+        // Even `RetryPolicy::none()` would return `Some` without the
+        // defence (because `attempt >= max_attempts` is `0 >= 1 = false`).
+        let none = RetryPolicy::none();
+        assert_eq!(none.delay_after(&err, 0), None);
     }
 
     /// The cap on the *exponential* branch (when no provider hint)

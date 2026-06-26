@@ -66,16 +66,10 @@ impl ResponseAccumulator {
             }
             StreamEvent::Error { error } => {
                 // The stream produced a typed Error event — surface
-                // it. `try_unwrap` avoids cloning when we hold the
-                // only Arc (common case in our own buffer/collect
-                // paths); falls back to deep clone otherwise via the
-                // string Display.
-                return Err(std::sync::Arc::try_unwrap(error).unwrap_or_else(
-                    // `Error` isn't `Clone` (reqwest::Error inside
-                    // Transport), so fall back to a Provider wrap
-                    // when we hold a non-exclusive Arc.
-                    |arc| Error::provider("Stream", format!("mid-stream error (cloned): {arc}")),
-                ));
+                // it via the shared helper so the classification
+                // (retryable / retry_after) is preserved on the
+                // shared-Arc fallback path.
+                return Err(Error::from_stream_event_arc(error));
             }
         }
         Ok(())
@@ -395,5 +389,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(acc.finalize().unwrap().finish_reason, FinishReason::Length);
+    }
+
+    /// `process_event`'s `StreamEvent::Error` arm must preserve the
+    /// inner error's retryability classification on the shared-Arc
+    /// fallback — same invariant as `Response::buffer`. Earlier the
+    /// accumulator's fallback wrapped as `Error::provider("Stream",
+    /// …)` with default `retryable: false`, silently downgrading
+    /// mid-stream rate limits.
+    #[test]
+    fn stream_error_event_preserves_retry_after_on_shared_arc() {
+        let inner = std::sync::Arc::new(Error::rate_limit(Some(11), "slow down"));
+        let _other = inner.clone(); // force the fallback path
+        let mut acc = ResponseAccumulator::new();
+        let err = acc
+            .process_event(StreamEvent::Error { error: inner })
+            .expect_err("Error event must produce Err");
+        match err {
+            Error::RateLimit { retry_after, .. } => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(11)));
+            }
+            other => panic!("retry-after must be preserved, got {other:?}"),
+        }
     }
 }
