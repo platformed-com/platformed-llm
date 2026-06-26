@@ -223,20 +223,27 @@ impl Error {
         Error::UnsupportedInput { provider, modality }
     }
 
-    /// Whether this error represents a transient failure that is safe
-    /// to retry by re-issuing the same request.
+    /// Whether this error represents a transient failure where
+    /// re-issuing the same request is likely to behave differently
+    /// next time.
     ///
-    /// Returns `true` for [`Self::RateLimit`], [`Self::Transport`], and
-    /// [`Self::Provider`] when its `retryable` flag is set (5xx / 429).
-    /// All other variants are terminal — re-issuing the same request
-    /// won't change the outcome (bad auth, malformed prompt, model
-    /// unavailable, context-window-exceeded, etc.).
+    /// Returns `true` for [`Self::RateLimit`], [`Self::Transport`],
+    /// [`Self::Streaming`] (SSE parse failure / mid-stream connection
+    /// drop — also transient), and [`Self::Provider`] when its
+    /// `retryable` flag is set (5xx / 429). All other variants are
+    /// terminal — re-issuing the same request won't change the
+    /// outcome (bad auth, malformed prompt, model unavailable,
+    /// context-window-exceeded, etc.).
     ///
-    /// [`Self::Streaming`] is **not** retryable: by the time it fires
-    /// the response has already started streaming, so the assistant
-    /// turn is partially constructed. Resuming from a partial stream is
-    /// caller-specific (you may have already shown tokens to the user
-    /// or persisted partial state) and out of scope for this primitive.
+    /// **"Retryable" is not the same as "safe to retry without
+    /// thought."** Every retry is a fresh request — the model's
+    /// reply may diverge from whatever the first attempt streamed.
+    /// If the caller has already shown partial output to a user or
+    /// committed it downstream, the new attempt's output won't
+    /// stitch cleanly with what was shown. That's a caller-policy
+    /// concern (the same partial-state question applies to a
+    /// mid-stream [`Self::RateLimit`] as to [`Self::Streaming`], so
+    /// the variant alone doesn't carry that information).
     ///
     /// Pair this with [`Self::retry_after`] when building a manual
     /// retry loop, or hand off to [`crate::retry()`] /
@@ -248,12 +255,12 @@ impl Error {
             #[cfg(feature = "reqwest")]
             Error::Transport(_) => true,
             Error::RateLimit { .. } => true,
+            Error::Streaming(_) => true,
             Error::Provider { retryable, .. } => *retryable,
             Error::Auth { .. }
             | Error::Serialization(_)
             | Error::Config(_)
             | Error::InvalidPrompt(_)
-            | Error::Streaming(_)
             | Error::ModelNotAvailable(_)
             | Error::ContextWindowExceeded { .. }
             | Error::UnsupportedInput { .. }
@@ -413,6 +420,12 @@ mod tests {
         assert!(Error::rate_limit(None, "slow down").is_retryable());
         assert!(Error::provider_with_status("OpenAI", 503, "down").is_retryable());
         assert!(Error::provider_with_status("OpenAI", 429, "slow").is_retryable());
+        // SSE parse failure / mid-stream drop is a transient failure
+        // (a fresh request may succeed). Whether the caller can
+        // safely retry given partial output already shown to a user
+        // is policy, not an error-variant property — same question
+        // applies to a mid-stream RateLimit.
+        assert!(Error::streaming("connection reset").is_retryable());
     }
 
     #[test]
@@ -427,9 +440,6 @@ mod tests {
         assert!(!Error::ModelNotAvailable("gpt-x".into()).is_retryable());
         assert!(!Error::context_window_exceeded("OpenAI", "too long").is_retryable());
         assert!(!Error::compaction("empty memo").is_retryable());
-        // Mid-stream errors are intentionally non-retryable — the
-        // assistant turn is already partially constructed.
-        assert!(!Error::streaming("connection reset").is_retryable());
     }
 
     #[test]

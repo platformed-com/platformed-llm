@@ -25,16 +25,18 @@
 //!
 //! # What gets retried
 //!
-//! The policy treats an error as retryable when [`Error::is_retryable`]
-//! returns `true` (rate limits, transient 5xx / 429, transport
-//! errors) **or** when it's an [`Error::Streaming`] failure. Streaming
-//! failures aren't generally retry-safe — partial state may have
-//! escaped to a live UI — but inside [`retry()`] the caller's closure is
-//! the unit of retry, so re-entering it discards any per-attempt state
-//! the body owns. If you're streaming directly to a user and want
-//! something subtler than "discard and restart", drive the loop with
-//! [`RetryPolicy::delay_after`] instead and decide what to do with
-//! partial output yourself.
+//! The policy retries any error for which [`Error::is_retryable`]
+//! returns `true` — rate limits, transient 5xx / 429, transport
+//! errors, and mid-stream failures (SSE parse / connection drop).
+//! Every retry is a fresh request; the helper does not attempt to
+//! "resume" a partially-streamed response.
+//!
+//! If you're streaming directly to a user and the first attempt
+//! emitted some tokens before failing, retrying will produce
+//! different output that won't stitch with what you already showed.
+//! That's a caller-policy concern — drive the loop with
+//! [`RetryPolicy::delay_after`] yourself and decide whether to
+//! discard the partial output, surface a "retry?" prompt, or stop.
 //!
 //! # What doesn't
 //!
@@ -108,12 +110,7 @@ impl RetryPolicy {
     /// `attempt` is the 1-indexed attempt number that just failed.
     /// `1` after the first failure, `2` after the second, …
     pub fn delay_after(&self, err: &Error, attempt: u32) -> Option<Duration> {
-        // Mid-stream failures aren't retry-safe in general (partial
-        // state may have escaped), but inside a retry loop the caller
-        // has committed to restarting the whole operation — see the
-        // module docs. Permit them here, propagate them otherwise.
-        let retryable = err.is_retryable() || matches!(err, Error::Streaming(_));
-        if !retryable || attempt >= self.max_attempts {
+        if !err.is_retryable() || attempt >= self.max_attempts {
             return None;
         }
         let nominal = err.retry_after().unwrap_or_else(|| {
@@ -254,17 +251,6 @@ mod tests {
         assert_eq!(policy.delay_after(&err, 4), Some(Duration::from_secs(8)));
     }
 
-    #[test]
-    fn delay_after_treats_streaming_as_retryable() {
-        // Streaming errors aren't `is_retryable()` (partial state may
-        // have escaped), but inside a retry policy the caller is
-        // committing to restart the whole operation — so the policy
-        // accepts them.
-        let policy = RetryPolicy::standard();
-        let err = Error::streaming("connection reset");
-        assert!(policy.delay_after(&err, 1).is_some());
-    }
-
     /// Tight policy for tests — millisecond-scale delays so the
     /// suite doesn't pay for our exponential schedule.
     fn fast_policy() -> RetryPolicy {
@@ -325,9 +311,9 @@ mod tests {
 
     #[tokio::test]
     async fn retry_recovers_from_streaming_error() {
-        // Mid-stream errors aren't `is_retryable()` by default, but
-        // the retry policy accepts them — verify the helper actually
-        // re-enters the closure rather than propagating immediately.
+        // `Error::Streaming` is retryable (transient SSE / connection
+        // failure); verify the helper actually re-enters the closure
+        // rather than propagating immediately.
         let policy = fast_policy();
         let count = Cell::new(0u32);
         let result: Result<&'static str, Error> = retry(&policy, async |_| {
