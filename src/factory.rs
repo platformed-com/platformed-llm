@@ -4,6 +4,7 @@ use crate::providers::AnthropicViaVertexProvider;
 use crate::providers::GoogleProvider;
 #[cfg(feature = "openai")]
 use crate::providers::OpenAIProvider;
+use crate::rate_limit::SharedRateLimiter;
 use crate::{Error, Provider};
 use std::{env, fmt};
 
@@ -47,6 +48,13 @@ pub struct ProviderConfig {
     /// Pre-fetched OAuth access token for Vertex providers. When absent,
     /// the factory uses Application Default Credentials.
     pub access_token: Option<String>,
+    /// Shared rate limiter applied to whichever provider this config
+    /// constructs. `None` means each provider uses its default
+    /// [`crate::rate_limit::NoOpRateLimiter`]; set to an
+    /// `Arc<InMemoryRateLimiter>` (typically one shared instance per
+    /// process) to pace and prioritise traffic. Mutate via
+    /// [`Self::with_rate_limiter`].
+    pub rate_limiter: Option<SharedRateLimiter>,
 }
 
 impl ProviderConfig {
@@ -58,6 +66,7 @@ impl ProviderConfig {
             project_id: None,
             location: None,
             access_token: None,
+            rate_limiter: None,
         }
     }
 
@@ -82,6 +91,7 @@ impl ProviderConfig {
             project_id: Some(project_id),
             location: Some(location),
             access_token: Some(access_token),
+            rate_limiter: None,
         })
     }
 
@@ -105,7 +115,17 @@ impl ProviderConfig {
             project_id: Some(project_id),
             location: Some(location),
             access_token: None,
+            rate_limiter: None,
         })
+    }
+
+    /// Attach a shared rate limiter to this config. The factory wires
+    /// it into whichever provider [`ProviderFactory::create`]
+    /// constructs, so the same limiter can pace traffic across every
+    /// hosted provider in the process.
+    pub fn with_rate_limiter(mut self, limiter: SharedRateLimiter) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
     }
 
     /// Create configuration from environment variables.
@@ -184,6 +204,7 @@ impl fmt::Debug for ProviderConfig {
             project_id,
             location,
             access_token,
+            rate_limiter,
         } = self;
 
         f.debug_struct("ProviderConfig")
@@ -192,6 +213,7 @@ impl fmt::Debug for ProviderConfig {
             .field("project_id", &project_id)
             .field("location", &location)
             .field("access_token", &access_token.as_ref().map(|_| "[redacted]"))
+            .field("rate_limiter", &rate_limiter.as_ref().map(|_| "<attached>"))
             .finish()
     }
 }
@@ -213,7 +235,10 @@ impl ProviderFactory {
                     .api_key
                     .as_ref()
                     .ok_or_else(|| Error::config("API key required for OpenAI provider"))?;
-                let provider = OpenAIProvider::new(api_key.clone())?;
+                let mut provider = OpenAIProvider::new(api_key.clone())?;
+                if let Some(limiter) = &config.rate_limiter {
+                    provider = provider.with_rate_limiter(limiter.clone());
+                }
                 Ok(Box::new(provider))
             }
             #[cfg(not(feature = "openai"))]
@@ -232,11 +257,14 @@ impl ProviderFactory {
                     .location
                     .as_ref()
                     .ok_or_else(|| Error::config("Location required for Google provider"))?;
-                let provider = if let Some(access_token) = &config.access_token {
+                let mut provider = if let Some(access_token) = &config.access_token {
                     GoogleProvider::new(project_id.clone(), location.clone(), access_token.clone())?
                 } else {
                     GoogleProvider::with_adc(project_id.clone(), location.clone()).await?
                 };
+                if let Some(limiter) = &config.rate_limiter {
+                    provider = provider.with_rate_limiter(limiter.clone());
+                }
                 Ok(Box::new(provider))
             }
             #[cfg(not(feature = "google"))]
@@ -255,7 +283,7 @@ impl ProviderFactory {
                     .location
                     .as_ref()
                     .ok_or_else(|| Error::config("Location required for Anthropic provider"))?;
-                let provider = if let Some(access_token) = &config.access_token {
+                let mut provider = if let Some(access_token) = &config.access_token {
                     AnthropicViaVertexProvider::new(
                         project_id.clone(),
                         location.clone(),
@@ -265,6 +293,9 @@ impl ProviderFactory {
                     AnthropicViaVertexProvider::with_adc(project_id.clone(), location.clone())
                         .await?
                 };
+                if let Some(limiter) = &config.rate_limiter {
+                    provider = provider.with_rate_limiter(limiter.clone());
+                }
                 Ok(Box::new(provider))
             }
             #[cfg(not(feature = "anthropic-vertex"))]
@@ -376,6 +407,27 @@ mod tests {
         drop(provider);
     }
 
+    /// When `ProviderConfig::with_rate_limiter` is set, the factory
+    /// must clone the limiter `Arc` into the constructed provider —
+    /// otherwise the factory path silently downgrades to the no-op
+    /// limiter and the whole rate-limit subsystem is bypassed. Detect
+    /// via the `Arc`'s strong count: if the factory propagates, the
+    /// count grows by at least one (the new ref the provider holds).
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn create_openai_propagates_rate_limiter() {
+        use crate::rate_limit::InMemoryRateLimiter;
+        use std::sync::Arc;
+        let limiter: SharedRateLimiter = Arc::new(InMemoryRateLimiter::new());
+        let config = ProviderConfig::openai("sk-test".into()).with_rate_limiter(limiter.clone());
+        let count_before = Arc::strong_count(&limiter);
+        let _provider = ProviderFactory::create(&config).await.unwrap();
+        assert!(
+            Arc::strong_count(&limiter) > count_before,
+            "factory must clone the limiter into the constructed provider",
+        );
+    }
+
     #[cfg(feature = "google")]
     #[tokio::test]
     async fn create_google_with_access_token_succeeds() {
@@ -417,6 +469,7 @@ mod tests {
             project_id: None,
             location: None,
             access_token: None,
+            rate_limiter: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -434,6 +487,7 @@ mod tests {
             project_id: None,
             location: Some("us-east1".into()),
             access_token: Some("tok".into()),
+            rate_limiter: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -451,6 +505,7 @@ mod tests {
             project_id: Some("p".into()),
             location: None,
             access_token: Some("tok".into()),
+            rate_limiter: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -468,6 +523,7 @@ mod tests {
             project_id: None,
             location: Some("us-east1".into()),
             access_token: Some("tok".into()),
+            rate_limiter: None,
         };
         let err = ProviderFactory::create(&config)
             .await

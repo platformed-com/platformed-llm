@@ -190,8 +190,7 @@ fn parse_imf_fixdate_offset_seconds(s: &str) -> Option<u64> {
     let y = year - i32::from(month <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u32; // [0, 399]
-    let m = month as i32;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i32 - 1;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day as i32 - 1;
     let doy = doy as u32; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era as i64 * 146097 + doe as i64 - 719_468;
