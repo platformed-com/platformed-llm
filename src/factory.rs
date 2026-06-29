@@ -5,7 +5,9 @@ use crate::providers::GoogleProvider;
 #[cfg(feature = "openai")]
 use crate::providers::OpenAIProvider;
 use crate::rate_limit::SharedRateLimiter;
+use crate::types::FileResolver;
 use crate::{Error, Provider};
+use std::sync::Arc;
 use std::{env, fmt};
 
 /// Supported LLM providers.
@@ -55,6 +57,12 @@ pub struct ProviderConfig {
     /// process) to pace and prioritise traffic. Mutate via
     /// [`Self::with_rate_limiter`].
     pub rate_limiter: Option<SharedRateLimiter>,
+    /// File resolver for resolving `FileSource::Ref` inputs across
+    /// every provider. `None` means each provider's default
+    /// behaviour (no `Ref` resolution — the request will fail if a
+    /// `Ref` reaches the provider unresolved). Mutate via
+    /// [`Self::with_file_resolver`].
+    pub file_resolver: Option<Arc<dyn FileResolver>>,
 }
 
 impl ProviderConfig {
@@ -67,6 +75,7 @@ impl ProviderConfig {
             location: None,
             access_token: None,
             rate_limiter: None,
+            file_resolver: None,
         }
     }
 
@@ -92,6 +101,7 @@ impl ProviderConfig {
             location: Some(location),
             access_token: Some(access_token),
             rate_limiter: None,
+            file_resolver: None,
         })
     }
 
@@ -116,6 +126,7 @@ impl ProviderConfig {
             location: Some(location),
             access_token: None,
             rate_limiter: None,
+            file_resolver: None,
         })
     }
 
@@ -125,6 +136,16 @@ impl ProviderConfig {
     /// hosted provider in the process.
     pub fn with_rate_limiter(mut self, limiter: SharedRateLimiter) -> Self {
         self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Attach a [`FileResolver`] that resolves
+    /// [`FileSource::Ref`](crate::FileSource::Ref) inputs against a
+    /// caller-managed registry. The factory wires it into whichever
+    /// provider is constructed, so a single resolver implementation
+    /// works across every hosted provider.
+    pub fn with_file_resolver(mut self, resolver: Arc<dyn FileResolver>) -> Self {
+        self.file_resolver = Some(resolver);
         self
     }
 
@@ -205,6 +226,7 @@ impl fmt::Debug for ProviderConfig {
             location,
             access_token,
             rate_limiter,
+            file_resolver,
         } = self;
 
         f.debug_struct("ProviderConfig")
@@ -214,6 +236,10 @@ impl fmt::Debug for ProviderConfig {
             .field("location", &location)
             .field("access_token", &access_token.as_ref().map(|_| "[redacted]"))
             .field("rate_limiter", &rate_limiter.as_ref().map(|_| "<attached>"))
+            .field(
+                "file_resolver",
+                &file_resolver.as_ref().map(|_| "<attached>"),
+            )
             .finish()
     }
 }
@@ -238,6 +264,9 @@ impl ProviderFactory {
                 let mut provider = OpenAIProvider::new(api_key.clone())?;
                 if let Some(limiter) = &config.rate_limiter {
                     provider = provider.with_rate_limiter(limiter.clone());
+                }
+                if let Some(resolver) = &config.file_resolver {
+                    provider = provider.with_file_resolver(resolver.clone());
                 }
                 Ok(Box::new(provider))
             }
@@ -264,6 +293,9 @@ impl ProviderFactory {
                 };
                 if let Some(limiter) = &config.rate_limiter {
                     provider = provider.with_rate_limiter(limiter.clone());
+                }
+                if let Some(resolver) = &config.file_resolver {
+                    provider = provider.with_file_resolver(resolver.clone());
                 }
                 Ok(Box::new(provider))
             }
@@ -295,6 +327,9 @@ impl ProviderFactory {
                 };
                 if let Some(limiter) = &config.rate_limiter {
                     provider = provider.with_rate_limiter(limiter.clone());
+                }
+                if let Some(resolver) = &config.file_resolver {
+                    provider = provider.with_file_resolver(resolver.clone());
                 }
                 Ok(Box::new(provider))
             }
@@ -428,6 +463,49 @@ mod tests {
         );
     }
 
+    /// Same shape as `propagates_rate_limiter` but for the file
+    /// resolver. Without this, a caller setting
+    /// `with_file_resolver` on a factory-built provider would
+    /// silently get no `Ref` resolution and any prompt carrying a
+    /// `FileSource::Ref` would fail at the wire.
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn create_openai_propagates_file_resolver() {
+        use crate::types::{ProviderScope, ResolvedFile, ResolvedHandle};
+        // Minimal resolver that never gets called — we're only
+        // asserting Arc propagation here.
+        struct NoOpResolver;
+        #[async_trait::async_trait]
+        impl FileResolver for NoOpResolver {
+            async fn lookup(
+                &self,
+                _id: &str,
+                _scope: &ProviderScope,
+            ) -> Result<Option<ResolvedHandle>, Error> {
+                Ok(None)
+            }
+            async fn open(&self, _id: &str, _scope: &ProviderScope) -> Result<ResolvedFile, Error> {
+                Err(Error::config("noop"))
+            }
+            async fn store(
+                &self,
+                _id: &str,
+                _scope: &ProviderScope,
+                _handle: ResolvedHandle,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let resolver: Arc<dyn FileResolver> = Arc::new(NoOpResolver);
+        let config = ProviderConfig::openai("sk-test".into()).with_file_resolver(resolver.clone());
+        let count_before = Arc::strong_count(&resolver);
+        let _provider = ProviderFactory::create(&config).await.unwrap();
+        assert!(
+            Arc::strong_count(&resolver) > count_before,
+            "factory must clone the file resolver into the constructed provider",
+        );
+    }
+
     #[cfg(feature = "google")]
     #[tokio::test]
     async fn create_google_with_access_token_succeeds() {
@@ -470,6 +548,7 @@ mod tests {
             location: None,
             access_token: None,
             rate_limiter: None,
+            file_resolver: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -488,6 +567,7 @@ mod tests {
             location: Some("us-east1".into()),
             access_token: Some("tok".into()),
             rate_limiter: None,
+            file_resolver: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -506,6 +586,7 @@ mod tests {
             location: None,
             access_token: Some("tok".into()),
             rate_limiter: None,
+            file_resolver: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -524,6 +605,7 @@ mod tests {
             location: Some("us-east1".into()),
             access_token: Some("tok".into()),
             rate_limiter: None,
+            file_resolver: None,
         };
         let err = ProviderFactory::create(&config)
             .await
