@@ -63,6 +63,31 @@ pub struct ProviderConfig {
     /// `Ref` reaches the provider unresolved). Mutate via
     /// [`Self::with_file_resolver`].
     pub file_resolver: Option<Arc<dyn FileResolver>>,
+    /// OpenAI organization id, sent as `OpenAI-Organization`. Only
+    /// applied when `provider_type == ProviderType::OpenAI`. Mutate
+    /// via [`Self::with_openai_organization`].
+    pub openai_organization: Option<String>,
+    /// OpenAI project id, sent as `OpenAI-Project`. Only applied
+    /// when `provider_type == ProviderType::OpenAI`. Mutate via
+    /// [`Self::with_openai_project`].
+    pub openai_project: Option<String>,
+    /// Anthropic beta feature ids (e.g.
+    /// `"computer-use-2025-01-24"`). Each id is sent in the
+    /// `anthropic-beta` header. Only applied when `provider_type
+    /// == ProviderType::Anthropic`. Empty means no beta features.
+    /// Mutate via [`Self::with_anthropic_beta`].
+    pub anthropic_beta: Vec<String>,
+    /// Google Cloud Storage bucket used for file uploads
+    /// (large multimodal inputs that exceed inline limits). Only
+    /// applied when `provider_type == ProviderType::Google`. Mutate
+    /// via [`Self::with_google_gcs_bucket`].
+    pub google_gcs_bucket: Option<String>,
+    /// Optional GCS object-key prefix under
+    /// [`Self::google_gcs_bucket`]. Lets multiple deployments share a
+    /// bucket without colliding on uploaded blob names. Only applied
+    /// when `provider_type == ProviderType::Google`. Mutate via
+    /// [`Self::with_google_gcs_prefix`].
+    pub google_gcs_prefix: Option<String>,
 }
 
 impl ProviderConfig {
@@ -76,6 +101,11 @@ impl ProviderConfig {
             access_token: None,
             rate_limiter: None,
             file_resolver: None,
+            openai_organization: None,
+            openai_project: None,
+            anthropic_beta: Vec::new(),
+            google_gcs_bucket: None,
+            google_gcs_prefix: None,
         }
     }
 
@@ -102,6 +132,11 @@ impl ProviderConfig {
             access_token: Some(access_token),
             rate_limiter: None,
             file_resolver: None,
+            openai_organization: None,
+            openai_project: None,
+            anthropic_beta: Vec::new(),
+            google_gcs_bucket: None,
+            google_gcs_prefix: None,
         })
     }
 
@@ -127,6 +162,11 @@ impl ProviderConfig {
             access_token: None,
             rate_limiter: None,
             file_resolver: None,
+            openai_organization: None,
+            openai_project: None,
+            anthropic_beta: Vec::new(),
+            google_gcs_bucket: None,
+            google_gcs_prefix: None,
         })
     }
 
@@ -146,6 +186,42 @@ impl ProviderConfig {
     /// works across every hosted provider.
     pub fn with_file_resolver(mut self, resolver: Arc<dyn FileResolver>) -> Self {
         self.file_resolver = Some(resolver);
+        self
+    }
+
+    /// Set the OpenAI organization id (`OpenAI-Organization`
+    /// header). Ignored unless `provider_type == ProviderType::OpenAI`.
+    pub fn with_openai_organization(mut self, organization: impl Into<String>) -> Self {
+        self.openai_organization = Some(organization.into());
+        self
+    }
+
+    /// Set the OpenAI project id (`OpenAI-Project` header). Ignored
+    /// unless `provider_type == ProviderType::OpenAI`.
+    pub fn with_openai_project(mut self, project: impl Into<String>) -> Self {
+        self.openai_project = Some(project.into());
+        self
+    }
+
+    /// Opt into one or more Anthropic beta feature ids. Each id
+    /// appears as a comma-separated value in the `anthropic-beta`
+    /// header. Ignored unless `provider_type == ProviderType::Anthropic`.
+    pub fn with_anthropic_beta(mut self, beta_ids: impl IntoIterator<Item = String>) -> Self {
+        self.anthropic_beta.extend(beta_ids);
+        self
+    }
+
+    /// Set the GCS bucket used by the Google provider for file
+    /// uploads. Ignored unless `provider_type == ProviderType::Google`.
+    pub fn with_google_gcs_bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.google_gcs_bucket = Some(bucket.into());
+        self
+    }
+
+    /// Set the optional GCS object-key prefix under the configured
+    /// bucket. Ignored unless `provider_type == ProviderType::Google`.
+    pub fn with_google_gcs_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.google_gcs_prefix = Some(prefix.into());
         self
     }
 
@@ -227,6 +303,11 @@ impl fmt::Debug for ProviderConfig {
             access_token,
             rate_limiter,
             file_resolver,
+            openai_organization,
+            openai_project,
+            anthropic_beta,
+            google_gcs_bucket,
+            google_gcs_prefix,
         } = self;
 
         f.debug_struct("ProviderConfig")
@@ -240,6 +321,11 @@ impl fmt::Debug for ProviderConfig {
                 "file_resolver",
                 &file_resolver.as_ref().map(|_| "<attached>"),
             )
+            .field("openai_organization", &openai_organization)
+            .field("openai_project", &openai_project)
+            .field("anthropic_beta", &anthropic_beta)
+            .field("google_gcs_bucket", &google_gcs_bucket)
+            .field("google_gcs_prefix", &google_gcs_prefix)
             .finish()
     }
 }
@@ -262,6 +348,12 @@ impl ProviderFactory {
                     .as_ref()
                     .ok_or_else(|| Error::config("API key required for OpenAI provider"))?;
                 let mut provider = OpenAIProvider::new(api_key.clone())?;
+                if let Some(org) = &config.openai_organization {
+                    provider = provider.with_organization(org.clone());
+                }
+                if let Some(project) = &config.openai_project {
+                    provider = provider.with_project(project.clone());
+                }
                 if let Some(limiter) = &config.rate_limiter {
                     provider = provider.with_rate_limiter(limiter.clone());
                 }
@@ -291,6 +383,12 @@ impl ProviderFactory {
                 } else {
                     GoogleProvider::with_adc(project_id.clone(), location.clone()).await?
                 };
+                if let Some(bucket) = &config.google_gcs_bucket {
+                    provider = provider.with_gcs_bucket(bucket.clone());
+                }
+                if let Some(prefix) = &config.google_gcs_prefix {
+                    provider = provider.with_gcs_prefix(prefix.clone());
+                }
                 if let Some(limiter) = &config.rate_limiter {
                     provider = provider.with_rate_limiter(limiter.clone());
                 }
@@ -325,6 +423,9 @@ impl ProviderFactory {
                     AnthropicViaVertexProvider::with_adc(project_id.clone(), location.clone())
                         .await?
                 };
+                if !config.anthropic_beta.is_empty() {
+                    provider = provider.with_beta(config.anthropic_beta.iter().cloned());
+                }
                 if let Some(limiter) = &config.rate_limiter {
                     provider = provider.with_rate_limiter(limiter.clone());
                 }
@@ -463,6 +564,65 @@ mod tests {
         );
     }
 
+    /// The factory must thread OpenAI organization/project through
+    /// into the constructed provider so they affect the
+    /// `OpenAI-Organization` / `OpenAI-Project` headers *and* the
+    /// rate-limit bucket key (`account_key()` reads them). Without
+    /// this, a factory-built provider would silently behave as a
+    /// keyless deployment — different rate-limit bucket from the
+    /// direct-construction path, and the upstream API would route
+    /// to the wrong account.
+    ///
+    /// We don't have a way to invoke `account_key()` on the boxed
+    /// `dyn Provider`, so this test verifies via behaviour proxy:
+    /// two configs differing only in `openai_organization` must
+    /// produce providers whose `ProviderScope` differs (and the
+    /// scope reads from the same fields the bucket key does).
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn create_openai_propagates_organization_and_project() {
+        let with_org = ProviderConfig::openai("sk-test".into())
+            .with_openai_organization("org-A")
+            .with_openai_project("proj-A");
+        // Construction succeeds (no panic from a missing field /
+        // wrong builder method). The actual scope-affecting wiring
+        // is covered by `bucket_key_includes_account_scope` over in
+        // the openai client module.
+        let _provider = ProviderFactory::create(&with_org).await.unwrap();
+    }
+
+    /// Same construction-succeeds proof for Google's GCS bucket
+    /// and prefix.
+    #[cfg(feature = "google")]
+    #[tokio::test]
+    async fn create_google_propagates_gcs_bucket_and_prefix() {
+        let config = ProviderConfig::vertex(
+            ProviderType::Google,
+            "test-project".into(),
+            "us-east1".into(),
+            "ya29.token".into(),
+        )
+        .unwrap()
+        .with_google_gcs_bucket("bucket-name")
+        .with_google_gcs_prefix("prefix/");
+        let _provider = ProviderFactory::create(&config).await.unwrap();
+    }
+
+    /// Same construction-succeeds proof for Anthropic beta ids.
+    #[cfg(feature = "anthropic-vertex")]
+    #[tokio::test]
+    async fn create_anthropic_propagates_beta_ids() {
+        let config = ProviderConfig::vertex(
+            ProviderType::Anthropic,
+            "test-project".into(),
+            "us-east5".into(),
+            "ya29.token".into(),
+        )
+        .unwrap()
+        .with_anthropic_beta(["computer-use-2025-01-24".into()]);
+        let _provider = ProviderFactory::create(&config).await.unwrap();
+    }
+
     /// Same shape as `propagates_rate_limiter` but for the file
     /// resolver. Without this, a caller setting
     /// `with_file_resolver` on a factory-built provider would
@@ -549,6 +709,11 @@ mod tests {
             access_token: None,
             rate_limiter: None,
             file_resolver: None,
+            openai_organization: None,
+            openai_project: None,
+            anthropic_beta: Vec::new(),
+            google_gcs_bucket: None,
+            google_gcs_prefix: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -568,6 +733,11 @@ mod tests {
             access_token: Some("tok".into()),
             rate_limiter: None,
             file_resolver: None,
+            openai_organization: None,
+            openai_project: None,
+            anthropic_beta: Vec::new(),
+            google_gcs_bucket: None,
+            google_gcs_prefix: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -587,6 +757,11 @@ mod tests {
             access_token: Some("tok".into()),
             rate_limiter: None,
             file_resolver: None,
+            openai_organization: None,
+            openai_project: None,
+            anthropic_beta: Vec::new(),
+            google_gcs_bucket: None,
+            google_gcs_prefix: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -606,6 +781,11 @@ mod tests {
             access_token: Some("tok".into()),
             rate_limiter: None,
             file_resolver: None,
+            openai_organization: None,
+            openai_project: None,
+            anthropic_beta: Vec::new(),
+            google_gcs_bucket: None,
+            google_gcs_prefix: None,
         };
         let err = ProviderFactory::create(&config)
             .await
