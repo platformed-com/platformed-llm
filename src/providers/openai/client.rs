@@ -116,6 +116,17 @@ impl OpenAIProvider {
     /// The [`ProviderScope`] handles minted by this client are valid within —
     /// the base URL plus any org/project scoping.
     fn scope(&self) -> ProviderScope {
+        ProviderScope::new(ProviderType::OpenAI, self.account_key())
+    }
+
+    /// Account-shaped identifier for this client — `base_url` plus
+    /// any org / project — used as part of the rate-limiter bucket
+    /// key and the `ProviderScope::account`. Two `OpenAIProvider`s
+    /// sharing the same model name but pointing at different
+    /// deployments (e.g. `api.openai.com` vs. an Azure-hosted
+    /// endpoint, or an Org-scoped vs project-scoped key) must not
+    /// share an AIMD bucket; each upstream has its own quota.
+    fn account_key(&self) -> String {
         let mut account = self.base_url.clone();
         if let Some(org) = &self.organization {
             account.push('|');
@@ -125,7 +136,7 @@ impl OpenAIProvider {
             account.push('|');
             account.push_str(project);
         }
-        ProviderScope::new(ProviderType::OpenAI, account)
+        account
     }
 
     /// Convert internal request to OpenAI Responses API format.
@@ -1409,8 +1420,14 @@ impl Provider for OpenAIProvider {
         // returns immediately; a shared `InMemoryRateLimiter` paces
         // and prioritises us. The permit's `observe()` feeds the
         // response's normalised headers back to the limiter.
+        //
+        // The bucket key includes `account_key()` (base_url + org +
+        // project) so two providers pointing at different
+        // deployments (e.g. `api.openai.com` vs Azure) with the same
+        // model name don't collide on a shared limiter — each
+        // upstream has its own quota.
         let scope = crate::rate_limit::RateScope {
-            bucket_key: format!("OpenAI/{}", config.model),
+            bucket_key: format!("OpenAI|{}|{}", self.account_key(), config.model),
             tenant: config.tenant.unwrap_or(uuid::Uuid::nil()),
             priority: config.priority.unwrap_or_default(),
         };
@@ -1433,7 +1450,17 @@ impl Provider for OpenAIProvider {
             // Feed the limiter before draining the body — the body
             // collect is async and we don't want the limiter's
             // AIMD step to wait on it.
-            if status == 429 {
+            //
+            // A 5xx that carries a `Retry-After` is semantically a
+            // rate-limit-ish signal: the upstream is asking us to
+            // back off for `Retry-After` before retrying, same as a
+            // 429. Report it as `RateLimited` so the AIMD model
+            // halves rps and parks for the hint; otherwise an
+            // `OtherFailure` would still trigger the AIMD halving,
+            // but the limiter wouldn't park for the suggested
+            // duration.
+            let rate_limited = status == 429 || (status >= 500 && retry_after.is_some());
+            if rate_limited {
                 permit.observe(crate::rate_limit::RateOutcome::RateLimited {
                     retry_after: retry_after.map(std::time::Duration::from_secs),
                     info,

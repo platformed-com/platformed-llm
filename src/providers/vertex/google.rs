@@ -832,7 +832,13 @@ impl Provider for GoogleProvider {
             let status = response.status;
             // Read Retry-After before `collect_body` consumes the response.
             let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
-            if status == 429 {
+            // A 5xx with `Retry-After` is semantically a
+            // rate-limit-ish signal (Gemini sometimes sends 503 with
+            // a backoff hint under partial-quota exhaustion). Report
+            // it as `RateLimited` so the limiter parks for the
+            // suggested duration alongside the AIMD halving.
+            let rate_limited = status == 429 || (status >= 500 && retry_after.is_some());
+            if rate_limited {
                 permit.observe(crate::rate_limit::RateOutcome::RateLimited {
                     retry_after: retry_after.map(std::time::Duration::from_secs),
                     info: crate::rate_limit::ProviderRateInfo::default(),

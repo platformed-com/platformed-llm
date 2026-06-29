@@ -113,16 +113,97 @@ pub struct TransportResponse {
 
 /// Parse a `Retry-After` header value into whole seconds.
 ///
-/// Handles the delta-seconds form (`"30"`) that OpenAI, Anthropic and
-/// Vertex all send. The HTTP-date form is *not* parsed (returns
-/// `None`) — none of the supported providers use it; callers fall
-/// back to their own backoff when this is `None`.
+/// Handles **both** forms RFC 7231 defines for the header:
+///
+/// - Delta-seconds (`"30"`): direct parse.
+/// - HTTP-date (`"Wed, 21 Oct 2026 07:28:00 GMT"`): converted to
+///   delta-seconds against the current system clock. If the date is
+///   in the past (clock skew) we floor to 0 — "retry now" — rather
+///   than returning `None`. If the date is malformed, `None`.
+///
+/// OpenAI is documented as sending the delta-seconds form, but
+/// real-world responses (especially from edge proxies / WAFs in
+/// front of the providers) occasionally use the HTTP-date form;
+/// silently ignoring those would defeat the whole point of the
+/// rate-limit hint.
 ///
 /// Only the hosted providers consume this; gated to those features so
 /// a `--no-default-features` (core-only) build doesn't flag it as dead.
 #[cfg(any(feature = "openai", feature = "google", feature = "anthropic-vertex"))]
 pub(crate) fn parse_retry_after(value: Option<&str>) -> Option<u64> {
-    value.and_then(|v| v.trim().parse::<u64>().ok())
+    let raw = value?.trim();
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(seconds);
+    }
+    // HTTP-date form. RFC 7231 §7.1.1.1 specifies RFC 5322 (IMF-fixdate),
+    // RFC 850, and asctime() forms; in practice the IMF-fixdate form is
+    // overwhelmingly what shows up. Parse it without pulling in
+    // `chrono` — the cost of a tiny stdlib parser is much less than a
+    // multi-MB time crate.
+    parse_imf_fixdate_offset_seconds(raw)
+}
+
+/// Parse an IMF-fixdate / RFC 5322 date (`"Wed, 21 Oct 2026 07:28:00 GMT"`)
+/// and return the number of seconds between *now* and that instant.
+/// Returns `Some(0)` for past dates (clock skew → retry immediately),
+/// `None` for malformed input.
+///
+/// Only the IMF-fixdate form is supported — RFC 850 and asctime()
+/// forms predate the modern HTTP spec and don't appear in any
+/// provider response we've seen. If one shows up, callers fall back
+/// to their own backoff.
+#[cfg(any(feature = "openai", feature = "google", feature = "anthropic-vertex"))]
+fn parse_imf_fixdate_offset_seconds(s: &str) -> Option<u64> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Expected shape: "Day, DD Mon YYYY HH:MM:SS GMT"
+    // Strip the optional weekday prefix (`"Wed, "`) — we don't validate it.
+    let rest = s.split_once(", ").map(|(_, r)| r).unwrap_or(s);
+    let mut parts = rest.split_whitespace();
+    let day: u32 = parts.next()?.parse().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i32 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    let mut t = time.split(':');
+    let hour: u32 = t.next()?.parse().ok()?;
+    let minute: u32 = t.next()?.parse().ok()?;
+    let second: u32 = t.next()?.parse().ok()?;
+    // We don't validate the trailing "GMT" — IMF-fixdate is always
+    // GMT per spec; if it's missing we still treat the date as GMT.
+
+    // Civil-date → Unix-epoch seconds via Howard Hinnant's algorithm
+    // (https://howardhinnant.github.io/date_algorithms.html#days_from_civil).
+    // No leap-second handling — same as every other HTTP date parser.
+    let y = year - i32::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32; // [0, 399]
+    let m = month as i32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i32 - 1;
+    let doy = doy as u32; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era as i64 * 146097 + doe as i64 - 719_468;
+    let target_secs = days * 86400 + (hour as i64) * 3600 + (minute as i64) * 60 + second as i64;
+
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    if target_secs <= now_secs {
+        // Past or now — retry immediately.
+        Some(0)
+    } else {
+        Some((target_secs - now_secs) as u64)
+    }
 }
 
 impl TransportResponse {
@@ -366,12 +447,36 @@ mod tests {
         assert_eq!(parse_retry_after(Some("30")), Some(30));
         assert_eq!(parse_retry_after(Some("  7 ")), Some(7));
         assert_eq!(parse_retry_after(None), None);
-        // HTTP-date form is intentionally unparsed (returns None).
+        assert_eq!(parse_retry_after(Some("")), None);
+        assert_eq!(parse_retry_after(Some("not a number")), None);
+    }
+
+    /// HTTP-date form: must convert to delta-seconds against the
+    /// current clock. A past date floors to 0 (retry now); a future
+    /// date returns a positive delta.
+    #[cfg(any(feature = "openai", feature = "google", feature = "anthropic-vertex"))]
+    #[test]
+    fn parse_retry_after_handles_http_date_form() {
+        // A date deep in the past must floor to 0 ("retry now") rather
+        // than returning None — clock skew shouldn't defeat the hint.
         assert_eq!(
-            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            parse_retry_after(Some("Wed, 21 Oct 1990 07:28:00 GMT")),
+            Some(0),
+        );
+        // A date deep in the future must return a positive delta.
+        let far_future = parse_retry_after(Some("Sun, 21 Oct 2099 07:28:00 GMT"))
+            .expect("future date must parse");
+        assert!(
+            far_future > 60 * 60 * 24 * 365,
+            "year-2099 should be > 1 year out, got {far_future}s",
+        );
+        // Malformed must return None.
+        assert_eq!(
+            parse_retry_after(Some("Wed, 99 Foo 9999 99:99:99 GMT")),
             None
         );
-        assert_eq!(parse_retry_after(Some("")), None);
+        // Mixed gibberish must return None.
+        assert_eq!(parse_retry_after(Some("Wed, 21")), None);
     }
 
     /// `Transport` is a thin newtype around `Arc<dyn TransportImpl>` —

@@ -84,13 +84,24 @@
 //! normalised [`ProviderRateInfo`] shape so the limiter doesn't need
 //! provider-specific logic:
 //!
-//! - **OpenAI**: `x-ratelimit-{limit,remaining,reset}-{requests,tokens}`
-//!   on every response (success or error).
-//! - **Anthropic-via-Vertex**: only `Retry-After` on 429 plus
-//!   mid-stream `overloaded_error` / `rate_limit_error` SSE events
-//!   (which the lib normalises to [`crate::Error::RateLimit`] so the
-//!   limiter sees them).
-//! - **Gemini-via-Vertex**: `Retry-After` on 429.
+//! - **OpenAI**: `x-ratelimit-remaining-requests` and
+//!   `x-ratelimit-reset-requests` on every response (success or
+//!   error). `*-tokens` and `*-limit-*` are not yet parsed —
+//!   `ProviderRateInfo` is `#[non_exhaustive]` so extending it is
+//!   a non-breaking change.
+//! - **Anthropic-via-Vertex**: `Retry-After` on 429,
+//!   `anthropic-ratelimit-requests-{remaining,reset}` on every
+//!   response, plus mid-stream `overloaded_error` /
+//!   `rate_limit_error` SSE events (which the lib normalises to
+//!   [`crate::Error::RateLimit`] so the limiter sees them).
+//! - **Gemini-via-Vertex**: `Retry-After` on 429 (and on 5xx when
+//!   present — surfaced as a `RateLimited` outcome so the limiter
+//!   parks).
+//!
+//! A 5xx response that carries a `Retry-After` is observed as
+//! `RateLimited` rather than `OtherFailure` on every provider — the
+//! upstream is asking for a backoff, and the limiter should honour
+//! it rather than blindly halving rps without parking.
 
 use std::sync::Arc;
 use std::time::Duration;

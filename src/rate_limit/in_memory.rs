@@ -165,6 +165,28 @@ impl InMemoryRateLimiterConfig {
                 self.min_rps, self.max_rps,
             )));
         }
+        // `initial_rps` must lie in `[min_rps, max_rps]`. Without
+        // this guard the AIMD enqueue silently clamps a misconfigured
+        // initial value to one of the bounds — masking the bug at
+        // construction in exchange for a confused operator wondering
+        // why their carefully-tuned starting rate isn't holding.
+        if self.initial_rps < self.min_rps || self.initial_rps > self.max_rps {
+            return Err(Error::config(format!(
+                "InMemoryRateLimiterConfig: initial_rps ({}) must lie in [min_rps ({}), max_rps ({})]",
+                self.initial_rps, self.min_rps, self.max_rps,
+            )));
+        }
+        // `max_park` must be at least `default_park`; otherwise
+        // `observe_rate_limit`'s `max(default_park).min(max_park)`
+        // collapses to `max_park` for *every* parked bucket — silently
+        // overriding the documented "use default when missing"
+        // semantics with a smaller `max_park` floor.
+        if self.max_park < self.default_park {
+            return Err(Error::config(format!(
+                "InMemoryRateLimiterConfig: max_park ({:?}) must be >= default_park ({:?})",
+                self.max_park, self.default_park,
+            )));
+        }
         Ok(())
     }
 }
@@ -184,6 +206,16 @@ impl InMemoryRateLimiter {
         // propagate so `new()` stays infallible.
         Self::try_with_config(InMemoryRateLimiterConfig::default())
             .expect("default config is valid")
+    }
+
+    /// Test-only accessor for the current rps of any one bucket
+    /// the limiter knows about. Lets cross-module integration tests
+    /// (e.g. wiring `MockProvider` through the limiter) assert the
+    /// AIMD model reacted as expected without exposing the internal
+    /// HashMap layout.
+    #[cfg(test)]
+    pub(crate) fn first_bucket_rps(&self) -> Option<f64> {
+        self.inner.buckets.lock().values().next().map(|b| b.rps)
     }
 
     /// Construct with caller-tuned [`InMemoryRateLimiterConfig`].
@@ -1061,7 +1093,9 @@ mod tests {
     #[test]
     fn invalid_config_is_rejected() {
         // Validation catches the inputs that would otherwise panic
-        // deep inside `try_dispatch` (e.g. `1.0 / 0.0`).
+        // deep inside `try_dispatch` (e.g. `1.0 / 0.0`) or silently
+        // produce surprising behaviour (initial_rps clamped, max_park
+        // collapsed below default_park).
         let bad = InMemoryRateLimiterConfig {
             min_rps: 0.0,
             ..InMemoryRateLimiterConfig::default()
@@ -1077,6 +1111,34 @@ mod tests {
             ..InMemoryRateLimiterConfig::default()
         };
         assert!(InMemoryRateLimiter::try_with_config(bad_mult).is_err());
+
+        // `initial_rps` outside `[min_rps, max_rps]` is rejected —
+        // previously silently clamped, which masked typos in the
+        // starting rate.
+        let initial_above_max = InMemoryRateLimiterConfig {
+            initial_rps: 50.0,
+            min_rps: 0.25,
+            max_rps: 10.0,
+            ..InMemoryRateLimiterConfig::default()
+        };
+        assert!(InMemoryRateLimiter::try_with_config(initial_above_max).is_err());
+        let initial_below_min = InMemoryRateLimiterConfig {
+            initial_rps: 0.05,
+            min_rps: 0.25,
+            max_rps: 10.0,
+            ..InMemoryRateLimiterConfig::default()
+        };
+        assert!(InMemoryRateLimiter::try_with_config(initial_below_min).is_err());
+
+        // `max_park < default_park` is rejected — would collapse the
+        // `Retry-After` cap below the default fallback, silently
+        // overriding the documented semantics.
+        let inverted_park = InMemoryRateLimiterConfig {
+            default_park: Duration::from_secs(5),
+            max_park: Duration::from_secs(1),
+            ..InMemoryRateLimiterConfig::default()
+        };
+        assert!(InMemoryRateLimiter::try_with_config(inverted_park).is_err());
     }
 
     // ====================================================================
@@ -1646,8 +1708,17 @@ mod tests {
     /// `WaitForever`, and asserts the follower is woken and
     /// dispatches. Without `AcquireGuard::drop → wake_head()` the
     /// follower would never re-evaluate its dispatch target.
+    ///
+    /// Uses a `Barrier` to deterministically order head-then-follower
+    /// enqueue (rather than `sleep`-based wall-clock ordering, which
+    /// can race under sanitizer / CI load). The barrier guarantees
+    /// the head holds head-of-queue at the moment the follower
+    /// reaches its `acquire` await — which is the invariant the test
+    /// is exercising.
     #[tokio::test]
     async fn head_cancel_during_wait_promotes_next_waiter() {
+        use tokio::sync::Barrier;
+
         let limiter = Arc::new(
             InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
                 initial_rps: 2.0, // 500ms interval — leaves plenty of cancel window
@@ -1662,22 +1733,38 @@ mod tests {
             .acquire(&scope("warmup", Priority::Interactive))
             .await
             .unwrap();
-        // Spawn the head waiter with a short timeout — it will be
-        // cancelled while still actively waiting on the AIMD gate.
+
+        // Two-stage barrier:
+        // 1. `head_enqueued` — fires once the head has reached its
+        //    `acquire` await point, so we know it owns head-of-queue
+        //    before the follower starts to enqueue.
+        // 2. The follower spawns *after* `head_enqueued.wait()`
+        //    returns, so the enqueue order is deterministic regardless
+        //    of CI load.
+        let head_enqueued = Arc::new(Barrier::new(2));
+
+        // The head wraps its acquire in a timeout that we'll let fire,
+        // so the future drops mid-wait — exercising
+        // `AcquireGuard::drop`.
         let lim_head = limiter.clone();
+        let head_barrier = head_enqueued.clone();
         let head = tokio::spawn(async move {
-            let _ = timeout(
-                TokioDuration::from_millis(100),
-                lim_head.acquire(&scope("head", Priority::Interactive)),
-            )
-            .await;
+            // Start the acquire as a future, then signal the barrier
+            // *immediately* before awaiting it. The barrier only
+            // releases once both sides arrive, so the follower can't
+            // race ahead of the head's head-of-queue claim.
+            let head_scope = scope("head", Priority::Interactive);
+            let acquire_fut = lim_head.acquire(&head_scope);
+            head_barrier.wait().await;
+            let _ = timeout(TokioDuration::from_millis(100), acquire_fut).await;
         });
-        // Let the head reach the await point and claim head-of-queue
-        // before the follower enqueues behind it.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        // Spawn a real follower that genuinely needs to be promoted —
-        // it's parked at `WaitForever` until the head cancels and
-        // `wake_head` re-fires.
+
+        // Wait for the head to confirm it's enqueued.
+        head_enqueued.wait().await;
+
+        // Now spawn the follower. The head holds head-of-queue, so
+        // the follower will enqueue behind it and park at
+        // `WaitForever` until `wake_head` re-fires.
         let lim_follower = limiter.clone();
         let follower = tokio::spawn(async move {
             let p = lim_follower
@@ -1686,13 +1773,13 @@ mod tests {
                 .unwrap();
             (Instant::now(), p)
         });
-        // Let the follower reach the await point and enqueue behind
-        // the head.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+
         // Wait for the head to be cancelled (its 100ms timeout
         // elapses). The `AcquireGuard` drop must remove the head and
-        // fire `wake_head`, promoting the follower.
+        // fire `wake_head`, promoting the follower from
+        // `WaitForever` to a real wait-on-the-gate.
         head.await.unwrap();
+
         // The follower must now dispatch on the bucket's normal
         // schedule — if `wake_head` didn't re-fire after the head
         // dropped, it would stay at `WaitForever`.

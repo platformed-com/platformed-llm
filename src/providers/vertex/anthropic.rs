@@ -544,7 +544,15 @@ impl Provider for AnthropicViaVertexProvider {
             let status = response.status;
             // Read Retry-After before `collect_body` consumes the response.
             let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
-            if status == 429 {
+            // A 5xx with `Retry-After` is semantically a
+            // rate-limit-ish signal (Anthropic-via-Vertex returns 529
+            // overloaded with a hint), so report it as `RateLimited`
+            // so the limiter parks for the suggested duration
+            // alongside the AIMD halving. Without this branch the
+            // limiter would still halve rps but ignore the upstream
+            // hint, busy-looping back into the same overload.
+            let rate_limited = status == 429 || (status >= 500 && retry_after.is_some());
+            if rate_limited {
                 permit.observe(crate::rate_limit::RateOutcome::RateLimited {
                     retry_after: retry_after.map(std::time::Duration::from_secs),
                     info: crate::rate_limit::ProviderRateInfo::default(),
@@ -591,6 +599,11 @@ impl Provider for AnthropicViaVertexProvider {
         // below) is fed back as `RateLimited`, not `Success`. See
         // `rate_limit::observe_stream`.
 
+        // Snapshot the rate-limit headers before consuming the
+        // body — they're attached to the HTTP response, not the SSE
+        // events, so we have to read them here.
+        let response_headers = response.headers.clone();
+
         // Create SSE stream from response
         let sse_stream = SseStream::new("Anthropic", response.body);
 
@@ -635,9 +648,83 @@ impl Provider for AnthropicViaVertexProvider {
         let observed = crate::rate_limit::observe_response_stream(
             event_stream,
             permit,
-            crate::rate_limit::ProviderRateInfo::default(),
+            parse_anthropic_rate_info(&response_headers),
         );
         Ok(Response::from_stream(observed))
+    }
+}
+
+/// Anthropic exposes its rate-limit state via the
+/// `anthropic-ratelimit-requests-*` family on every successful
+/// response. We surface remaining and reset so the limiter's AIMD
+/// model can learn observed capacity rather than only from 429s.
+///
+/// The reset header is an RFC 3339 UTC datetime
+/// (`"2026-10-21T07:28:00Z"`); converted to a delta against the
+/// current clock. Past dates (clock skew or already-reset windows)
+/// floor to zero, mirroring `parse_retry_after`'s behaviour.
+fn parse_anthropic_rate_info(headers: &[(String, String)]) -> crate::rate_limit::ProviderRateInfo {
+    fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+    let requests_remaining = header(headers, "anthropic-ratelimit-requests-remaining")
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    let requests_reset = header(headers, "anthropic-ratelimit-requests-reset")
+        .and_then(parse_rfc3339_offset_seconds)
+        .map(std::time::Duration::from_secs);
+    crate::rate_limit::ProviderRateInfo {
+        requests_remaining,
+        requests_reset,
+    }
+}
+
+/// Parse an RFC 3339 UTC datetime (`"2026-10-21T07:28:00Z"`) into
+/// seconds from now. Past dates floor to 0. Malformed → `None`.
+///
+/// Same justification as the IMF-fixdate parser in `transport.rs`:
+/// a small inline parser is cheaper than pulling in a multi-MB time
+/// crate just to read a single header field.
+fn parse_rfc3339_offset_seconds(s: &str) -> Option<u64> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Expected shape: "YYYY-MM-DDTHH:MM:SS(.fraction)?(Z|+HH:MM|-HH:MM)"
+    // Anthropic emits `Z` (UTC); we only handle that suffix.
+    let s = s.trim();
+    // Strip trailing 'Z' if present; otherwise we expect no offset
+    // and treat as UTC (Anthropic's documented format).
+    let s = s.strip_suffix('Z').unwrap_or(s);
+    // Drop any fractional-seconds suffix (".123") for our
+    // whole-second resolution needs.
+    let (datetime, _frac) = s.split_once('.').unwrap_or((s, ""));
+    let (date, time) = datetime.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: i32 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    let mut time_parts = time.split(':');
+    let hour: u32 = time_parts.next()?.parse().ok()?;
+    let minute: u32 = time_parts.next()?.parse().ok()?;
+    let second: u32 = time_parts.next()?.parse().ok()?;
+
+    // Civil-date → Unix-epoch seconds (Howard Hinnant). Same algorithm
+    // as `transport::parse_imf_fixdate_offset_seconds`.
+    let m = month as i32;
+    let y = year - i32::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i32 - 1;
+    let doy = doy as u32;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era as i64 * 146097 + doe as i64 - 719_468;
+    let target_secs = days * 86400 + (hour as i64) * 3600 + (minute as i64) * 60 + second as i64;
+
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    if target_secs <= now_secs {
+        Some(0)
+    } else {
+        Some((target_secs - now_secs) as u64)
     }
 }
 

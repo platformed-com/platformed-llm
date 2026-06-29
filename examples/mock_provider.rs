@@ -86,7 +86,7 @@ async fn main() -> Result<(), Error> {
     let weather_service = Uuid::from_u128(0x1);
     let log = provider.call_log();
     let policy = RetryPolicy::standard();
-    let answer = retry(&policy, async |_attempt| {
+    let answer = retry(policy, async |_attempt| {
         run_agent(
             &provider,
             weather_service,
