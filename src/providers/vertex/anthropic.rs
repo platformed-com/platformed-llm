@@ -532,16 +532,20 @@ impl Provider for AnthropicViaVertexProvider {
                     retry_after,
                     format!("Anthropic 429 (rate limited): {body_text}"),
                 ),
-                _ => Error::provider_with_status(
+                // 5xx (and any other non-special status) may carry
+                // a `Retry-After` per RFC 7231; thread it through so
+                // the retry helper honours the server hint.
+                _ => Error::provider_with_retry_after(
                     "Anthropic",
                     status,
+                    retry_after,
                     format!("API error: {body_text}"),
                 ),
             });
         }
 
         // Create SSE stream from response
-        let sse_stream = SseStream::new(response.body);
+        let sse_stream = SseStream::new("Anthropic", response.body);
 
         // Create a stateful processor for function call tracking
         let mut state = StreamState::default();

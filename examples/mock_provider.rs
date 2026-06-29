@@ -24,7 +24,7 @@ async fn run_agent(provider: &dyn Provider, question: &str) -> Result<String, Er
     let mut prompt = Prompt::user(question);
 
     loop {
-        let response = retry(&policy, async |_attempt| {
+        let response = retry(policy, async |_attempt| {
             generate(provider, &prompt, &config).await?.buffer().await
         })
         .await?;

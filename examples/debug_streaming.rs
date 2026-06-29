@@ -49,7 +49,7 @@ async fn main() -> Result<(), Error> {
     // accumulated text. `retry` honours `Retry-After` via the policy
     // and gives up on terminal errors (auth, bad config, …).
     let policy = RetryPolicy::standard();
-    let text = retry(&policy, async |attempt| {
+    let text = retry(policy, async |attempt| {
         if attempt > 1 {
             println!("🔁 retry attempt {attempt}");
         }

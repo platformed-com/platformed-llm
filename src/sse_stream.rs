@@ -41,21 +41,27 @@ pub struct SseStream<S> {
     line_buffer: Vec<u8>,
     /// Line ending detection state (preserved across buffer boundaries)
     last_seen_cr: bool,
-    /// Parsed events ready to be yielded
+    /// Parsed events ready to be yielded. Carries the provider name
+    /// used to attribute SSE-layer errors (UTF-8 parse failures);
+    /// see [`EventBuffer::provider`].
     events: EventBuffer,
 }
 
 struct EventBuffer {
     current_event: SseEvent,
     events: VecDeque<SseEvent>,
+    /// Provider name forwarded from the owning `SseStream` so the
+    /// UTF-8 error site can attribute the failure correctly.
+    provider: &'static str,
 }
 
 impl EventBuffer {
     /// Create a new empty event buffer.
-    fn new() -> Self {
+    fn new(provider: &'static str) -> Self {
         Self {
             current_event: SseEvent::default(),
             events: VecDeque::new(),
+            provider,
         }
     }
 
@@ -82,10 +88,12 @@ impl EventBuffer {
 
     fn process_line(&mut self, line: &[u8]) -> Result<(), Error> {
         let line = std::str::from_utf8(line).map_err(|e| {
-            // Provider-agnostic SSE-layer error: malformed UTF-8 on
-            // the wire. Not retryable — the next attempt would hit
-            // the same shape.
-            Error::provider("Stream", format!("Invalid UTF-8 in SSE event: {e}"))
+            // SSE-layer error attributed to the upstream provider so
+            // logs / metrics / per-provider retry policies see the
+            // real source. Not retryable — the next attempt would
+            // hit the same shape if the upstream is genuinely
+            // emitting non-UTF-8.
+            Error::provider(self.provider, format!("Invalid UTF-8 in SSE event: {e}"))
         })?;
 
         if line.is_empty() {
@@ -130,13 +138,15 @@ impl EventBuffer {
 }
 
 impl<S> SseStream<S> {
-    /// Create a new SSE stream from a byte stream.
-    pub fn new(stream: S) -> Self {
+    /// Create a new SSE stream from a byte stream. `provider` is the
+    /// upstream name (`"OpenAI"`, `"Anthropic"`, …) used to attribute
+    /// any SSE-layer errors that this adapter raises.
+    pub fn new(provider: &'static str, stream: S) -> Self {
         Self {
             inner: stream,
             line_buffer: Vec::new(),
             last_seen_cr: false,
-            events: EventBuffer::new(),
+            events: EventBuffer::new(provider),
         }
     }
 
@@ -171,7 +181,7 @@ impl<S> SseStream<S> {
 impl<S, E> Stream for SseStream<S>
 where
     S: Stream<Item = Result<bytes::Bytes, E>> + Unpin,
-    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    E: Into<Error>,
 {
     type Item = Result<SseEvent, Error>;
 
@@ -182,22 +192,19 @@ where
                 return Poll::Ready(Some(Ok(event)));
             }
 
-            // No buffered events, poll the underlying stream for more data.
-            // The inner stream is type-erased (`E: Into<Box<dyn Error>>`),
-            // so we can't recover the typed source; surface as a
-            // retryable provider-level stream error since failures at
-            // this layer are usually transient (connection drop, read
-            // timeout). Callers with a concrete typed source can wrap
-            // the body in their own classifying adapter before passing
-            // it to `SseStream`.
-            if let Some(chunk) = ready!(self.inner.poll_next_unpin(cx).map_err(|e| {
-                Error::Provider {
-                    provider: "Stream",
-                    status: None,
-                    retryable: true,
-                    message: format!("Stream error: {}", e.into()),
-                }
-            })?) {
+            // Poll the underlying stream for more data. The bound
+            // `E: Into<Error>` lets us preserve the typed
+            // classification through the SSE layer — most providers
+            // pass `Result<Bytes, Error>` directly (the transport
+            // already mapped `reqwest::Error` to our `Error`), so a
+            // mid-stream connection drop arrives as the typed
+            // `Error::Transport(_)` (or whatever variant the
+            // upstream supplied) and `is_retryable()` matches the
+            // source's intent rather than being blanket-classified
+            // by this layer.
+            let polled = ready!(self.inner.poll_next_unpin(cx));
+            if let Some(chunk_result) = polled {
+                let chunk = chunk_result.map_err(Into::into)?;
                 self.parse_buffer(&chunk)?;
             } else {
                 // EOF. Per the SSE spec, dispatch any in-flight event
@@ -223,12 +230,14 @@ where
 
 /// Extension trait to add SSE parsing to byte streams.
 pub trait SseStreamExt: Stream {
-    /// Parse this byte stream as SSE events.
-    fn sse_events(self) -> SseStream<Self>
+    /// Parse this byte stream as SSE events. `provider` is the
+    /// upstream name (`"OpenAI"`, `"Anthropic"`, …) used to attribute
+    /// SSE-layer errors raised by the parser.
+    fn sse_events(self, provider: &'static str) -> SseStream<Self>
     where
         Self: Sized,
     {
-        SseStream::new(self)
+        SseStream::new(provider, self)
     }
 }
 
@@ -241,10 +250,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_stream_complete_events() {
-        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+        let chunks: Vec<Result<bytes::Bytes, Error>> =
             vec![Ok(bytes::Bytes::from("data: Hello\n\ndata: World\n\n"))];
         let byte_stream = stream::iter(chunks);
-        let mut sse_stream = byte_stream.sse_events();
+        let mut sse_stream = byte_stream.sse_events("Test");
 
         let event1 = sse_stream.next().await.unwrap().unwrap();
         assert_eq!(event1.data, "Hello");
@@ -257,13 +266,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_stream_split_events() {
-        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+        let chunks: Vec<Result<bytes::Bytes, Error>> = vec![
             Ok(bytes::Bytes::from("data: Hel")),
             Ok(bytes::Bytes::from("lo World\n\ndata: ")),
             Ok(bytes::Bytes::from("Second\n\n")),
         ];
         let byte_stream = stream::iter(chunks);
-        let mut sse_stream = byte_stream.sse_events();
+        let mut sse_stream = byte_stream.sse_events("Test");
 
         let event1 = sse_stream.next().await.unwrap().unwrap();
         assert_eq!(event1.data, "Hello World");
@@ -276,10 +285,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_stream_multiline() {
-        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+        let chunks: Vec<Result<bytes::Bytes, Error>> =
             vec![Ok(bytes::Bytes::from("data: Line 1\ndata: Line 2\n\n"))];
         let byte_stream = stream::iter(chunks);
-        let mut sse_stream = byte_stream.sse_events();
+        let mut sse_stream = byte_stream.sse_events("Test");
 
         let event = sse_stream.next().await.unwrap().unwrap();
         assert_eq!(event.data, "Line 1\nLine 2");
@@ -287,11 +296,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_stream_with_fields() {
-        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![Ok(bytes::Bytes::from(
+        let chunks: Vec<Result<bytes::Bytes, Error>> = vec![Ok(bytes::Bytes::from(
             "event: custom\ndata: Test\nid: 123\n\n",
         ))];
         let byte_stream = stream::iter(chunks);
-        let mut sse_stream = byte_stream.sse_events();
+        let mut sse_stream = byte_stream.sse_events("Test");
 
         let event = sse_stream.next().await.unwrap().unwrap();
         assert_eq!(event.event_type, "custom".to_string());
@@ -305,7 +314,7 @@ mod tests {
         // Using Euro symbol (€) which is 3 bytes in UTF-8: E2 82 AC
         let euro_bytes = "€".as_bytes();
 
-        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+        let chunks: Vec<Result<bytes::Bytes, Error>> = vec![
             // Split the Euro symbol across chunks
             Ok(bytes::Bytes::from(
                 [b"data: Price: ".as_slice(), &euro_bytes[..2]].concat(),
@@ -314,7 +323,7 @@ mod tests {
         ];
 
         let byte_stream = stream::iter(chunks);
-        let mut sse_stream = byte_stream.sse_events();
+        let mut sse_stream = byte_stream.sse_events("Test");
 
         let event = sse_stream.next().await.unwrap().unwrap();
         assert_eq!(event.data, "Price: €100");
@@ -325,12 +334,12 @@ mod tests {
     #[tokio::test]
     async fn test_sse_stream_invalid_utf8_error() {
         // Test that invalid UTF-8 in a complete event properly returns an error
-        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![Ok(bytes::Bytes::from(
+        let chunks: Vec<Result<bytes::Bytes, Error>> = vec![Ok(bytes::Bytes::from(
             b"data: Valid start \xFF\xFE invalid bytes\n\n".to_vec(),
         ))];
 
         let byte_stream = stream::iter(chunks);
-        let mut sse_stream = byte_stream.sse_events();
+        let mut sse_stream = byte_stream.sse_events("Test");
 
         // Should get an error for invalid UTF-8
         let result = sse_stream.next().await.unwrap();
@@ -374,10 +383,9 @@ mod tests {
         for (test_name, data, expected) in test_cases {
             println!("Testing: {test_name}");
 
-            let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
-                vec![Ok(bytes::Bytes::from(data))];
+            let chunks: Vec<Result<bytes::Bytes, Error>> = vec![Ok(bytes::Bytes::from(data))];
             let byte_stream = stream::iter(chunks);
-            let mut sse_stream = byte_stream.sse_events();
+            let mut sse_stream = byte_stream.sse_events("Test");
 
             let mut received_events = Vec::new();
             while let Some(result) = sse_stream.next().await {
@@ -399,12 +407,12 @@ mod tests {
         // Test the critical case where line separators are split across buffer boundaries
 
         // Case 1: CRLF split across boundaries (\r | \n\r\n)
-        let chunks1: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+        let chunks1: Vec<Result<bytes::Bytes, Error>> = vec![
             Ok(bytes::Bytes::from("data: event1\r")), // Ends with \r
             Ok(bytes::Bytes::from("\n\r\ndata: event2\r\n\r\n")), // Starts with \n, contains complete event
         ];
         let byte_stream1 = stream::iter(chunks1);
-        let mut sse_stream1 = byte_stream1.sse_events();
+        let mut sse_stream1 = byte_stream1.sse_events("Test");
 
         let event1 = sse_stream1.next().await.unwrap().unwrap();
         assert_eq!(event1.data, "event1");
@@ -415,12 +423,12 @@ mod tests {
         assert!(sse_stream1.next().await.is_none());
 
         // Case 2: LF split across boundaries (data\n | \ndata)
-        let chunks2: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+        let chunks2: Vec<Result<bytes::Bytes, Error>> = vec![
             Ok(bytes::Bytes::from("data: event1\n")),     // Ends with \n
             Ok(bytes::Bytes::from("\ndata: event2\n\n")), // Starts with \n, contains complete event
         ];
         let byte_stream2 = stream::iter(chunks2);
-        let mut sse_stream2 = byte_stream2.sse_events();
+        let mut sse_stream2 = byte_stream2.sse_events("Test");
 
         let event1 = sse_stream2.next().await.unwrap().unwrap();
         assert_eq!(event1.data, "event1");
@@ -431,12 +439,12 @@ mod tests {
         assert!(sse_stream2.next().await.is_none());
 
         // Case 3: Complex split (\r\n | \r\n)
-        let chunks3: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+        let chunks3: Vec<Result<bytes::Bytes, Error>> = vec![
             Ok(bytes::Bytes::from("data: event1\r\n")), // Ends with \r\n
             Ok(bytes::Bytes::from("\r\ndata: event2\r\n\r\n")), // Starts with \r\n
         ];
         let byte_stream3 = stream::iter(chunks3);
-        let mut sse_stream3 = byte_stream3.sse_events();
+        let mut sse_stream3 = byte_stream3.sse_events("Test");
 
         let event1 = sse_stream3.next().await.unwrap().unwrap();
         assert_eq!(event1.data, "event1");
@@ -453,10 +461,9 @@ mod tests {
 
         // Case 1: Mixed separators - CRLF should take precedence over LF within it
         let mixed_data = "data: event1\r\n\r\ndata: event2\n\ndata: event3\r\r";
-        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
-            vec![Ok(bytes::Bytes::from(mixed_data))];
+        let chunks: Vec<Result<bytes::Bytes, Error>> = vec![Ok(bytes::Bytes::from(mixed_data))];
         let byte_stream = stream::iter(chunks);
-        let mut sse_stream = byte_stream.sse_events();
+        let mut sse_stream = byte_stream.sse_events("Test");
 
         // Should correctly parse all three events with different separators
         let event1 = sse_stream.next().await.unwrap().unwrap();
@@ -473,10 +480,9 @@ mod tests {
 
         // Case 2: Ensure \n\n within \r\n\r\n doesn't cause false matches
         let tricky_data = "data: tricky\r\n\r\ndata: event\r\n\r\n";
-        let chunks2: Vec<Result<bytes::Bytes, std::io::Error>> =
-            vec![Ok(bytes::Bytes::from(tricky_data))];
+        let chunks2: Vec<Result<bytes::Bytes, Error>> = vec![Ok(bytes::Bytes::from(tricky_data))];
         let byte_stream2 = stream::iter(chunks2);
-        let mut sse_stream2 = byte_stream2.sse_events();
+        let mut sse_stream2 = byte_stream2.sse_events("Test");
 
         let event1 = sse_stream2.next().await.unwrap().unwrap();
         assert_eq!(event1.data, "tricky");
@@ -492,10 +498,10 @@ mod tests {
     /// a phantom message.
     #[tokio::test]
     async fn comments_do_not_dispatch_events() {
-        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![Ok(bytes::Bytes::from(
+        let chunks: Vec<Result<bytes::Bytes, Error>> = vec![Ok(bytes::Bytes::from(
             ":keep-alive\n\n: another comment\n\ndata: hello\n\n",
         ))];
-        let mut stream = stream::iter(chunks).sse_events();
+        let mut stream = stream::iter(chunks).sse_events("Test");
         let event = stream.next().await.unwrap().unwrap();
         assert_eq!(
             event.data, "hello",
@@ -508,9 +514,9 @@ mod tests {
     /// should still dispatch the data event correctly.
     #[tokio::test]
     async fn comment_inside_event_does_not_break_parsing() {
-        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+        let chunks: Vec<Result<bytes::Bytes, Error>> =
             vec![Ok(bytes::Bytes::from(":heartbeat\nevent: m\ndata: x\n\n"))];
-        let mut stream = stream::iter(chunks).sse_events();
+        let mut stream = stream::iter(chunks).sse_events("Test");
         let event = stream.next().await.unwrap().unwrap();
         assert_eq!(event.event_type, "m");
         assert_eq!(event.data, "x");
@@ -523,9 +529,8 @@ mod tests {
     /// payload.
     #[tokio::test]
     async fn eof_without_blank_line_dispatches_pending_event() {
-        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
-            vec![Ok(bytes::Bytes::from("data: final"))];
-        let mut stream = stream::iter(chunks).sse_events();
+        let chunks: Vec<Result<bytes::Bytes, Error>> = vec![Ok(bytes::Bytes::from("data: final"))];
+        let mut stream = stream::iter(chunks).sse_events("Test");
         let event = stream
             .next()
             .await
@@ -541,10 +546,10 @@ mod tests {
 
         // Case 1: \r\n\r at end of buffer (incomplete, should not be treated as separator)
         let incomplete_data = "data: event1\r\n\r";
-        let chunks1: Vec<Result<bytes::Bytes, std::io::Error>> =
+        let chunks1: Vec<Result<bytes::Bytes, Error>> =
             vec![Ok(bytes::Bytes::from(incomplete_data))];
         let byte_stream1 = stream::iter(chunks1);
-        let mut sse_stream1 = byte_stream1.sse_events();
+        let mut sse_stream1 = byte_stream1.sse_events("Test");
 
         // Should parse the incomplete event when stream ends
         let event1 = sse_stream1.next().await.unwrap().unwrap();
@@ -553,10 +558,9 @@ mod tests {
 
         // Case 2: \r\n\r\n complete separator should work normally
         let complete_data = "data: event1\r\n\r\ndata: event2\r\n\r\n";
-        let chunks2: Vec<Result<bytes::Bytes, std::io::Error>> =
-            vec![Ok(bytes::Bytes::from(complete_data))];
+        let chunks2: Vec<Result<bytes::Bytes, Error>> = vec![Ok(bytes::Bytes::from(complete_data))];
         let byte_stream2 = stream::iter(chunks2);
-        let mut sse_stream2 = byte_stream2.sse_events();
+        let mut sse_stream2 = byte_stream2.sse_events("Test");
 
         let event1 = sse_stream2.next().await.unwrap().unwrap();
         assert_eq!(event1.data, "event1");
@@ -568,10 +572,9 @@ mod tests {
 
         // Case 3: Mixed separators should all work
         let mixed_data = "data: event1\n\ndata: event2\r\rdata: event3\r\n\r\n";
-        let chunks3: Vec<Result<bytes::Bytes, std::io::Error>> =
-            vec![Ok(bytes::Bytes::from(mixed_data))];
+        let chunks3: Vec<Result<bytes::Bytes, Error>> = vec![Ok(bytes::Bytes::from(mixed_data))];
         let byte_stream3 = stream::iter(chunks3);
-        let mut sse_stream3 = byte_stream3.sse_events();
+        let mut sse_stream3 = byte_stream3.sse_events("Test");
 
         let event1 = sse_stream3.next().await.unwrap().unwrap();
         assert_eq!(event1.data, "event1");
@@ -588,7 +591,7 @@ mod tests {
     /// Drive `bytes` through `SseStream` split into the given byte-size
     /// runs. Returns the parsed event sequence.
     async fn parse_with_chunks(bytes: &[u8], runs: &[usize]) -> Vec<SseEvent> {
-        let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> = Vec::new();
+        let mut chunks: Vec<Result<bytes::Bytes, Error>> = Vec::new();
         let mut i = 0usize;
         for &run in runs {
             if i >= bytes.len() {
@@ -601,7 +604,7 @@ mod tests {
         if i < bytes.len() {
             chunks.push(Ok(bytes::Bytes::copy_from_slice(&bytes[i..])));
         }
-        let mut s = stream::iter(chunks).sse_events();
+        let mut s = stream::iter(chunks).sse_events("Test");
         let mut out = Vec::new();
         while let Some(ev) = s.next().await {
             out.push(ev.expect("unexpected parse error"));

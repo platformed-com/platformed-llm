@@ -330,7 +330,7 @@ fn rewrite_synth_tool_stream(
                             // a fresh request would likely produce
                             // the same uncoercible output.
                             Some(Err(Error::provider(
-                                "Stream",
+                                "Library",
                                 "json_coercion: model did not invoke the structured-response \
                                  tool and made no other tool call — the request asked for \
                                  structured output but the model returned free-form text",
@@ -1046,7 +1046,8 @@ mod tests {
         assert!(matches!(
             err,
             Error::Provider {
-                provider: "Stream",
+                provider: "Library",
+                retryable: false,
                 ..
             }
         ));

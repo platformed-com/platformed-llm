@@ -296,34 +296,74 @@ fn lower_response(resp: MockResponse, chunking: &Chunking) -> Vec<Result<StreamE
 }
 
 /// Extract an owned [`Error`] from an [`std::sync::Arc<Error>`],
-/// preserving the inner error's **retryability classification**.
+/// preserving the inner error's variant identity wherever possible
+/// and falling back to a classification-preserving wrap when it
+/// can't.
 ///
 /// `MockResponse` holds the mid-stream error behind an `Arc` so the
 /// containing response can be `Clone` (required for
 /// `MockProvider::Always` mode). At the stream-lowering boundary we
-/// surface a single owned [`Error`] via [`std::sync::Arc::try_unwrap`]
-/// — the common case in `Always` mode, where the response is cloned
-/// for use and the original is dropped. On the shared-ref fallback
-/// (some other consumer still holds the `Arc`) we synthesise a fresh
-/// [`Error`] that preserves [`Error::retry_after`] when present and
-/// [`Error::is_retryable`] otherwise. Without that preservation, a
-/// shared mid-stream [`Error::RateLimit`] would silently downgrade to
-/// a non-retryable provider error and the caller's retry loop would
-/// give up.
+/// try [`std::sync::Arc::try_unwrap`] first — that succeeds in
+/// `scripted` / `queue` modes where the response is popped and
+/// consumed exactly once. In `Always` mode the original `Arc` stays
+/// alive in `Mode::Always(response)` while a clone goes to the
+/// caller, so `try_unwrap` *always* fails there and we take the
+/// fallback path.
+///
+/// The fallback rebuilds the error by hand. Variants that don't
+/// carry non-`Clone` payloads (`RateLimit`, `Auth`,
+/// `ContextWindowExceeded`, `ModelNotAvailable`, `InvalidPrompt`,
+/// `Config`, `Compaction`, `UnsupportedInput`) are reconstructed
+/// faithfully so callers can match on them. The remaining variants
+/// (`Transport` — wraps a non-`Clone` `reqwest::Error`,
+/// `Serialization` — same, and `Provider` — easiest to rebuild
+/// from-scratch) collapse to a synthetic `Provider("Mock", …)`
+/// carrying the inner's `is_retryable()` verdict. Without that
+/// preservation, a shared mid-stream rate limit would silently
+/// downgrade to a non-retryable provider error and the caller's
+/// retry loop would give up.
 fn unwrap_shared_error(error: std::sync::Arc<Error>) -> Error {
     std::sync::Arc::try_unwrap(error).unwrap_or_else(|arc| {
-        if let Some(retry_after) = arc.retry_after() {
+        // Reconstruct cloneable variants by hand so callers can
+        // still match on the original tag (`compaction` needs to
+        // see `ContextWindowExceeded`, not a generic provider error).
+        match &*arc {
             Error::RateLimit {
-                retry_after: Some(retry_after),
-                message: format!("mid-stream error (cloned): {arc}"),
+                retry_after,
+                message,
+            } => Error::RateLimit {
+                retry_after: *retry_after,
+                message: message.clone(),
+            },
+            Error::Auth { status, message } => Error::Auth {
+                status: *status,
+                message: message.clone(),
+            },
+            Error::ContextWindowExceeded { provider, message } => Error::ContextWindowExceeded {
+                provider,
+                message: message.clone(),
+            },
+            Error::ModelNotAvailable(s) => Error::ModelNotAvailable(s.clone()),
+            Error::InvalidPrompt(s) => Error::InvalidPrompt(s.clone()),
+            Error::Config(s) => Error::Config(s.clone()),
+            Error::Compaction { reason } => Error::Compaction {
+                reason: reason.clone(),
+            },
+            Error::UnsupportedInput { provider, modality } => {
+                Error::UnsupportedInput { provider, modality }
             }
-        } else {
-            Error::Provider {
-                provider: "Stream",
+            // Provider rebuilt from-scratch (cheaper than figuring
+            // out which fields to preserve when the most-common case
+            // is a test-supplied error anyway). Falls into the
+            // catch-all for the non-cloneable variants too
+            // (`Transport`, `Serialization`).
+            other => Error::Provider {
+                provider: "Mock",
                 status: None,
-                retryable: arc.is_retryable(),
+                retryable: other.is_retryable(),
+                retry_after: other.retry_after(),
                 message: format!("mid-stream error (cloned): {arc}"),
-            }
+            },
         }
     })
 }

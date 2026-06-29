@@ -77,7 +77,7 @@ name = "mock_provider"
 required-features = ["mock"]
 
 [dev-dependencies]
-tokio = { version = "1.40", features = ["macros", "rt", "rt-multi-thread", "process"] }
+tokio = { version = "1.40", features = ["macros", "rt", "rt-multi-thread", "process", "test-util"] }
 # Lib leaves TLS to the downstream consumer; tests/examples need to make
 # real HTTPS calls so we enable rustls-tls only here.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }

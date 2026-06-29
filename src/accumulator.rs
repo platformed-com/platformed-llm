@@ -36,7 +36,7 @@ impl ResponseAccumulator {
                     // Deterministic invariant violation from the
                     // provider's event sequence — not retryable.
                     return Err(Error::provider(
-                        "Stream",
+                        "Library",
                         format!(
                             "PartStart out of order: index={index}, parts.len()={}",
                             self.parts.len()
@@ -74,7 +74,7 @@ impl ResponseAccumulator {
             // Deterministic invariant violation from the provider's
             // event sequence — not retryable.
             Error::provider(
-                "Stream",
+                "Library",
                 format!("stream event references unknown part index {index} (have {len} parts)",),
             )
         })

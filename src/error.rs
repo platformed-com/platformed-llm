@@ -38,6 +38,11 @@ pub enum Error {
         status: Option<u16>,
         /// `true` when the operation is safe to retry (5xx or 429).
         retryable: bool,
+        /// Provider-supplied wait hint from a `Retry-After` header (or
+        /// equivalent). RFC 7231 explicitly defines `Retry-After` on
+        /// 503s as well as 429s, so 5xx responses can carry one too —
+        /// the retry helper surfaces it via [`Self::retry_after`].
+        retry_after: Option<Duration>,
         /// Provider-supplied error description.
         message: String,
     },
@@ -134,6 +139,7 @@ impl Error {
             provider,
             status: None,
             retryable: false,
+            retry_after: None,
             message: message.into(),
         }
     }
@@ -150,6 +156,30 @@ impl Error {
             provider,
             status: Some(status),
             retryable,
+            retry_after: None,
+            message: message.into(),
+        }
+    }
+
+    /// Build a provider error with an HTTP status and a
+    /// `Retry-After`-derived wait hint. Use this when a 5xx (or any
+    /// non-429 status that still carried a `Retry-After`) provides a
+    /// server-suggested backoff — surfaced via [`Self::retry_after`]
+    /// so retry policies honour it the same way they do for 429s.
+    /// For 429s use [`Self::rate_limit`] instead — that variant
+    /// preserves the distinct rate-limit shape.
+    pub fn provider_with_retry_after(
+        provider: &'static str,
+        status: u16,
+        retry_after_seconds: Option<u64>,
+        message: impl Into<String>,
+    ) -> Self {
+        let retryable = status == 429 || (500..=599).contains(&status);
+        Error::Provider {
+            provider,
+            status: Some(status),
+            retryable,
+            retry_after: retry_after_seconds.map(Duration::from_secs),
             message: message.into(),
         }
     }
@@ -250,9 +280,16 @@ impl Error {
             Error::Transport(e) => {
                 // `reqwest::Error` is a grab bag. Only the network-
                 // layer failure shapes are genuinely transient; a
-                // request-build error, a response-body decode error,
-                // or a startup `ClientBuilder` failure won't behave
-                // differently on retry.
+                // response-body decode error or a startup
+                // `ClientBuilder` failure won't behave differently on
+                // retry.
+                //
+                // `is_request()` covers the pre-flight network shapes
+                // — TLS handshake reset, connection refused at
+                // `send()`, DNS hiccup. Those are often transient and
+                // are functionally indistinguishable from
+                // `is_connect()` from a retry-policy standpoint, so
+                // they live in the same bucket.
                 //
                 // `is_body()` is intentionally *not* in the transient
                 // set: it fires both for legitimate mid-body
@@ -263,7 +300,7 @@ impl Error {
                 // false-negative (don't retry a real transient
                 // body-read drop) — the caller's own retry loop can
                 // still re-issue if it knows the operation is safe.
-                e.is_connect() || e.is_timeout()
+                e.is_connect() || e.is_timeout() || e.is_request()
             }
             Error::RateLimit { .. } => true,
             Error::Provider { retryable, .. } => *retryable,
@@ -279,15 +316,19 @@ impl Error {
     }
 
     /// Provider-suggested wait duration before retrying, parsed from a
-    /// `Retry-After` header (or equivalent) on a 429.
+    /// `Retry-After` header (or equivalent).
     ///
-    /// Returns `Some(d)` only for [`Self::RateLimit`] when the provider
-    /// supplied a hint; `None` for every other variant *and* for rate
-    /// limits with no header. Callers that get `None` from a retryable
-    /// error should fall back to their own backoff policy.
+    /// Returns `Some(d)` for [`Self::RateLimit`] *and* for
+    /// [`Self::Provider`] when the upstream supplied a hint — RFC
+    /// 7231 defines `Retry-After` on 503 as well as 429, and several
+    /// providers send it on transient 5xx. `None` for every other
+    /// variant *and* for retryable errors with no header. Callers
+    /// that get `None` from a retryable error should fall back to
+    /// their own backoff policy.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Error::RateLimit { retry_after, .. } => *retry_after,
+            Error::Provider { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -453,10 +494,22 @@ mod tests {
 
         let without_hint = Error::rate_limit(None, "slow down");
         assert_eq!(without_hint.retry_after(), None);
+    }
 
-        // Non-rate-limit variants never report a retry_after, even if
-        // they're otherwise retryable.
-        let provider_5xx = Error::provider_with_status("OpenAI", 503, "down");
-        assert_eq!(provider_5xx.retry_after(), None);
+    /// A 503 (or other retryable 5xx) that carries a `Retry-After`
+    /// must surface the hint via `retry_after()` so the helper
+    /// honours the server's instruction rather than falling back to
+    /// blind exponential backoff. RFC 7231 explicitly allows
+    /// `Retry-After` on 503, and OpenAI / Anthropic / Vertex all
+    /// send it in practice.
+    #[test]
+    fn retry_after_surfaces_provider_5xx_hint() {
+        let err = Error::provider_with_retry_after("OpenAI", 503, Some(30), "down");
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
+        assert!(err.is_retryable());
+        // Without a hint, retryability is preserved but no hint is reported.
+        let no_hint = Error::provider_with_status("OpenAI", 503, "down");
+        assert!(no_hint.is_retryable());
+        assert_eq!(no_hint.retry_after(), None);
     }
 }
