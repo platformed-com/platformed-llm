@@ -34,10 +34,15 @@
 //!   transient codes retryable (e.g. OpenAI's mid-stream
 //!   `server_error` / `server_overloaded` / `internal_error`
 //!   frames).
-//! - [`Error::Transport`] when the underlying `reqwest::Error` is
-//!   `is_connect()` / `is_timeout()` / `is_request()` — the network
-//!   shapes that fail before any body bytes arrive (TLS handshake
-//!   reset, connect timeout, DNS hiccup).
+//! - [`Error::Transport`] for any of the network failure shapes
+//!   (`is_connect()` / `is_timeout()` / `is_request()` / `is_body()`)
+//!   — TLS handshake reset, connect timeout, DNS hiccup, mid-body
+//!   connection drop. The library deliberately errs on the side of
+//!   over-retrying: `is_body()` also fires for deterministic decode
+//!   failures (gzip corruption, broken UTF-8), but in practice
+//!   mid-body connection drops dominate, and silently giving up on
+//!   them is worse than burning 4× latency on the rare bad-decode
+//!   case.
 //!
 //! Every retry is a fresh request; the helper does not attempt to
 //! "resume" a partially-streamed response.
@@ -51,20 +56,10 @@
 //!
 //! # What doesn't
 //!
-//! - Deterministic mid-stream failures: SSE parse errors (malformed
-//!   UTF-8, malformed event JSON) surface as `Error::Provider` with
-//!   `retryable: false` — re-issuing won't change the upstream's
-//!   output.
-//! - Mid-body `reqwest` drops surface as `Error::Transport` with
-//!   `is_body()` true. The library deliberately excludes `is_body()`
-//!   from the transient set because the same predicate fires for
-//!   legitimate connection drops *and* for deterministic decode
-//!   failures (gzip corruption, broken UTF-8), and we can't
-//!   distinguish them cheaply. The safer default is the false
-//!   negative — for production callers who know their stream is
-//!   safe to re-issue on any body-level error, drive
-//!   [`RetryPolicy::delay_after`] yourself and treat
-//!   `Error::Transport` as retryable in your own classifier.
+//! - Deterministic mid-stream failures classified by the provider
+//!   layer: SSE parse errors (malformed UTF-8, malformed event JSON)
+//!   surface as `Error::Provider` with `retryable: false` — re-
+//!   issuing won't change the upstream's output.
 //! - [`Error::Auth`], [`Error::Config`], [`Error::InvalidPrompt`],
 //!   [`Error::ModelNotAvailable`], [`Error::ContextWindowExceeded`],
 //!   [`Error::Compaction`] — re-issuing the same request hits the

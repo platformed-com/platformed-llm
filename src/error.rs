@@ -278,29 +278,31 @@ impl Error {
         match self {
             #[cfg(feature = "reqwest")]
             Error::Transport(e) => {
-                // `reqwest::Error` is a grab bag. Only the network-
-                // layer failure shapes are genuinely transient; a
-                // response-body decode error or a startup
-                // `ClientBuilder` failure won't behave differently on
-                // retry.
+                // `reqwest::Error` is a grab bag, and the network-
+                // shape predicates overlap. The bucket covers the
+                // failure modes that are *most often* transient even
+                // though a minority of each can be deterministic:
                 //
-                // `is_request()` covers the pre-flight network shapes
-                // — TLS handshake reset, connection refused at
-                // `send()`, DNS hiccup. Those are often transient and
-                // are functionally indistinguishable from
-                // `is_connect()` from a retry-policy standpoint, so
-                // they live in the same bucket.
+                // - `is_connect()` / `is_timeout()` / `is_request()` —
+                //   pre-flight network shapes (TLS handshake reset,
+                //   connect timeout, DNS hiccup, body-build failure
+                //   that surfaces at `send()` time).
+                // - `is_body()` — mid-body failures. These include
+                //   legitimate connection drops (the common case)
+                //   *and* deterministic decode failures (gzip
+                //   corruption, broken UTF-8). We deliberately err on
+                //   the side of over-retrying: a connection drop
+                //   mid-stream is by far the more common shape, and
+                //   silently giving up on it (the false-negative the
+                //   prior carve-out preferred) is more painful in
+                //   production than burning 4× latency on the
+                //   genuinely-corrupt-decode case.
                 //
-                // `is_body()` is intentionally *not* in the transient
-                // set: it fires both for legitimate mid-body
-                // connection drops *and* deterministic decode
-                // failures (gzip corruption, broken UTF-8). Retrying
-                // a deterministic decode failure would burn 4× the
-                // latency for the same outcome. We prefer the
-                // false-negative (don't retry a real transient
-                // body-read drop) — the caller's own retry loop can
-                // still re-issue if it knows the operation is safe.
-                e.is_connect() || e.is_timeout() || e.is_request()
+                // What stays terminal: `is_builder()` (startup config
+                // error), `is_decode()` for JSON/wire-format decode
+                // failures (we surface those as `Serialization`
+                // anyway), and anything else not in the above set.
+                e.is_connect() || e.is_timeout() || e.is_request() || e.is_body()
             }
             Error::RateLimit { .. } => true,
             Error::Provider { retryable, .. } => *retryable,
