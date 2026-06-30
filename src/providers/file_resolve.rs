@@ -119,10 +119,10 @@ fn collect_ref_ids(items: &[InputItem]) -> Vec<String> {
                 UserPart::Image(FileSource::Ref(id))
                 | UserPart::Audio(FileSource::Ref(id))
                 | UserPart::Document(FileSource::Ref(id))
-                | UserPart::Video(FileSource::Ref(id)) => {
-                    if seen.insert(id.clone()) {
-                        ids.push(id.clone());
-                    }
+                | UserPart::Video(FileSource::Ref(id))
+                    if seen.insert(id.clone()) =>
+                {
+                    ids.push(id.clone());
                 }
                 UserPart::ToolResult { content, .. } => walk(content, ids, seen),
                 _ => {}

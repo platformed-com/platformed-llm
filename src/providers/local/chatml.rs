@@ -809,7 +809,7 @@ mod tests {
         // never processed.
         let items = vec![
             Ok::<_, Error>("partial".into()),
-            Err(Error::streaming("kaboom")),
+            Err(Error::provider("Stream", "kaboom")),
             Ok(" later".into()),
         ];
         let out = futures::executor::block_on(

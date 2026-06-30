@@ -156,13 +156,18 @@ pub struct MockResponse(Repr);
 #[derive(Debug, Clone)]
 enum Repr {
     /// Synthesize events from these parts (chunking applies), then a
-    /// terminal `Done` — unless `stream_error` is set, in which case a
-    /// `StreamEvent::Error` is emitted after the content instead.
+    /// terminal `Done` — unless `stream_error` is set, in which case
+    /// the stream ends with `Err(error)` instead. The error lives
+    /// behind an `Arc` because `Error` isn't `Clone` and we need
+    /// `MockResponse: Clone` for `MockProvider::Always` mode; the
+    /// `Arc` is unwrapped (or, on the shared-ref fallback path,
+    /// rebuilt preserving retryability) when the response lowers to
+    /// events.
     Parts {
         content: Vec<AssistantPart>,
         finish_reason: FinishReason,
         usage: Usage,
-        stream_error: Option<String>,
+        stream_error: Option<std::sync::Arc<Error>>,
     },
     /// Emit these events verbatim. Chunking does *not* apply; the caller
     /// is responsible for a well-formed sequence (monotonic part indices,
@@ -232,15 +237,17 @@ impl MockResponse {
     }
 
     /// Make the turn fail *mid-stream*: after streaming any content parts,
-    /// emit a [`StreamEvent::Error`] (and no terminal `Done`), so
-    /// [`Response::buffer`] / [`Response::text`] surface an
-    /// [`Error::Streaming`]. Use this to test partial-then-failed
-    /// streaming; for a failure *before any* stream is returned, script
-    /// [`MockProviderBuilder::fail`] instead. No-op on a
-    /// [`MockResponse::raw_events`] response.
-    pub fn with_stream_error(mut self, message: impl Into<String>) -> Self {
+    /// the stream ends with `Err(err)` (and no terminal `Done`), so
+    /// [`Response::buffer`] / [`Response::text`] surface that exact
+    /// typed error. Use this to test partial-then-failed streaming
+    /// with any [`Error`] variant — e.g. `with_stream_error(
+    /// Error::rate_limit(Some(0), "overloaded"))` to simulate an
+    /// Anthropic mid-stream rate limit. For a failure *before any*
+    /// stream is returned, script [`MockProviderBuilder::fail`]
+    /// instead. No-op on a [`MockResponse::raw_events`] response.
+    pub fn with_stream_error(mut self, err: Error) -> Self {
         if let Repr::Parts { stream_error, .. } = &mut self.0 {
-            *stream_error = Some(message.into());
+            *stream_error = Some(std::sync::Arc::new(err));
         }
         self
     }
@@ -277,7 +284,7 @@ fn lower_response(resp: MockResponse, chunking: &Chunking) -> Vec<Result<StreamE
                 }
             }
             match stream_error {
-                Some(error) => out.push(Ok(StreamEvent::Error { error })),
+                Some(error) => out.push(Err(unwrap_shared_error(error))),
                 None => out.push(Ok(StreamEvent::Done {
                     finish_reason,
                     usage,
@@ -286,6 +293,79 @@ fn lower_response(resp: MockResponse, chunking: &Chunking) -> Vec<Result<StreamE
             out
         }
     }
+}
+
+/// Extract an owned [`Error`] from an [`std::sync::Arc<Error>`],
+/// preserving the inner error's variant identity wherever possible
+/// and falling back to a classification-preserving wrap when it
+/// can't.
+///
+/// `MockResponse` holds the mid-stream error behind an `Arc` so the
+/// containing response can be `Clone` (required for
+/// `MockProvider::Always` mode). At the stream-lowering boundary we
+/// try [`std::sync::Arc::try_unwrap`] first — that succeeds in
+/// `scripted` / `queue` modes where the response is popped and
+/// consumed exactly once. In `Always` mode the original `Arc` stays
+/// alive in `Mode::Always(response)` while a clone goes to the
+/// caller, so `try_unwrap` *always* fails there and we take the
+/// fallback path.
+///
+/// The fallback rebuilds the error by hand. Variants that don't
+/// carry non-`Clone` payloads (`RateLimit`, `Auth`,
+/// `ContextWindowExceeded`, `ModelNotAvailable`, `InvalidPrompt`,
+/// `Config`, `Compaction`, `UnsupportedInput`) are reconstructed
+/// faithfully so callers can match on them. The remaining variants
+/// (`Transport` — wraps a non-`Clone` `reqwest::Error`,
+/// `Serialization` — same, and `Provider` — easiest to rebuild
+/// from-scratch) collapse to a synthetic `Provider("Mock", …)`
+/// carrying the inner's `is_retryable()` verdict. Without that
+/// preservation, a shared mid-stream rate limit would silently
+/// downgrade to a non-retryable provider error and the caller's
+/// retry loop would give up.
+fn unwrap_shared_error(error: std::sync::Arc<Error>) -> Error {
+    std::sync::Arc::try_unwrap(error).unwrap_or_else(|arc| {
+        // Reconstruct cloneable variants by hand so callers can
+        // still match on the original tag (`compaction` needs to
+        // see `ContextWindowExceeded`, not a generic provider error).
+        match &*arc {
+            Error::RateLimit {
+                retry_after,
+                message,
+            } => Error::RateLimit {
+                retry_after: *retry_after,
+                message: message.clone(),
+            },
+            Error::Auth { status, message } => Error::Auth {
+                status: *status,
+                message: message.clone(),
+            },
+            Error::ContextWindowExceeded { provider, message } => Error::ContextWindowExceeded {
+                provider,
+                message: message.clone(),
+            },
+            Error::ModelNotAvailable(s) => Error::ModelNotAvailable(s.clone()),
+            Error::InvalidPrompt(s) => Error::InvalidPrompt(s.clone()),
+            Error::Config(s) => Error::Config(s.clone()),
+            Error::Compaction { reason } => Error::Compaction {
+                reason: reason.clone(),
+            },
+            Error::UnsupportedInput { provider, modality } => {
+                Error::UnsupportedInput { provider, modality }
+            }
+            // Provider rebuilt from-scratch (cheaper than figuring
+            // out which fields to preserve when the most-common case
+            // is a test-supplied error anyway). Falls into the
+            // catch-all for the non-cloneable variants too
+            // (`Transport`, `Serialization`).
+            other => Error::Provider {
+                provider: "Mock",
+                status: None,
+                retryable: other.is_retryable(),
+                retry_after: other.retry_after(),
+                message: format!("mid-stream error (cloned): {arc}"),
+            },
+        }
+    })
 }
 
 /// Push the events for one part at `index`. Returns `false` (without
@@ -603,6 +683,44 @@ mod tests {
         crate::Config::builder("test-model").build().raw().clone()
     }
 
+    /// The Arc-shared fallback path of `unwrap_shared_error` must
+    /// preserve the inner error's retryability so a downstream retry
+    /// policy still matches the source's intent. Without this, a
+    /// mid-stream `Error::RateLimit` whose Arc happened to be shared
+    /// would downgrade to a non-retryable `Provider("Stream", …)`
+    /// and the retry loop would give up.
+    #[test]
+    fn unwrap_shared_error_fallback_preserves_retry_after() {
+        let inner = std::sync::Arc::new(Error::rate_limit(Some(7), "overloaded"));
+        // Keep a second strong ref so `try_unwrap` fails.
+        let _other = inner.clone();
+        let unwrapped = unwrap_shared_error(inner);
+        match unwrapped {
+            Error::RateLimit { retry_after, .. } => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(7)));
+            }
+            other => panic!("expected RateLimit with retry_after preserved, got {other:?}"),
+        }
+    }
+
+    /// Same as above but for a transient `Provider` error: the
+    /// fallback path must carry the `retryable` flag through.
+    #[test]
+    fn unwrap_shared_error_fallback_preserves_retryable_flag() {
+        let inner = std::sync::Arc::new(Error::provider_with_status(
+            "OpenAI",
+            503,
+            "service unavailable",
+        ));
+        let _other = inner.clone();
+        let unwrapped = unwrap_shared_error(inner);
+        assert!(
+            unwrapped.is_retryable(),
+            "transient 5xx must remain retryable across the shared-Arc fallback, \
+             got {unwrapped:?}",
+        );
+    }
+
     #[tokio::test]
     async fn scripted_queue_pops_in_order() {
         let provider = MockProvider::builder()
@@ -761,7 +879,10 @@ mod tests {
     #[tokio::test]
     async fn stream_error_surfaces_after_partial_content() {
         let provider = MockProvider::builder()
-            .reply(MockResponse::text("partial").with_stream_error("connection reset"))
+            .reply(
+                MockResponse::text("partial")
+                    .with_stream_error(Error::provider("Mock", "connection reset")),
+            )
             .build();
         let err = provider
             .generate(&Prompt::user("x"), &cfg())
@@ -770,7 +891,13 @@ mod tests {
             .buffer()
             .await
             .expect_err("mid-stream error");
-        assert!(matches!(err, Error::Streaming(_)));
+        assert!(matches!(
+            err,
+            Error::Provider {
+                provider: "Mock",
+                ..
+            }
+        ));
         assert!(err.to_string().contains("connection reset"));
     }
 

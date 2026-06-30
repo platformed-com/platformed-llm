@@ -457,9 +457,15 @@ pub(crate) fn parse_openai_error(
             retry_after_seconds,
             format!("OpenAI 429 ({kind} {code}): {message}"),
         ),
-        _ => Error::provider_with_status(
+        // RFC 7231 explicitly defines `Retry-After` on 503 (and it
+        // shows up on other 5xx in practice); surface it via
+        // `Error::Provider.retry_after` so the retry helper honours
+        // the server's instruction rather than blind exponential
+        // backoff.
+        _ => Error::provider_with_retry_after(
             "OpenAI",
             status,
+            retry_after_seconds,
             format!("HTTP {status} ({kind} {code}): {message}"),
         ),
     }
@@ -784,10 +790,28 @@ impl OpenAIStreamState {
                         format!("{}: {}", error.r#type, error.message),
                     ));
                 }
-                Err(Error::provider(
-                    "OpenAI",
-                    format!("{}: {}", error.r#type, error.message),
-                ))
+                // Mid-stream transient codes mirror the *pre*-stream
+                // 5xx classification: a `server_error` /
+                // `server_overloaded` / `internal_error` frame is the
+                // same upstream condition the HTTP layer would
+                // surface as a 5xx, so the retryable verdict should
+                // match. Without this, a transient blip mid-stream
+                // becomes terminal where the same blip pre-stream
+                // would retry cleanly.
+                let retryable = matches!(
+                    error.r#type.as_str(),
+                    "server_error" | "server_overloaded" | "internal_error"
+                ) || matches!(
+                    error.code.as_deref(),
+                    Some("server_error" | "server_overloaded" | "internal_error")
+                );
+                Err(Error::Provider {
+                    provider: "OpenAI",
+                    status: None,
+                    retryable,
+                    retry_after: None,
+                    message: format!("{}: {}", error.r#type, error.message),
+                })
             }
 
             // `response.id` is stable across created/in_progress/
@@ -968,9 +992,10 @@ impl OpenAIStreamState {
                 }
                 let key = (output_index, None);
                 let index = self.tracker.index_of(&key).ok_or_else(|| {
-                    Error::streaming(format!(
-                        "function_call_arguments.delta for unknown tool part {key:?}"
-                    ))
+                    Error::provider(
+                        "OpenAI",
+                        format!("function_call_arguments.delta for unknown tool part {key:?}"),
+                    )
                 })?;
                 self.fn_args_streamed.insert(key);
                 Ok(vec![StreamEvent::Delta { index, delta }])
@@ -983,7 +1008,10 @@ impl OpenAIStreamState {
             } => {
                 let key = (output_index, Some(content_index));
                 let index = self.tracker.index_of(&key).ok_or_else(|| {
-                    Error::streaming(format!("annotation.added for unknown content part {key:?}"))
+                    Error::provider(
+                        "OpenAI",
+                        format!("annotation.added for unknown content part {key:?}"),
+                    )
                 })?;
                 let Some(annotation) = map_openai_annotation(annotation) else {
                     return Ok(vec![]);
@@ -1025,20 +1053,33 @@ impl OpenAIStreamState {
                 Ok(out)
             }
             OpenAIStreamEvent::ResponseFailed { response, error } => {
-                let message = response
+                let inner_error = response
                     .as_ref()
                     .and_then(|r| r.error.as_ref())
+                    .or(error.as_ref());
+                let message = inner_error
                     .map(|e| format!("{}: {}", e.r#type, e.message))
-                    .or_else(|| {
-                        error
-                            .as_ref()
-                            .map(|e| format!("{}: {}", e.r#type, e.message))
-                    })
                     .unwrap_or_else(|| "response failed without error details".to_string());
-                Err(Error::provider(
-                    "OpenAI",
-                    format!("response.failed — {message}"),
-                ))
+                // Same retryable-by-transient-type rule as the
+                // mid-stream `error` frame: a `server_error` /
+                // `server_overloaded` / `internal_error` is the
+                // streaming counterpart of a pre-stream 5xx.
+                let retryable = inner_error.is_some_and(|e| {
+                    matches!(
+                        e.r#type.as_str(),
+                        "server_error" | "server_overloaded" | "internal_error"
+                    ) || matches!(
+                        e.code.as_deref(),
+                        Some("server_error" | "server_overloaded" | "internal_error")
+                    )
+                });
+                Err(Error::Provider {
+                    provider: "OpenAI",
+                    status: None,
+                    retryable,
+                    retry_after: None,
+                    message: format!("response.failed — {message}"),
+                })
             }
 
             // Final-canonical-value / lifecycle frames whose payload
@@ -1075,9 +1116,10 @@ impl OpenAIStreamState {
         }
         let key = (output_index, Some(content_index));
         let index = self.tracker.index_of(&key).ok_or_else(|| {
-            Error::streaming(format!(
-                "{kind_label}.delta for unknown content part {key:?}"
-            ))
+            Error::provider(
+                "OpenAI",
+                format!("{kind_label}.delta for unknown content part {key:?}"),
+            )
         })?;
         Ok(vec![StreamEvent::Delta { index, delta }])
     }
@@ -1106,9 +1148,10 @@ impl OpenAIStreamState {
             let (idx, start) = self.tracker.open(key, PartKind::Reasoning);
             return Ok(vec![start, StreamEvent::Delta { index: idx, delta }]);
         }
-        Err(Error::streaming(format!(
-            "reasoning delta for unknown reasoning part {key:?}"
-        )))
+        Err(Error::provider(
+            "OpenAI",
+            format!("reasoning delta for unknown reasoning part {key:?}"),
+        ))
     }
 }
 
@@ -1282,7 +1325,7 @@ impl Provider for OpenAIProvider {
         let state_for_stream = state.clone();
         let event_stream = response
             .body
-            .sse_events()
+            .sse_events("OpenAI")
             .map(move |sse_result| -> Result<Vec<StreamEvent>, Error> {
                 let sse_event = sse_result?;
                 trace!(event = ?sse_event, "received OpenAI SSE event");
@@ -1292,7 +1335,7 @@ impl Provider for OpenAIProvider {
                 // panicking this task too.
                 let mut guard = state_for_stream
                     .lock()
-                    .map_err(|_| Error::streaming("OpenAI stream state lock poisoned"))?;
+                    .map_err(|_| Error::provider("OpenAI", "stream state lock poisoned"))?;
                 guard.process(stream_event)
             })
             .flat_map(|result| match result {
@@ -1429,8 +1472,13 @@ mod tests {
     /// `context_length_exceeded` must still fall through to the
     /// generic `Error::Provider` path — the typed variant is reserved
     /// for the one signal compaction callers care about.
+    /// Transient codes (`server_error`, `server_overloaded`,
+    /// `internal_error`) carry `retryable: true` so the retry helper
+    /// honours them — mirroring the pre-stream 5xx classification.
+    /// Without that, a mid-stream blip would become terminal where
+    /// the same blip pre-stream would retry cleanly.
     #[test]
-    fn in_stream_unrelated_error_stays_generic_provider() {
+    fn in_stream_transient_error_stays_generic_but_retryable() {
         use crate::providers::openai::types::ErrorDetails;
         let mut state = OpenAIStreamState::new();
         let err = state
@@ -1445,8 +1493,42 @@ mod tests {
             .expect_err("Error event must produce an Err");
         match err {
             Error::Provider {
-                provider: "OpenAI", ..
-            } => {}
+                provider: "OpenAI",
+                retryable,
+                ..
+            } => {
+                assert!(
+                    retryable,
+                    "transient mid-stream server_error must be retryable to mirror pre-stream 5xx",
+                );
+            }
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
+    /// In-stream `Error` events for *non-transient* codes (e.g.
+    /// `invalid_request_error` other than context-length) must stay
+    /// non-retryable — a malformed request won't fix itself on retry.
+    #[test]
+    fn in_stream_non_transient_error_stays_non_retryable() {
+        use crate::providers::openai::types::ErrorDetails;
+        let mut state = OpenAIStreamState::new();
+        let err = state
+            .process(OpenAIStreamEvent::Error {
+                error: ErrorDetails {
+                    message: "bad parameter".to_string(),
+                    r#type: "invalid_request_error".to_string(),
+                    param: Some("max_tokens".to_string()),
+                    code: Some("invalid_value".to_string()),
+                },
+            })
+            .expect_err("Error event must produce an Err");
+        match err {
+            Error::Provider {
+                provider: "OpenAI",
+                retryable,
+                ..
+            } => assert!(!retryable, "deterministic 4xx must not be retryable"),
             other => panic!("expected Provider, got {other:?}"),
         }
     }

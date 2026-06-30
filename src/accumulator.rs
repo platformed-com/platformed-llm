@@ -33,10 +33,15 @@ impl ResponseAccumulator {
         match event {
             StreamEvent::PartStart { index, kind } => {
                 if index as usize != self.parts.len() {
-                    return Err(Error::streaming(format!(
-                        "PartStart out of order: index={index}, parts.len()={}",
-                        self.parts.len()
-                    )));
+                    // Deterministic invariant violation from the
+                    // provider's event sequence — not retryable.
+                    return Err(Error::provider(
+                        "Library",
+                        format!(
+                            "PartStart out of order: index={index}, parts.len()={}",
+                            self.parts.len()
+                        ),
+                    ));
                 }
                 self.parts.push(open_part(kind));
             }
@@ -59,9 +64,6 @@ impl ResponseAccumulator {
                 self.finish_reason = Some(finish_reason);
                 self.usage = Some(usage);
             }
-            StreamEvent::Error { error } => {
-                return Err(Error::streaming(error));
-            }
         }
         Ok(())
     }
@@ -69,9 +71,12 @@ impl ResponseAccumulator {
     fn part_mut(&mut self, index: u32) -> Result<&mut AssistantPart, Error> {
         let len = self.parts.len();
         self.parts.get_mut(index as usize).ok_or_else(|| {
-            Error::streaming(format!(
-                "stream event references unknown part index {index} (have {len} parts)",
-            ))
+            // Deterministic invariant violation from the provider's
+            // event sequence — not retryable.
+            Error::provider(
+                "Library",
+                format!("stream event references unknown part index {index} (have {len} parts)",),
+            )
         })
     }
 

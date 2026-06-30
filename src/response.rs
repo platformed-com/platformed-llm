@@ -120,15 +120,10 @@ impl Response {
         let mut stream = self.stream;
         while let Some(event_result) = stream.next().await {
             let event = event_result?;
-            match &event {
-                StreamEvent::Error { error } => {
-                    return Err(Error::streaming(error.clone()));
-                }
-                StreamEvent::Done { .. } => {
-                    accumulator.process_event(event)?;
-                    break;
-                }
-                _ => accumulator.process_event(event)?,
+            let done = matches!(event, StreamEvent::Done { .. });
+            accumulator.process_event(event)?;
+            if done {
+                break;
             }
         }
         accumulator.finalize()
@@ -161,19 +156,11 @@ impl Response {
         let mut stream = self.stream;
         while let Some(event_result) = stream.next().await {
             let event = event_result?;
-            match &event {
-                StreamEvent::Done { .. } => {
-                    events.push(event.clone());
-                    accumulator.process_event(event)?;
-                    break;
-                }
-                StreamEvent::Error { error } => {
-                    return Err(Error::streaming(error.clone()));
-                }
-                _ => {
-                    events.push(event.clone());
-                    accumulator.process_event(event)?;
-                }
+            let done = matches!(event, StreamEvent::Done { .. });
+            events.push(event.clone());
+            accumulator.process_event(event)?;
+            if done {
+                break;
             }
         }
 
@@ -214,8 +201,13 @@ mod tests {
         assert_eq!(text, "Test response");
     }
 
+    /// A mid-stream `Err` must propagate out of `buffer` and discard
+    /// any events that arrive after it — including a `Done`. Without
+    /// the short-circuit, a malformed provider that emitted both an
+    /// `Err` *and* a `Done` could trick callers into seeing a
+    /// successful finish.
     #[tokio::test]
-    async fn buffer_propagates_mid_stream_error() {
+    async fn buffer_propagates_mid_stream_error_and_stops_at_err() {
         let events: Vec<Result<StreamEvent, Error>> = vec![
             Ok(StreamEvent::PartStart {
                 index: 0,
@@ -225,7 +217,8 @@ mod tests {
                 index: 0,
                 delta: "partial".to_string(),
             }),
-            Err(Error::streaming("connection reset mid-stream")),
+            Err(Error::provider("OpenAI", "connection reset mid-stream")),
+            // A spurious post-error Done that buffer() must NOT see.
             Ok(StreamEvent::Done {
                 finish_reason: FinishReason::Stop,
                 usage: Usage::default(),
@@ -233,32 +226,17 @@ mod tests {
         ];
         let stream = futures_util::stream::iter(events);
         let err = Response::from_stream(stream).buffer().await.expect_err("");
-        assert!(matches!(err, Error::Streaming(_)));
+        assert!(
+            matches!(
+                err,
+                Error::Provider {
+                    provider: "OpenAI",
+                    ..
+                }
+            ),
+            "must propagate the upstream provider name, got {err:?}",
+        );
         assert!(err.to_string().contains("connection reset"));
-    }
-
-    #[tokio::test]
-    async fn buffer_propagates_stream_error_event() {
-        let events: Vec<Result<StreamEvent, Error>> = vec![
-            Ok(StreamEvent::PartStart {
-                index: 0,
-                kind: PartKind::Text,
-            }),
-            Ok(StreamEvent::Delta {
-                index: 0,
-                delta: "partial".to_string(),
-            }),
-            Ok(StreamEvent::Error {
-                error: "model internal error".to_string(),
-            }),
-            Ok(StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-                usage: Usage::default(),
-            }),
-        ];
-        let stream = futures_util::stream::iter(events);
-        let err = Response::from_stream(stream).buffer().await.expect_err("");
-        assert!(err.to_string().contains("model internal error"));
     }
 
     #[test]

@@ -324,14 +324,19 @@ fn rewrite_synth_tool_stream(
                                 usage,
                             }))
                         } else {
-                            Some(Err(Error::streaming(
+                            // Provider-agnostic middleware-layer
+                            // failure — the model didn't comply with
+                            // our coercion polyfill. Not retryable;
+                            // a fresh request would likely produce
+                            // the same uncoercible output.
+                            Some(Err(Error::provider(
+                                "Library",
                                 "json_coercion: model did not invoke the structured-response \
                                  tool and made no other tool call — the request asked for \
                                  structured output but the model returned free-form text",
                             )))
                         }
                     }
-                    StreamEvent::Error { error } => Some(Ok(StreamEvent::Error { error })),
                 }
             })
             .filter_map(futures_util::future::ready),
@@ -1038,7 +1043,14 @@ mod tests {
             .buffer()
             .await
             .expect_err("free-text-only response should error");
-        assert!(matches!(err, Error::Streaming(_)));
+        assert!(matches!(
+            err,
+            Error::Provider {
+                provider: "Library",
+                retryable: false,
+                ..
+            }
+        ));
         assert!(err.to_string().contains("structured output"), "got: {err}");
     }
 }

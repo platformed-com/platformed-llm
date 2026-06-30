@@ -38,6 +38,11 @@ pub enum Error {
         status: Option<u16>,
         /// `true` when the operation is safe to retry (5xx or 429).
         retryable: bool,
+        /// Provider-supplied wait hint from a `Retry-After` header (or
+        /// equivalent). RFC 7231 explicitly defines `Retry-After` on
+        /// 503s as well as 429s, so 5xx responses can carry one too —
+        /// the retry helper surfaces it via [`Self::retry_after`].
+        retry_after: Option<Duration>,
         /// Provider-supplied error description.
         message: String,
     },
@@ -57,10 +62,6 @@ pub enum Error {
     /// `functionResponse` count.
     #[error("invalid prompt: {0}")]
     InvalidPrompt(String),
-
-    /// Mid-stream / SSE parsing failure.
-    #[error("streaming error: {0}")]
-    Streaming(String),
 
     /// Rate limit hit (HTTP 429). `retry_after` is the parsed
     /// `Retry-After` header or equivalent, if any.
@@ -138,6 +139,7 @@ impl Error {
             provider,
             status: None,
             retryable: false,
+            retry_after: None,
             message: message.into(),
         }
     }
@@ -154,6 +156,30 @@ impl Error {
             provider,
             status: Some(status),
             retryable,
+            retry_after: None,
+            message: message.into(),
+        }
+    }
+
+    /// Build a provider error with an HTTP status and a
+    /// `Retry-After`-derived wait hint. Use this when a 5xx (or any
+    /// non-429 status that still carried a `Retry-After`) provides a
+    /// server-suggested backoff — surfaced via [`Self::retry_after`]
+    /// so retry policies honour it the same way they do for 429s.
+    /// For 429s use [`Self::rate_limit`] instead — that variant
+    /// preserves the distinct rate-limit shape.
+    pub fn provider_with_retry_after(
+        provider: &'static str,
+        status: u16,
+        retry_after_seconds: Option<u64>,
+        message: impl Into<String>,
+    ) -> Self {
+        let retryable = status == 429 || (500..=599).contains(&status);
+        Error::Provider {
+            provider,
+            status: Some(status),
+            retryable,
+            retry_after: retry_after_seconds.map(Duration::from_secs),
             message: message.into(),
         }
     }
@@ -183,11 +209,6 @@ impl Error {
             status: Some(status),
             message: message.into(),
         }
-    }
-
-    /// Build a streaming error (SSE parse failure, out-of-order events, etc.).
-    pub fn streaming(message: impl Into<String>) -> Self {
-        Error::Streaming(message.into())
     }
 
     /// Build a rate-limit error. `retry_after_seconds` is parsed from
@@ -221,6 +242,97 @@ impl Error {
     /// can't accept (e.g. `("OpenAI", "audio")`).
     pub fn unsupported_input(provider: &'static str, modality: &'static str) -> Self {
         Error::UnsupportedInput { provider, modality }
+    }
+
+    /// Whether this error represents a transient failure where
+    /// re-issuing the same request is likely to behave differently
+    /// next time.
+    ///
+    /// Returns `true` for [`Self::RateLimit`], for [`Self::Transport`]
+    /// **only when** the wrapped `reqwest::Error` is a connect or
+    /// timeout failure (the unambiguously transient network shapes
+    /// — request-build, body-read, decode, and startup errors stay
+    /// terminal because they could equally be deterministic bugs),
+    /// and for [`Self::Provider`] when its `retryable` flag is set
+    /// (5xx / 429, mid-stream connection-drop errors that we
+    /// classified as transient at their site). All other variants
+    /// are terminal — re-issuing the same request won't change the
+    /// outcome (bad auth, malformed prompt, model unavailable,
+    /// context-window-exceeded, etc.).
+    ///
+    /// **"Retryable" is not the same as "safe to retry without
+    /// thought."** Every retry is a fresh request — the model's
+    /// reply may diverge from whatever the first attempt streamed.
+    /// If the caller has already shown partial output to a user or
+    /// committed it downstream, the new attempt's output won't
+    /// stitch cleanly with what was shown. That's a caller-policy
+    /// concern — pre-stream vs mid-stream timing isn't a variant
+    /// property.
+    ///
+    /// Pair this with [`Self::retry_after`] when building a manual
+    /// retry loop, or hand off to [`crate::retry()`] /
+    /// [`crate::RetryPolicy`] which package both into a closure-based
+    /// helper. See the [`mod@crate::retry`] module docs for the
+    /// buffered vs streaming patterns.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            #[cfg(feature = "reqwest")]
+            Error::Transport(e) => {
+                // `reqwest::Error` is a grab bag, and the network-
+                // shape predicates overlap. The bucket covers the
+                // failure modes that are *most often* transient even
+                // though a minority of each can be deterministic:
+                //
+                // - `is_connect()` / `is_timeout()` / `is_request()` —
+                //   pre-flight network shapes (TLS handshake reset,
+                //   connect timeout, DNS hiccup, body-build failure
+                //   that surfaces at `send()` time).
+                // - `is_body()` — mid-body failures. These include
+                //   legitimate connection drops (the common case)
+                //   *and* deterministic decode failures (gzip
+                //   corruption, broken UTF-8). We deliberately err on
+                //   the side of over-retrying: a connection drop
+                //   mid-stream is by far the more common shape, and
+                //   silently giving up on it (the false-negative the
+                //   prior carve-out preferred) is more painful in
+                //   production than burning 4× latency on the
+                //   genuinely-corrupt-decode case.
+                //
+                // What stays terminal: `is_builder()` (startup config
+                // error), `is_decode()` for JSON/wire-format decode
+                // failures (we surface those as `Serialization`
+                // anyway), and anything else not in the above set.
+                e.is_connect() || e.is_timeout() || e.is_request() || e.is_body()
+            }
+            Error::RateLimit { .. } => true,
+            Error::Provider { retryable, .. } => *retryable,
+            Error::Auth { .. }
+            | Error::Serialization(_)
+            | Error::Config(_)
+            | Error::InvalidPrompt(_)
+            | Error::ModelNotAvailable(_)
+            | Error::ContextWindowExceeded { .. }
+            | Error::UnsupportedInput { .. }
+            | Error::Compaction { .. } => false,
+        }
+    }
+
+    /// Provider-suggested wait duration before retrying, parsed from a
+    /// `Retry-After` header (or equivalent).
+    ///
+    /// Returns `Some(d)` for [`Self::RateLimit`] *and* for
+    /// [`Self::Provider`] when the upstream supplied a hint — RFC
+    /// 7231 defines `Retry-After` on 503 as well as 429, and several
+    /// providers send it on transient 5xx. `None` for every other
+    /// variant *and* for retryable errors with no header. Callers
+    /// that get `None` from a retryable error should fall back to
+    /// their own backoff policy.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Error::RateLimit { retry_after, .. } => *retry_after,
+            Error::Provider { retry_after, .. } => *retry_after,
+            _ => None,
+        }
     }
 }
 
@@ -353,5 +465,53 @@ mod tests {
         let err = Error::config("Invalid model name");
         assert!(err.to_string().contains("invalid configuration"));
         assert!(err.to_string().contains("Invalid model name"));
+    }
+
+    #[test]
+    fn is_retryable_covers_transient_variants() {
+        assert!(Error::rate_limit(Some(5), "slow down").is_retryable());
+        assert!(Error::rate_limit(None, "slow down").is_retryable());
+        assert!(Error::provider_with_status("OpenAI", 503, "down").is_retryable());
+        assert!(Error::provider_with_status("OpenAI", 429, "slow").is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_rejects_terminal_variants() {
+        // Status-bearing 4xx that aren't 429 are explicitly non-retryable.
+        assert!(!Error::provider_with_status("OpenAI", 400, "bad").is_retryable());
+        assert!(!Error::provider("OpenAI", "default non-retryable").is_retryable());
+        assert!(!Error::auth("bad key").is_retryable());
+        assert!(!Error::auth_with_status(401, "bad key").is_retryable());
+        assert!(!Error::config("nope").is_retryable());
+        assert!(!Error::invalid_prompt("nope").is_retryable());
+        assert!(!Error::ModelNotAvailable("gpt-x".into()).is_retryable());
+        assert!(!Error::context_window_exceeded("OpenAI", "too long").is_retryable());
+        assert!(!Error::compaction("empty memo").is_retryable());
+    }
+
+    #[test]
+    fn retry_after_surfaces_rate_limit_hint() {
+        let with_hint = Error::rate_limit(Some(42), "slow down");
+        assert_eq!(with_hint.retry_after(), Some(Duration::from_secs(42)));
+
+        let without_hint = Error::rate_limit(None, "slow down");
+        assert_eq!(without_hint.retry_after(), None);
+    }
+
+    /// A 503 (or other retryable 5xx) that carries a `Retry-After`
+    /// must surface the hint via `retry_after()` so the helper
+    /// honours the server's instruction rather than falling back to
+    /// blind exponential backoff. RFC 7231 explicitly allows
+    /// `Retry-After` on 503, and OpenAI / Anthropic / Vertex all
+    /// send it in practice.
+    #[test]
+    fn retry_after_surfaces_provider_5xx_hint() {
+        let err = Error::provider_with_retry_after("OpenAI", 503, Some(30), "down");
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
+        assert!(err.is_retryable());
+        // Without a hint, retryability is preserved but no hint is reported.
+        let no_hint = Error::provider_with_status("OpenAI", 503, "down");
+        assert!(no_hint.is_retryable());
+        assert_eq!(no_hint.retry_after(), None);
     }
 }

@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use platformed_llm::accumulator::ResponseAccumulator;
-use platformed_llm::{generate, Config, Error, Prompt, ProviderFactory};
+use platformed_llm::{generate, retry, Config, Error, Prompt, ProviderFactory, RetryPolicy};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -41,48 +41,37 @@ async fn main() -> Result<(), Error> {
 
     println!("📡 Making request...");
 
-    // Generate response
-    match generate(&*provider, &conversation, &cfg).await {
-        Ok(response) => {
-            println!("✅ Request succeeded");
-
-            // Test direct text method
-            let response_clone = generate(&*provider, &conversation, &cfg).await?;
-            let text = response_clone.text().await?;
-            println!("📄 Direct text result: '{text}'");
-            println!("📄 Text length: {}", text.len());
-
-            // Test streaming
-            let mut stream = response.stream();
-            let mut accumulator = ResponseAccumulator::new();
-            let mut event_count = 0;
-
-            println!("📥 Stream events:");
-            while let Some(event_result) = stream.next().await {
-                event_count += 1;
-                match event_result {
-                    Ok(event) => {
-                        println!("  #{event_count}: {event:?}");
-                        accumulator.process_event(event)?;
-                    }
-                    Err(e) => {
-                        println!("  Error #{event_count}: {e}");
-                        return Err(e);
-                    }
-                }
-            }
-
-            println!("🏁 {event_count} total events");
-
-            let complete_response = accumulator.finalize()?;
-            let text = complete_response.text();
-            println!("📄 Accumulated content: '{text}'");
+    // Wrap the entire generate-and-stream-consumption in `retry` so
+    // a transient 429 / 5xx / mid-stream connection drop restarts
+    // cleanly. The closure is the unit of retry: any state it owns
+    // (the event counter, the accumulator) is discarded on each
+    // attempt, so a partial stream from a previous attempt can't
+    // leak into the accumulated text. `retry` honours `Retry-After`
+    // via the policy and gives up on terminal errors (auth, bad
+    // config, …).
+    let policy = RetryPolicy::standard();
+    let text = retry(policy, async |attempt| {
+        if attempt > 1 {
+            println!("🔁 retry attempt {attempt}");
         }
-        Err(e) => {
-            println!("❌ Request failed: {e}");
-            return Err(e);
+        let response = generate(&*provider, &conversation, &cfg).await?;
+        let mut stream = response.stream();
+        let mut accumulator = ResponseAccumulator::new();
+        let mut event_count = 0;
+        println!("📥 Stream events:");
+        while let Some(event) = stream.next().await {
+            event_count += 1;
+            let event = event?;
+            println!("  #{event_count}: {event:?}");
+            accumulator.process_event(event)?;
         }
-    }
+        println!("🏁 {event_count} total events");
+        Ok(accumulator.finalize()?.text())
+    })
+    .await?;
+
+    println!("📄 Accumulated content: '{text}'");
+    println!("📄 Text length: {}", text.len());
 
     Ok(())
 }

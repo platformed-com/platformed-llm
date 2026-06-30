@@ -55,12 +55,6 @@ pub enum StreamEvent {
         /// Final usage counters for the turn.
         usage: Usage,
     },
-
-    /// Mid-stream fatal error.
-    Error {
-        /// Human-readable error description.
-        error: String,
-    },
 }
 
 /// Kind of part being streamed. Mirrors [`crate::AssistantPart`] but in

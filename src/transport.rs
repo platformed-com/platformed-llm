@@ -287,7 +287,7 @@ impl TransportImpl for ReqwestTransport {
         // the connection — preserving the cancellation contract.
         let body = response
             .bytes_stream()
-            .map(|chunk| chunk.map_err(|e| Error::streaming(format!("transport: {e}"))));
+            .map(|chunk| chunk.map_err(Error::from));
         let body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> = Box::pin(body);
 
         Ok(TransportResponse {
@@ -326,7 +326,7 @@ impl TransportImpl for ReqwestTransport {
             .collect();
         let body = response
             .bytes_stream()
-            .map(|chunk| chunk.map_err(|e| Error::streaming(format!("transport: {e}"))));
+            .map(|chunk| chunk.map_err(Error::from));
         let body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> = Box::pin(body);
 
         Ok(TransportResponse {

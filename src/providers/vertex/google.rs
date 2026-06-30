@@ -822,14 +822,20 @@ impl Provider for GoogleProvider {
                     retry_after,
                     format!("Google 429 (RESOURCE_EXHAUSTED): {body_text}"),
                 ),
-                _ => {
-                    Error::provider_with_status("Google", status, format!("API error: {body_text}"))
-                }
+                // 5xx (and any other status) may carry a
+                // `Retry-After` per RFC 7231; thread it through so
+                // the retry helper honours the server hint.
+                _ => Error::provider_with_retry_after(
+                    "Google",
+                    status,
+                    retry_after,
+                    format!("API error: {body_text}"),
+                ),
             });
         }
 
         // Create SSE stream from response (Gemini supports ?alt=sse)
-        let sse_stream = SseStream::new(response.body);
+        let sse_stream = SseStream::new("Google", response.body);
 
         // Create a stateful processor for tracking output items
         let mut state = GoogleStreamState::default();
