@@ -26,8 +26,19 @@
 //! # What gets retried
 //!
 //! The policy retries any error for which [`Error::is_retryable`]
-//! returns `true` — rate limits, transient 5xx / 429, transport
-//! errors, and mid-stream failures (SSE parse / connection drop).
+//! returns `true`:
+//!
+//! - [`Error::RateLimit`] — 429s.
+//! - [`Error::Provider`] with `retryable: true` — typically 5xx
+//!   responses; each hosted provider also marks specific mid-stream
+//!   transient codes retryable (e.g. OpenAI's mid-stream
+//!   `server_error` / `server_overloaded` / `internal_error`
+//!   frames).
+//! - [`Error::Transport`] when the underlying `reqwest::Error` is
+//!   `is_connect()` / `is_timeout()` / `is_request()` — the network
+//!   shapes that fail before any body bytes arrive (TLS handshake
+//!   reset, connect timeout, DNS hiccup).
+//!
 //! Every retry is a fresh request; the helper does not attempt to
 //! "resume" a partially-streamed response.
 //!
@@ -40,11 +51,24 @@
 //!
 //! # What doesn't
 //!
-//! [`Error::Auth`], [`Error::Config`], [`Error::InvalidPrompt`],
-//! [`Error::ModelNotAvailable`], [`Error::ContextWindowExceeded`],
-//! [`Error::Compaction`], and [`Error::Provider`] with `retryable:
-//! false` are terminal — re-issuing the same request hits the same
-//! error. The helper propagates them on the first failure.
+//! - Deterministic mid-stream failures: SSE parse errors (malformed
+//!   UTF-8, malformed event JSON) surface as `Error::Provider` with
+//!   `retryable: false` — re-issuing won't change the upstream's
+//!   output.
+//! - Mid-body `reqwest` drops surface as `Error::Transport` with
+//!   `is_body()` true. The library deliberately excludes `is_body()`
+//!   from the transient set because the same predicate fires for
+//!   legitimate connection drops *and* for deterministic decode
+//!   failures (gzip corruption, broken UTF-8), and we can't
+//!   distinguish them cheaply. The safer default is the false
+//!   negative — for production callers who know their stream is
+//!   safe to re-issue on any body-level error, drive
+//!   [`RetryPolicy::delay_after`] yourself and treat
+//!   `Error::Transport` as retryable in your own classifier.
+//! - [`Error::Auth`], [`Error::Config`], [`Error::InvalidPrompt`],
+//!   [`Error::ModelNotAvailable`], [`Error::ContextWindowExceeded`],
+//!   [`Error::Compaction`] — re-issuing the same request hits the
+//!   same error.
 //!
 //! `ContextWindowExceeded` in particular should be paired with
 //! [`crate::Compactor`] (see the `auto_compaction` example), not
@@ -125,12 +149,19 @@ impl RetryPolicy {
     /// just surfaced. Returns `None` if the error is terminal or
     /// attempts are exhausted — the caller propagates the error.
     ///
-    /// Honours [`Error::retry_after`] when set; otherwise applies
-    /// exponential backoff:
-    /// `initial_backoff * backoff_multiplier^(attempt - 1)`. The
-    /// result is capped at [`Self::max_backoff`] either way, then
-    /// (if [`Self::jitter`] is non-zero) shaved by a random
-    /// fraction.
+    /// When [`Error::retry_after`] is set the server's hint is
+    /// honoured *verbatim* (capped at [`Self::max_backoff`]); jitter
+    /// is deliberately **not** applied to it. The hint is a server-
+    /// imposed floor — waiting less just guarantees another 429 — so
+    /// shaving a random fraction off would burn attempts. Jitter is
+    /// designed to *decorrelate* clients above a server-imposed
+    /// floor, not below it, so it only applies to the exponential
+    /// branch where the schedule is library-chosen.
+    ///
+    /// Without a hint, applies exponential backoff:
+    /// `initial_backoff * backoff_multiplier^(attempt - 1)`, capped
+    /// at [`Self::max_backoff`] and (if [`Self::jitter`] is non-zero)
+    /// shaved by a random fraction.
     ///
     /// `attempt` is the 1-indexed attempt number that just failed.
     /// `1` after the first failure, `2` after the second, …
@@ -139,8 +170,10 @@ impl RetryPolicy {
     /// caller setting nonsense values (`NaN`, negative multiplier,
     /// overflow, `max_backoff = Duration::MAX`) saturates here
     /// rather than panicking. The clamp uses
-    /// `Duration::try_from_secs_f64` so the policy-shaped float can
-    /// never reach `from_secs_f64`'s panic preconditions.
+    /// `Duration::try_from_secs_f64` throughout so the policy-shaped
+    /// float can never reach `from_secs_f64`'s panic preconditions —
+    /// including inside `apply_jitter`, where multiplying
+    /// `Duration::MAX` by a near-1.0 factor would otherwise overflow.
     pub fn delay_after(&self, err: &Error, attempt: u32) -> Option<Duration> {
         // `attempt` is documented as 1-indexed (1 after the first
         // failure). `0` is undefined input from this method's POV
@@ -150,20 +183,29 @@ impl RetryPolicy {
         if attempt == 0 || !err.is_retryable() || attempt >= self.max_attempts {
             return None;
         }
-        let nominal = err.retry_after().unwrap_or_else(|| {
-            let base = self.initial_backoff.as_secs_f64();
-            let mult = self.backoff_multiplier.powi((attempt as i32) - 1);
-            let secs = base * mult;
-            // `try_from_secs_f64` returns `Err` for NaN, negative,
-            // and `> u64::MAX` (the three panic preconditions of
-            // `from_secs_f64`). On any failure mode, fall back to
-            // `max_backoff` — capping is the only safe choice when
-            // the computed delay isn't a finite, representable
-            // duration.
-            Duration::try_from_secs_f64(secs).unwrap_or(self.max_backoff)
-        });
-        let capped = nominal.min(self.max_backoff);
-        Some(apply_jitter(capped, self.jitter))
+        let raw = match err.retry_after() {
+            // Server-supplied hint: honour as a floor — never jitter
+            // *below* it (jitter cuts the wait short, the next attempt
+            // re-trips the same 429, burning the retry budget without
+            // making progress).
+            Some(hint) => hint,
+            None => {
+                // Library-chosen exponential schedule: cap, then apply
+                // jitter to decorrelate clients sharing an upstream.
+                let base = self.initial_backoff.as_secs_f64();
+                let mult = self.backoff_multiplier.powi((attempt as i32) - 1);
+                let secs = base * mult;
+                // `try_from_secs_f64` returns `Err` for NaN, negative,
+                // and `> u64::MAX` (the three panic preconditions of
+                // `from_secs_f64`). On any failure mode, fall back to
+                // `max_backoff` — capping is the only safe choice when
+                // the computed delay isn't a finite, representable
+                // duration.
+                let exponential = Duration::try_from_secs_f64(secs).unwrap_or(self.max_backoff);
+                apply_jitter(exponential.min(self.max_backoff), self.jitter)
+            }
+        };
+        Some(raw.min(self.max_backoff))
     }
 }
 
@@ -171,14 +213,21 @@ impl RetryPolicy {
 /// Result is `delay * (1 - jitter * rand())` where `rand() ∈ [0, 1)`.
 /// Zero `jitter` returns `delay` unchanged — important so the
 /// deterministic-test path doesn't touch the RNG.
+///
+/// Uses `Duration::try_from_secs_f64` rather than `Duration::mul_f64`
+/// so a `delay` near `Duration::MAX` can't panic: `MAX.mul_f64(0.999…)`
+/// rounds to `≥ u64::MAX as f64` seconds and trips `mul_f64`'s
+/// overflow check. Falling back to the unjittered `delay` is the
+/// only sane choice — the caller is already in the "schedule
+/// saturated" regime where exact wait time doesn't matter.
 fn apply_jitter(delay: Duration, jitter: f64) -> Duration {
     if jitter <= 0.0 {
         return delay;
     }
     // `delay * (1 - jitter * rand)` — `rand` in `[0, 1)`, so the
     // factor is in `(1 - jitter, 1]`.
-    let factor = 1.0 - jitter.min(1.0) * random_unit();
-    delay.mul_f64(factor.max(0.0))
+    let factor = (1.0 - jitter.min(1.0) * random_unit()).max(0.0);
+    Duration::try_from_secs_f64(delay.as_secs_f64() * factor).unwrap_or(delay)
 }
 
 /// A tiny splitmix64-style RNG seeded once per-thread from the
@@ -426,26 +475,85 @@ mod tests {
         }
     }
 
-    /// `Duration::MAX` for `max_backoff` (or `Duration::from_secs(u64::MAX)`)
-    /// must not panic — `as_secs_f64()` overflows the `from_secs_f64`
-    /// preconditions, but `try_from_secs_f64` returns `Err` instead
-    /// of unwinding. A user accidentally setting an unbounded
-    /// `max_backoff` deserves a fallback, not a panic in the retry
-    /// loop.
+    /// The exponential-branch `try_from_secs_f64` fallback path must
+    /// actually fire for inputs that overflow the f64→Duration
+    /// conversion (NaN, negative, `> u64::MAX as f64`). Earlier
+    /// versions of this test used `backoff_multiplier: 2.0` which
+    /// never produced a non-finite value, so a regression removing
+    /// the fallback would have passed silently. `1e300^1` overflows
+    /// the seconds field and forces the fallback branch.
     #[test]
     fn delay_after_does_not_panic_on_huge_max_backoff() {
         let policy = RetryPolicy {
             max_attempts: 5,
             initial_backoff: Duration::from_secs(1),
-            backoff_multiplier: 2.0,
+            // `1 * 1e300^1 = 1e300` — finite f64 but well above
+            // `u64::MAX as f64 ≈ 1.8e19`, so `try_from_secs_f64`
+            // returns Err and the fallback fires.
+            backoff_multiplier: 1e300,
             max_backoff: Duration::MAX,
             jitter: 0.0,
         };
         let err = Error::rate_limit(None, "slow");
-        // Attempt 2 → 1 * 2 = 2 seconds, well-defined.
-        assert_eq!(policy.delay_after(&err, 2), Some(Duration::from_secs(2)));
-        // Attempt 10 with multiplier 2.0 → 2^9 = 512, also fine.
-        let _ = policy.delay_after(&err, 10);
+        // Attempt 2 saturates to `max_backoff` (which is `MAX`) via
+        // the fallback. Without the fallback, `from_secs_f64(1e300)`
+        // would panic here.
+        assert_eq!(policy.delay_after(&err, 2), Some(Duration::MAX));
+    }
+
+    /// Server-supplied `Retry-After` is a *floor*, not a target:
+    /// waiting less just guarantees another 429. Jitter cuts the
+    /// computed delay *down*, so applying it to the server hint
+    /// would silently undershoot the quota window — burning the
+    /// retry budget without making progress. This test pins the
+    /// no-jitter-on-server-hint invariant: with `jitter: 0.5` a
+    /// 7s hint must return *exactly* 7s every time.
+    #[test]
+    fn delay_after_does_not_jitter_server_retry_after() {
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            initial_backoff: Duration::from_secs(1),
+            backoff_multiplier: 2.0,
+            max_backoff: Duration::from_secs(60),
+            // Aggressive jitter — if it leaked onto the server hint
+            // path, even a single iteration would produce <7s.
+            jitter: 0.5,
+        };
+        let err = Error::rate_limit(Some(7), "slow down");
+        for _ in 0..64 {
+            let d = policy.delay_after(&err, 1).unwrap();
+            assert_eq!(
+                d,
+                Duration::from_secs(7),
+                "server `Retry-After` must be honoured verbatim — \
+                 jitter would shave it below the server's floor and \
+                 retries would burn against the still-closed window",
+            );
+        }
+    }
+
+    /// Jitter on a saturated exponential delay (`capped =
+    /// Duration::MAX`) must not panic. `Duration::MAX.mul_f64(0.999…)`
+    /// rounds the product to `≥ u64::MAX as f64` and trips
+    /// `mul_f64`'s overflow check; `apply_jitter` now uses
+    /// `try_from_secs_f64` to saturate instead.
+    #[test]
+    fn delay_after_with_jitter_does_not_panic_at_max_backoff() {
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            initial_backoff: Duration::from_secs(1),
+            // Saturates the exponential branch to `max_backoff`.
+            backoff_multiplier: 1e300,
+            max_backoff: Duration::MAX,
+            jitter: 0.5,
+        };
+        let err = Error::rate_limit(None, "slow");
+        // 64 iterations to exercise a range of jitter factors —
+        // each draws `random_unit` and recomputes the saturating
+        // jittered duration.
+        for _ in 0..64 {
+            let _ = policy.delay_after(&err, 2);
+        }
     }
 
     /// A non-zero `jitter` must shave a uniform-random fraction off

@@ -14,10 +14,11 @@ use platformed_llm::{generate, retry, Config, Error, FunctionCall, Prompt, Provi
 
 /// A toy "agent loop" — exactly the kind of code you'd want to test
 /// against a mock. Each turn is wrapped in [`retry`]: a transient
-/// failure (rate limit, 5xx, transport blip, mid-stream drop)
-/// transparently re-issues *that turn only*, without re-running
-/// already-committed turns earlier in the conversation. Terminal
-/// errors propagate immediately.
+/// failure (rate limit, 5xx, pre-stream transport blip) transparently
+/// re-issues *that turn only*, without re-running already-committed
+/// turns earlier in the conversation. Terminal errors propagate
+/// immediately. (Mid-body / mid-SSE failures aren't retried by the
+/// default policy — see the `What doesn't` section of `mod retry`.)
 async fn run_agent(provider: &dyn Provider, question: &str) -> Result<String, Error> {
     let config = Config::builder("test-model").build();
     let policy = RetryPolicy::standard();
