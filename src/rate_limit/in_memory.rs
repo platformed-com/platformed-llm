@@ -108,6 +108,18 @@ pub struct InMemoryRateLimiterConfig {
     /// asking us to wait 30 minutes from a tight in-process loop
     /// is more often a misconfiguration than a real signal.
     pub max_park: Duration,
+    /// Idle-eviction TTL for per-bucket state. Buckets are keyed by
+    /// `(provider-shape, account, model)` and inserted lazily on
+    /// first acquire; without eviction, a long-lived limiter serving
+    /// a churny model set (e.g. OpenAI fine-tunes, where each name
+    /// like `ft:gpt-4o…::AbC1XyZ` is unique) accumulates one bucket
+    /// per model ever seen, unbounded. Buckets that go idle (empty
+    /// queues, no active park) longer than this TTL are dropped on
+    /// the next `acquire` for the same limiter. Defaults to 5
+    /// minutes — long enough that a hot bucket retains its learned
+    /// AIMD state across bursty traffic, short enough that a
+    /// long-tail of ephemeral model names doesn't accumulate.
+    pub bucket_ttl: Duration,
 }
 
 impl Default for InMemoryRateLimiterConfig {
@@ -120,6 +132,7 @@ impl Default for InMemoryRateLimiterConfig {
             multiplicative_decrease: 0.5,
             default_park: Duration::from_secs(1),
             max_park: Duration::from_secs(60),
+            bucket_ttl: Duration::from_secs(300),
         }
     }
 }
@@ -186,6 +199,18 @@ impl InMemoryRateLimiterConfig {
                 "InMemoryRateLimiterConfig: max_park ({:?}) must be >= default_park ({:?})",
                 self.max_park, self.default_park,
             )));
+        }
+        // `bucket_ttl` of zero would evict every bucket on the next
+        // enqueue, defeating the AIMD model entirely (rps resets to
+        // `initial_rps` on every acquire). Reject at construction
+        // rather than let a stray `Duration::from_secs(0)` silently
+        // break rate limiting.
+        if self.bucket_ttl.is_zero() {
+            return Err(Error::config(
+                "InMemoryRateLimiterConfig: bucket_ttl must be > 0 \
+                 (zero would evict every bucket on every acquire, \
+                 disabling AIMD state accumulation)",
+            ));
         }
         Ok(())
     }
@@ -355,6 +380,23 @@ struct Inner {
 impl Inner {
     fn enqueue(&self, key: &Arc<str>, scope: &RateScope) -> Arc<WaiterHandle> {
         let mut buckets = self.buckets.lock();
+        let now = Instant::now();
+        // Opportunistic idle-eviction sweep. Buckets keyed by
+        // caller-controlled `(account, model)` accumulate one entry
+        // per distinct model ever seen — unbounded for churny
+        // workloads (OpenAI fine-tune names, etc.). Sweeping on
+        // every `enqueue` is cheap when the map is small (which it
+        // stays, because of the sweep); the alternatives (periodic
+        // background task, LRU cap with per-op bookkeeping) add
+        // complexity for no meaningful throughput gain.
+        //
+        // Only genuinely idle buckets are evicted: empty queues
+        // across all priority bands and no active `Retry-After`
+        // park. AIMD state is lost on eviction, but only after the
+        // bucket has been idle past `bucket_ttl` (default 5min) —
+        // long enough that any hot path retains its state.
+        let ttl = self.config.bucket_ttl;
+        buckets.retain(|_, b| now.duration_since(b.last_activity) < ttl || !b.is_idle(now));
         let bucket = buckets.entry(key.clone()).or_insert_with(|| {
             Bucket::new(
                 self.config
@@ -362,6 +404,7 @@ impl Inner {
                     .clamp(self.config.min_rps, self.config.max_rps),
             )
         });
+        bucket.last_activity = now;
         let id = bucket.next_waiter_id();
         let notify = Arc::new(Notify::new());
         let handle = Arc::new(WaiterHandle {
@@ -415,6 +458,10 @@ impl Inner {
         let Some(bucket) = buckets.get_mut(key) else {
             return;
         };
+        // Refresh the activity clock so an in-flight request
+        // spanning past `bucket_ttl` doesn't cause its own bucket
+        // to be evicted between `acquire` and `observe`.
+        bucket.last_activity = Instant::now();
         #[cfg(test)]
         if self
             .poison_next_observe
@@ -466,6 +513,13 @@ struct Bucket {
     /// Monotonic waiter id, used to identify "is this me at the
     /// head" without raw pointers.
     next_id: u64,
+    /// Wall-clock timestamp of the last time this bucket saw
+    /// activity — an enqueue, dispatch, or observe. Combined with
+    /// [`InMemoryRateLimiterConfig::bucket_ttl`], drives the idle-
+    /// eviction sweep in `Inner::enqueue` so ephemeral model names
+    /// (e.g. OpenAI fine-tune ids) don't accumulate one bucket
+    /// each.
+    last_activity: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -549,15 +603,30 @@ impl PriorityBand {
 
 impl Bucket {
     fn new(initial_rps: f64) -> Self {
+        let now = Instant::now();
         Self {
             rps: initial_rps,
-            next_dispatch_at: Instant::now(),
+            next_dispatch_at: now,
             parked_until: None,
             interactive: PriorityBand::default(),
             standard: PriorityBand::default(),
             background: PriorityBand::default(),
             next_id: 0,
+            last_activity: now,
         }
+    }
+
+    /// Whether this bucket is currently idle — no queued waiters
+    /// across any priority band, and no active `Retry-After` park.
+    /// Idle buckets whose `last_activity` is older than the
+    /// configured TTL are safe to evict without disrupting any
+    /// in-flight scheduling.
+    fn is_idle(&self, now: Instant) -> bool {
+        let queues_empty = self.interactive.tenant_order.is_empty()
+            && self.standard.tenant_order.is_empty()
+            && self.background.tenant_order.is_empty();
+        let not_parked = self.parked_until.is_none_or(|until| until <= now);
+        queues_empty && not_parked
     }
 
     fn next_waiter_id(&mut self) -> u64 {
@@ -790,6 +859,10 @@ mod tests {
             multiplicative_decrease: 0.5,
             default_park: Duration::from_millis(10),
             max_park: Duration::from_millis(50),
+            // Tests dispatch synchronously and finish well within
+            // 5 minutes; the default TTL is fine here. Individual
+            // tests exercising the eviction path override.
+            bucket_ttl: Duration::from_secs(300),
         }
     }
 
@@ -999,12 +1072,21 @@ mod tests {
         drop(p2);
     }
 
-    /// Pin AIMD halving: the interval after a 429 should be ~2× the
-    /// pre-429 interval. We assert both a lower bound (proves the
-    /// rate decreased at all) and an upper bound (proves it didn't
-    /// over-correct or stay the same — e.g. a buggy `*= 0.9` would
-    /// fail the lower bound, and a missing decrease would fail the
-    /// upper bound).
+    /// Pin AIMD halving via *state* rather than wall-clock upper
+    /// bounds. The earlier form asserted `interval < 300ms` on a
+    /// 200ms dispatch gate — 100ms of slack that intermittently
+    /// false-reds under parallel `nextest` / sanitizer / macOS
+    /// runner load, where tokio wake-up jitter regularly exceeds
+    /// 100ms even when the halving is correct.
+    ///
+    /// Reading `bucket.rps` after the 429 pins the invariant
+    /// deterministically: it must equal `initial × decrease`
+    /// (10 × 0.5 = 5.0). A missing decrease (rps stays at 10),
+    /// under-decrease (a buggy `*= 0.9` → 9.0), and over-decrease
+    /// (`*= 0.25` → 2.5) all fail this cleanly. A single lower
+    /// timing bound on the *next* acquire then confirms the halved
+    /// rate is actually applied to dispatch spacing, without an
+    /// upper bound that flakes.
     #[tokio::test]
     async fn rate_limit_halves_rps() {
         let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
@@ -1015,6 +1097,7 @@ mod tests {
             multiplicative_decrease: 0.5,
             default_park: Duration::from_millis(1),
             max_park: Duration::from_millis(10),
+            bucket_ttl: Duration::from_secs(300),
         })
         .unwrap();
         let p = limiter
@@ -1025,6 +1108,17 @@ mod tests {
             retry_after: Some(Duration::from_millis(1)),
             info: ProviderRateInfo::default(),
         });
+        // State check: rps must be exactly halved. Under `additive_step: 0`
+        // no growth interferes, so this is the deterministic invariant.
+        {
+            let buckets = limiter.inner.buckets.lock();
+            let bucket = buckets.values().next().unwrap();
+            assert!(
+                (bucket.rps - 5.0).abs() < 0.01,
+                "halving invariant violated: expected rps=5.0 (10.0 × 0.5), got {}",
+                bucket.rps,
+            );
+        }
         tokio::time::sleep(Duration::from_millis(15)).await;
         let _p1 = limiter
             .acquire(&scope("t1", Priority::Interactive))
@@ -1036,18 +1130,13 @@ mod tests {
             .await
             .unwrap();
         let interval = start.elapsed();
-        // Halved rate of 10 rps → 5 rps → 200ms interval. Lower
-        // bound proves the rate decreased; upper bound rules out
-        // an over-decrease (e.g. `*= 0.25` would give a 400ms
-        // interval and fail) and a missing decrease (the original
-        // 100ms interval would fail the lower bound).
+        // Lower bound only — proves the halved rate is actually
+        // applied to dispatch spacing. Upper bound removed: wake-up
+        // jitter on loaded runners past 100ms is realistic and
+        // doesn't indicate a real regression.
         assert!(
             interval >= Duration::from_millis(150),
             "expected ~200ms (halved interval), got {interval:?}",
-        );
-        assert!(
-            interval < Duration::from_millis(300),
-            "halving should not over-decrease — got {interval:?}",
         );
         drop(p2);
     }
@@ -1067,6 +1156,7 @@ mod tests {
             multiplicative_decrease: 0.5,
             default_park: Duration::from_millis(1),
             max_park: Duration::from_millis(10),
+            bucket_ttl: Duration::from_secs(300),
         })
         .unwrap();
         let p = limiter
@@ -1086,6 +1176,86 @@ mod tests {
         assert!(
             bucket.rps >= 10.0,
             "remaining=0 success must not shrink rps, got {}",
+            bucket.rps,
+        );
+    }
+
+    /// The header-derived capacity ceiling is
+    /// `proposed.min(observed.max(self.rps))`. When `observed` is
+    /// *between* the current rps and the proposed post-growth rps,
+    /// growth is capped to `observed` — the ceiling bounds growth
+    /// but doesn't decrease from the current rate.
+    #[tokio::test]
+    async fn success_ceiling_caps_growth_when_observed_between_rps_and_proposed() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 10.0,
+            min_rps: 0.1,
+            max_rps: 100.0,
+            additive_step: 1.0, // proposed = 10 + 1 = 11
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(1),
+            max_park: Duration::from_millis(10),
+            bucket_ttl: Duration::from_secs(300),
+        })
+        .unwrap();
+        let p = limiter
+            .acquire(&scope("t1", Priority::Interactive))
+            .await
+            .unwrap();
+        // observed = 105 / 10s = 10.5 r/s — between rps=10 and
+        // proposed=11. Growth caps at 10.5.
+        p.observe(RateOutcome::Success {
+            info: ProviderRateInfo {
+                requests_remaining: Some(105),
+                requests_reset: Some(Duration::from_secs(10)),
+            },
+        });
+        let buckets = limiter.inner.buckets.lock();
+        let bucket = buckets.values().next().unwrap();
+        assert!(
+            (bucket.rps - 10.5).abs() < 0.01,
+            "ceiling must cap growth to observed=10.5 when between rps and proposed, got {}",
+            bucket.rps,
+        );
+    }
+
+    /// The `.max(self.rps)` term in the ceiling is load-bearing: it
+    /// stops the header-derived ceiling from *decreasing* an already-
+    /// stable rate. Without it, a burst of successful low-remaining
+    /// responses (e.g. after most of the quota window was consumed
+    /// by other clients) would collapse rps toward `min_rps` on
+    /// every observation — inverse of the AIMD contract.
+    #[tokio::test]
+    async fn success_ceiling_never_shrinks_below_current_rps() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 10.0,
+            min_rps: 0.1,
+            max_rps: 100.0,
+            additive_step: 1.0,
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(1),
+            max_park: Duration::from_millis(10),
+            bucket_ttl: Duration::from_secs(300),
+        })
+        .unwrap();
+        let p = limiter
+            .acquire(&scope("t1", Priority::Interactive))
+            .await
+            .unwrap();
+        // observed = 50 / 60s ≈ 0.83 r/s — well below rps=10.
+        // Without `.max(self.rps)`, this would collapse rps to 0.83.
+        // With it, rps stays at 10.
+        p.observe(RateOutcome::Success {
+            info: ProviderRateInfo {
+                requests_remaining: Some(50),
+                requests_reset: Some(Duration::from_secs(60)),
+            },
+        });
+        let buckets = limiter.inner.buckets.lock();
+        let bucket = buckets.values().next().unwrap();
+        assert!(
+            (bucket.rps - 10.0).abs() < 0.01,
+            "ceiling below rps must never decrease it (`.max(self.rps)` invariant), got {}",
             bucket.rps,
         );
     }
@@ -1139,6 +1309,118 @@ mod tests {
             ..InMemoryRateLimiterConfig::default()
         };
         assert!(InMemoryRateLimiter::try_with_config(inverted_park).is_err());
+
+        // `bucket_ttl == 0` is rejected — every enqueue would evict
+        // every bucket, resetting AIMD state on every acquire.
+        let zero_ttl = InMemoryRateLimiterConfig {
+            bucket_ttl: Duration::ZERO,
+            ..InMemoryRateLimiterConfig::default()
+        };
+        assert!(InMemoryRateLimiter::try_with_config(zero_ttl).is_err());
+    }
+
+    /// Build a `RateScope` with a caller-specified bucket key. The
+    /// default `scope(...)` helper pins bucket_key to a single value
+    /// (varying tenant), which is right for scheduling-fairness
+    /// tests. Eviction tests need distinct bucket keys.
+    fn scope_key(bucket_key: &str, priority: Priority) -> RateScope {
+        RateScope {
+            bucket_key: bucket_key.into(),
+            tenant: tenant_uuid("t"),
+            priority,
+        }
+    }
+
+    /// Buckets keyed by caller-controlled `(account, model)` are
+    /// inserted lazily; without eviction, a long-lived limiter
+    /// serving a churny model set (e.g. OpenAI fine-tune names like
+    /// `ft:gpt-4o-2024-08-06:my-org::AbC1XyZ`) grows one bucket per
+    /// distinct name ever seen — unbounded. The idle-TTL sweep on
+    /// `enqueue` must remove buckets whose queues have been empty
+    /// past `bucket_ttl`. Under a 50ms TTL, a bucket acquired-and-
+    /// released, then left alone for 100ms, must be gone by the
+    /// next acquire on a *different* key.
+    #[tokio::test]
+    async fn idle_buckets_evicted_past_ttl() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 100.0,
+            min_rps: 1.0,
+            max_rps: 1000.0,
+            additive_step: 1.0,
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(1),
+            max_park: Duration::from_millis(10),
+            bucket_ttl: Duration::from_millis(50),
+        })
+        .unwrap();
+        // Acquire under key `bucket-a`, release, then wait past the TTL.
+        let p = limiter
+            .acquire(&scope_key("bucket-a", Priority::Interactive))
+            .await
+            .unwrap();
+        drop(p);
+        assert_eq!(
+            limiter.inner.buckets.lock().len(),
+            1,
+            "bucket `bucket-a` should exist after acquire",
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Enqueue on a *different* key `bucket-b` — the sweep runs
+        // and must evict `bucket-a` since it's been idle past the TTL.
+        let _p = limiter
+            .acquire(&scope_key("bucket-b", Priority::Interactive))
+            .await
+            .unwrap();
+        let buckets = limiter.inner.buckets.lock();
+        assert_eq!(
+            buckets.len(),
+            1,
+            "idle bucket `bucket-a` should have been evicted; only \
+             `bucket-b` remains — got {} bucket(s)",
+            buckets.len(),
+        );
+    }
+
+    /// A bucket that's been active recently (within `bucket_ttl`)
+    /// must NOT be evicted, even if it's currently idle at the
+    /// moment of the sweep. Prevents churn on repeated same-key
+    /// acquires from destroying AIMD state.
+    #[tokio::test]
+    async fn hot_buckets_survive_sweep() {
+        let limiter = InMemoryRateLimiter::try_with_config(InMemoryRateLimiterConfig {
+            initial_rps: 100.0,
+            min_rps: 1.0,
+            max_rps: 1000.0,
+            additive_step: 5.0,
+            multiplicative_decrease: 0.5,
+            default_park: Duration::from_millis(1),
+            max_park: Duration::from_millis(10),
+            bucket_ttl: Duration::from_secs(300),
+        })
+        .unwrap();
+        // Acquire under key `bucket-a`, observe a Success to grow
+        // rps, then acquire on `bucket-b` immediately — the sweep
+        // runs but `bucket-a` is hot (last_activity within TTL) so
+        // it must survive.
+        let p = limiter
+            .acquire(&scope_key("bucket-a", Priority::Interactive))
+            .await
+            .unwrap();
+        p.observe(RateOutcome::Success {
+            info: ProviderRateInfo::default(),
+        });
+        let _p = limiter
+            .acquire(&scope_key("bucket-b", Priority::Interactive))
+            .await
+            .unwrap();
+        let buckets = limiter.inner.buckets.lock();
+        assert_eq!(
+            buckets.len(),
+            2,
+            "hot bucket `bucket-a` should survive the sweep; \
+             expected 2 buckets, got {}",
+            buckets.len(),
+        );
     }
 
     // ====================================================================
@@ -1325,6 +1607,7 @@ mod tests {
             multiplicative_decrease: 0.5,
             default_park: Duration::from_millis(1),
             max_park: Duration::from_millis(10),
+            bucket_ttl: Duration::from_secs(300),
         })
         .unwrap();
         for _ in 0..3 {
@@ -1364,6 +1647,7 @@ mod tests {
             multiplicative_decrease: 0.5,
             default_park: Duration::from_millis(1),
             max_park: Duration::from_millis(5),
+            bucket_ttl: Duration::from_secs(300),
         })
         .unwrap();
         // Establish the bucket via a single acquire (so it exists
@@ -1404,6 +1688,7 @@ mod tests {
             multiplicative_decrease: 0.5,
             default_park: Duration::from_millis(1),
             max_park: Duration::from_millis(5),
+            bucket_ttl: Duration::from_secs(300),
         })
         .unwrap();
         for _ in 0..3 {
@@ -1441,6 +1726,7 @@ mod tests {
             multiplicative_decrease: 0.5,
             default_park: Duration::from_millis(10),
             max_park: Duration::from_millis(50),
+            bucket_ttl: Duration::from_secs(300),
         })
         .unwrap();
         let p = limiter
@@ -1481,6 +1767,7 @@ mod tests {
             multiplicative_decrease: 0.5,
             default_park: Duration::from_millis(5),
             max_park: Duration::from_millis(200),
+            bucket_ttl: Duration::from_secs(300),
         })
         .unwrap();
         let p = limiter
@@ -1529,6 +1816,7 @@ mod tests {
             multiplicative_decrease: 0.5,
             default_park: Duration::from_millis(1),
             max_park: Duration::from_millis(5),
+            bucket_ttl: Duration::from_secs(300),
         })
         .unwrap();
         let scope_a = RateScope {
@@ -1585,6 +1873,7 @@ mod tests {
             multiplicative_decrease: 0.5,
             default_park: Duration::from_millis(10),
             max_park: Duration::from_millis(500),
+            bucket_ttl: Duration::from_secs(300),
         })
         .unwrap();
         let scope_a = RateScope {

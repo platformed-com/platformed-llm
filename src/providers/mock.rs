@@ -1065,6 +1065,7 @@ mod tests {
                     multiplicative_decrease: 0.5,
                     default_park: std::time::Duration::from_millis(1),
                     max_park: std::time::Duration::from_millis(10),
+                    bucket_ttl: std::time::Duration::from_secs(300),
                 },
             )
             .unwrap(),

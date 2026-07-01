@@ -521,10 +521,16 @@ impl Provider for AnthropicViaVertexProvider {
         let req = TransportRequest { url, headers, body };
 
         let scope = crate::rate_limit::RateScope {
-            // Vertex regions have independent quotas — include the
-            // location so per-region buckets stay separate.
+            // Vertex quotas are per-project-per-region, so both
+            // `project_id` and `location` must be part of the key —
+            // otherwise two `AnthropicViaVertexProvider` instances
+            // for different GCP projects sharing one limiter would
+            // collide, and one project's 429 would halve/park the
+            // shared bucket while the other's quota was untouched.
+            // Mirrors the `account_key()` shape on the OpenAI side.
             bucket_key: format!(
-                "Vertex-Anthropic/{}/{}",
+                "Vertex-Anthropic/{}/{}/{}",
+                self.endpoint.project_id(),
                 self.endpoint.location(),
                 config.model,
             ),

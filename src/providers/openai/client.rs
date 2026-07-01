@@ -442,16 +442,24 @@ impl OpenAIProvider {
 /// on anything we don't recognise so the limiter just falls back to its
 /// own backoff.
 fn parse_openai_reset(s: &str) -> Option<std::time::Duration> {
+    use std::time::Duration;
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
+    // Every f64→Duration conversion goes through `try_from_secs_f64`
+    // so negative / non-finite / overflowing inputs (a malformed
+    // proxy sending `-0.5s`, `1e400ms`, etc.) return `None` rather
+    // than panicking. The docstring promises `None` on unparseable —
+    // `Duration::from_secs_f64`'s panic would violate that contract
+    // and abort the request instead of falling back to the limiter's
+    // own backoff.
     // Single-unit short forms: "30s", "1.5s", "500ms", "7m", "1h".
     if let Some(num) = s.strip_suffix("ms") {
         return num
             .parse::<f64>()
             .ok()
-            .map(|n| std::time::Duration::from_secs_f64(n / 1000.0));
+            .and_then(|n| Duration::try_from_secs_f64(n / 1000.0).ok());
     }
     if let Some(num) = s.strip_suffix('s') {
         // Could be "1.5s" or "7m30s" — the latter is handled below.
@@ -459,20 +467,20 @@ fn parse_openai_reset(s: &str) -> Option<std::time::Duration> {
             return num
                 .parse::<f64>()
                 .ok()
-                .map(std::time::Duration::from_secs_f64);
+                .and_then(|n| Duration::try_from_secs_f64(n).ok());
         }
     }
     if let Some(num) = s.strip_suffix('m') {
         return num
             .parse::<f64>()
             .ok()
-            .map(|n| std::time::Duration::from_secs_f64(n * 60.0));
+            .and_then(|n| Duration::try_from_secs_f64(n * 60.0).ok());
     }
     if let Some(num) = s.strip_suffix('h') {
         return num
             .parse::<f64>()
             .ok()
-            .map(|n| std::time::Duration::from_secs_f64(n * 3600.0));
+            .and_then(|n| Duration::try_from_secs_f64(n * 3600.0).ok());
     }
     // Composite minutes-and-seconds: "7m30s", "1m0.5s".
     if let Some(m_idx) = s.find('m') {
@@ -483,7 +491,7 @@ fn parse_openai_reset(s: &str) -> Option<std::time::Duration> {
         } else {
             rest.strip_suffix('s')?.parse().ok()?
         };
-        return Some(std::time::Duration::from_secs_f64(mins * 60.0 + secs));
+        return Duration::try_from_secs_f64(mins * 60.0 + secs).ok();
     }
     None
 }
@@ -2337,5 +2345,32 @@ mod tests {
         assert_eq!(parse_openai_reset(""), None);
         assert_eq!(parse_openai_reset("garbage"), None);
         assert_eq!(parse_openai_reset("30sec"), None);
+    }
+
+    /// Malformed inputs must return `None`, never panic. Earlier drafts
+    /// piped the parsed `f64` straight into `Duration::from_secs_f64`,
+    /// which panics on negative / non-finite / overflow — so a
+    /// hostile / misconfigured proxy sending `-0.5s` or `1e400ms`
+    /// would abort the request instead of falling back to the
+    /// limiter's own backoff. `try_from_secs_f64` is the total
+    /// alternative.
+    #[test]
+    fn parse_openai_reset_returns_none_on_pathological_inputs() {
+        // Negative values.
+        assert_eq!(parse_openai_reset("-0.5s"), None);
+        assert_eq!(parse_openai_reset("-1ms"), None);
+        assert_eq!(parse_openai_reset("-2m"), None);
+        assert_eq!(parse_openai_reset("-1h"), None);
+        // `f64::INFINITY` / `f64::NAN`.
+        assert_eq!(parse_openai_reset("1e400ms"), None); // parses to +∞
+        assert_eq!(parse_openai_reset("1e400s"), None);
+        assert_eq!(parse_openai_reset("NaNs"), None);
+        // Composite forms where the total sum is negative or
+        // non-finite. (`1m-1s` sums to +59s — not a panic path so
+        // the parser happily accepts it. Semantic-validation of
+        // sign per-component isn't a goal here; total-and-panic-
+        // safety is.)
+        assert_eq!(parse_openai_reset("-1m30s"), None);
+        assert_eq!(parse_openai_reset("1m-1e400s"), None);
     }
 }
