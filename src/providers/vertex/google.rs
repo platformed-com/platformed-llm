@@ -676,9 +676,32 @@ fn normalize_schema_keys(
                 };
                 out.insert(k, mapped);
             }
-            // Data / scalar validation keyword (`type`, `enum`, `const`,
-            // `default`, `examples`, `required`, `format`, …): copy
-            // verbatim — never strip or resolve inside a data position.
+            // Gemini's `Schema` proto has no union type and rejects an
+            // array-valued `type`. Lower a JSON-Schema nullable union
+            // (`["T", "null"]`) to a scalar `type` + `nullable: true`. A
+            // union of several concrete types has no Gemini equivalent, so
+            // leave it for the API to reject rather than guess at a mapping.
+            "type" => match v {
+                Value::Array(members) if members.iter().any(|m| m.as_str() == Some("null")) => {
+                    let mut concrete = members
+                        .into_iter()
+                        .filter(|m| m.as_str() != Some("null"))
+                        .collect::<Vec<_>>();
+                    out.insert("nullable".to_string(), Value::Bool(true));
+                    let lowered = if concrete.len() == 1 {
+                        concrete.swap_remove(0)
+                    } else {
+                        Value::Array(concrete)
+                    };
+                    out.insert(k, lowered);
+                }
+                other => {
+                    out.insert(k, other);
+                }
+            },
+            // Data / scalar validation keyword (`enum`, `const`, `default`,
+            // `examples`, `required`, `format`, …): copy verbatim — never
+            // strip or resolve inside a data position.
             _ => {
                 out.insert(k, v);
             }
@@ -1756,6 +1779,47 @@ mod tests {
         assert!(
             schema["properties"]["source"].get("$ref").is_none(),
             "responseSchema must have $ref inlined: {schema}",
+        );
+    }
+
+    /// Gemini's `Schema` proto has no union type and rejects an array-valued
+    /// `type` with a 400. A JSON-Schema nullable union (`["T", "null"]`, the
+    /// OpenAI strict-mode idiom for a required-but-nullable field) must be
+    /// lowered to a scalar `type` plus `nullable: true`.
+    #[test]
+    fn response_format_nullable_union_lowered() {
+        use crate::types::ResponseFormat;
+        use std::borrow::Cow;
+        let schema_raw = serde_json::value::RawValue::from_string(
+            r#"{
+                "type": "object",
+                "properties": {
+                    "question_number": { "type": ["string", "null"] }
+                }
+            }"#
+            .to_string(),
+        )
+        .unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::builder("gemini")
+            .response_format(ResponseFormat::JsonSchema {
+                name: "Out".to_string(),
+                schema: Cow::Owned(schema_raw),
+                strict: true,
+            })
+            .build();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let field = &json["generationConfig"]["responseSchema"]["properties"]["question_number"];
+        assert_eq!(
+            field["type"], "string",
+            "nullable union must lower to a scalar type: {field}",
+        );
+        assert_eq!(
+            field["nullable"], true,
+            "the null member must become nullable: true: {field}",
         );
     }
 
