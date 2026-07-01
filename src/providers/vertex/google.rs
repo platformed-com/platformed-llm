@@ -652,6 +652,10 @@ fn normalize_schema_keys(
     use serde_json::Value;
 
     let mut out = serde_json::Map::new();
+    // The array-`type` lowering below can synthesise an `anyOf`; capture
+    // whether the node already carries one so the lowering leaves it alone
+    // rather than silently clobbering the caller's constraint.
+    let has_own_any_of = obj.contains_key("anyOf");
     for (k, v) in obj {
         match k.as_str() {
             // Meta-fields and definition blocks: stripped from the output
@@ -692,35 +696,49 @@ fn normalize_schema_keys(
             }
             // Gemini's `Schema` proto has no union `type`; an array-valued
             // `type` reaches the wire raw and Vertex rejects it with a 400.
-            // A `"null"` member is expressed as `nullable: true` on the
-            // parent, then the remaining concrete types are lowered to the
-            // Gemini shape: a sole type collapses to a scalar `type`, and
-            // several map to `anyOf`, one scalar subschema per member.
+            // Lower an array of type names to the Gemini shape, treating a
+            // `"null"` member as nullability:
+            //   - one concrete type (incl. the `["T", "null"]` idiom):
+            //     a scalar `type`, plus `nullable: true` when null was present;
+            //   - several concrete types: an `anyOf` with one branch per type.
+            //     Vertex rejects `nullable` as a sibling of `anyOf` ("anyOf
+            //     must be the only field set"), so a `"null"` member becomes
+            //     `nullable: true` *inside* each branch instead.
+            // Only well-formed all-string arrays are lowered. A null-only /
+            // empty array (no concrete type, so no Gemini form), a non-string
+            // member (malformed), or a node that already owns an `anyOf` (the
+            // lowering would clobber it) are left untouched for the API to
+            // accept or reject as-is.
             "type" => match v {
-                Value::Array(members) => {
+                Value::Array(members) if members.iter().all(Value::is_string) => {
                     let has_null = members.iter().any(|m| m.as_str() == Some("null"));
-                    let mut concrete = members
-                        .into_iter()
+                    let concrete_count = members
+                        .iter()
                         .filter(|m| m.as_str() != Some("null"))
-                        .collect::<Vec<_>>();
-                    if has_null {
-                        out.insert("nullable".to_string(), Value::Bool(true));
-                    }
-                    match concrete.len() {
-                        // `[]` / `["null"]`: nothing concrete to place; the
-                        // `nullable` flag (if any) already stands alone.
-                        0 => {}
-                        // Nullable-scalar idiom (`["T", "null"]`) or a plain
-                        // single-element array: a scalar `type`.
-                        1 => {
+                        .count();
+                    if concrete_count == 0 || (concrete_count > 1 && has_own_any_of) {
+                        out.insert(k, Value::Array(members));
+                    } else {
+                        let mut concrete = members
+                            .into_iter()
+                            .filter(|m| m.as_str() != Some("null"))
+                            .collect::<Vec<_>>();
+                        if concrete_count == 1 {
+                            if has_null {
+                                out.insert("nullable".to_string(), Value::Bool(true));
+                            }
                             out.insert(k, concrete.swap_remove(0));
-                        }
-                        // A genuine union (`["T1", "T2"]`): one `anyOf`
-                        // branch per concrete type.
-                        _ => {
+                        } else {
                             let branches = concrete
                                 .into_iter()
-                                .map(|t| serde_json::json!({ "type": t }))
+                                .map(|t| {
+                                    let mut branch = serde_json::Map::new();
+                                    branch.insert("type".to_string(), t);
+                                    if has_null {
+                                        branch.insert("nullable".to_string(), Value::Bool(true));
+                                    }
+                                    Value::Object(branch)
+                                })
                                 .collect();
                             out.insert("anyOf".to_string(), Value::Array(branches));
                         }
@@ -1910,23 +1928,14 @@ mod tests {
         );
     }
 
-    /// A union of several concrete types has no scalar Gemini form, so it
-    /// maps to `anyOf` — one scalar subschema per member. A `"null"` member
-    /// rides on the parent as `nullable: true`, not as an `anyOf` branch.
-    #[test]
-    fn response_format_multitype_union_lowered_to_any_of() {
+    /// Normalise a single property's schema through the Gemini
+    /// `response_format` path and return the emitted field JSON.
+    fn lowered_response_field(field_schema: &str) -> serde_json::Value {
         use crate::types::ResponseFormat;
         use std::borrow::Cow;
-        let schema_raw = serde_json::value::RawValue::from_string(
-            r#"{
-                "type": "object",
-                "properties": {
-                    "value": { "type": ["string", "number", "null"] }
-                }
-            }"#
-            .to_string(),
-        )
-        .unwrap();
+        let schema =
+            format!(r#"{{ "type": "object", "properties": {{ "value": {field_schema} }} }}"#);
+        let schema_raw = serde_json::value::RawValue::from_string(schema).unwrap();
         let prompt = crate::Prompt::user("hi");
         let cfg = Config::builder("gemini")
             .response_format(ResponseFormat::JsonSchema {
@@ -1939,19 +1948,84 @@ mod tests {
             .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
             .unwrap();
         let json = serde_json::to_value(&body).unwrap();
-        let field = &json["generationConfig"]["responseSchema"]["properties"]["value"];
+        json["generationConfig"]["responseSchema"]["properties"]["value"].clone()
+    }
+
+    /// A union of several concrete types has no scalar Gemini form, so it
+    /// maps to `anyOf` — one branch per type. Vertex rejects `nullable`
+    /// beside `anyOf` ("anyOf must be the only field set"), so a `"null"`
+    /// member becomes `nullable: true` *inside* each branch, and the parent
+    /// carries neither `type` nor `nullable`.
+    #[test]
+    fn response_format_nullable_multitype_union_lowered_to_any_of() {
+        let field = lowered_response_field(r#"{ "type": ["string", "number", "null"] }"#);
+        assert_eq!(
+            field,
+            serde_json::json!({
+                "anyOf": [
+                    { "type": "string", "nullable": true },
+                    { "type": "number", "nullable": true },
+                ]
+            }),
+            "nullable union must map to anyOf with per-branch nullable and nothing beside it: {field}",
+        );
+    }
+
+    /// A non-nullable multi-type union maps to a bare `anyOf`.
+    #[test]
+    fn response_format_multitype_union_without_null() {
+        let field = lowered_response_field(r#"{ "type": ["string", "number"] }"#);
+        assert_eq!(
+            field,
+            serde_json::json!({ "anyOf": [{ "type": "string" }, { "type": "number" }] }),
+            "a non-nullable union must map to a bare anyOf: {field}",
+        );
+    }
+
+    /// A single-element `type` array collapses to a scalar `type`.
+    #[test]
+    fn response_format_single_element_type_array_collapses() {
+        let field = lowered_response_field(r#"{ "type": ["string"] }"#);
+        assert_eq!(field, serde_json::json!({ "type": "string" }), "{field}");
+    }
+
+    /// A null-only `type` has no Gemini form, so it is left untouched rather
+    /// than inverted into a constraint-free nullable node.
+    #[test]
+    fn response_format_null_only_type_passes_through() {
+        let field = lowered_response_field(r#"{ "type": ["null"] }"#);
+        assert_eq!(field, serde_json::json!({ "type": ["null"] }), "{field}");
+    }
+
+    /// A non-string member is malformed, so the array is left untouched
+    /// rather than lowered into a garbage branch.
+    #[test]
+    fn response_format_non_string_type_member_passes_through() {
+        let field = lowered_response_field(r#"{ "type": ["string", 3] }"#);
+        assert_eq!(
+            field,
+            serde_json::json!({ "type": ["string", 3] }),
+            "{field}"
+        );
+    }
+
+    /// When a node already owns an `anyOf`, the union lowering must not
+    /// overwrite it — the array `type` is left untouched instead of
+    /// silently dropping the caller's constraint.
+    #[test]
+    fn response_format_union_preserves_existing_any_of() {
+        let field = lowered_response_field(
+            r#"{ "type": ["string", "number"], "anyOf": [{ "minLength": 3 }] }"#,
+        );
         assert_eq!(
             field["anyOf"],
-            serde_json::json!([{ "type": "string" }, { "type": "number" }]),
-            "concrete members must map to one anyOf branch each: {field}",
+            serde_json::json!([{ "minLength": 3 }]),
+            "the caller's anyOf must survive: {field}",
         );
         assert_eq!(
-            field["nullable"], true,
-            "the null member must become nullable: true on the parent: {field}",
-        );
-        assert!(
-            field.get("type").is_none(),
-            "the array-valued type must not survive alongside anyOf: {field}",
+            field["type"],
+            serde_json::json!(["string", "number"]),
+            "the array type is left untouched when lowering would clobber anyOf: {field}",
         );
     }
 
