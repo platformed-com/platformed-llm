@@ -540,6 +540,11 @@ pub struct MockProvider {
     mode: Mode,
     chunking: Chunking,
     log: Arc<Mutex<Vec<RecordedCall>>>,
+    /// Cooperative rate limiter consulted before each scripted reply
+    /// is yielded — included so multi-tenant / priority behaviour can
+    /// be tested without a network round-trip. Defaults to
+    /// [`crate::NoOpRateLimiter`].
+    rate_limiter: crate::rate_limit::SharedRateLimiter,
 }
 
 impl MockProvider {
@@ -548,6 +553,7 @@ impl MockProvider {
             mode,
             chunking,
             log: Arc::new(Mutex::new(Vec::new())),
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         }
     }
 
@@ -590,6 +596,16 @@ impl MockProvider {
         self
     }
 
+    /// Attach a shared [`crate::rate_limit::RateLimiter`]. The mock
+    /// honours the limiter exactly the way a hosted provider would
+    /// — acquire before "sending", observe `Success` after — so
+    /// downstream tests can exercise scheduling, fairness, and
+    /// rate-limit observation without standing up a real upstream.
+    pub fn with_rate_limiter(mut self, limiter: crate::rate_limit::SharedRateLimiter) -> Self {
+        self.rate_limiter = limiter;
+        self
+    }
+
     /// A cloneable handle to this provider's recorded calls. Grab it
     /// before moving the provider into the code under test.
     pub fn call_log(&self) -> CallLog {
@@ -627,11 +643,51 @@ impl Provider for MockProvider {
                 config: config.clone(),
             });
 
+        // Honour the rate limiter exactly like a hosted provider —
+        // acquire before yielding the scripted reply, observe with
+        // the outcome derived from the reply.
+        //
+        // The `MockProvider/` prefix disambiguates from the hosted
+        // providers' bucket-key shape (`OpenAI|…|model`, `Anthropic|…`,
+        // …). A test wiring both a `MockProvider` and a real
+        // `OpenAIProvider` behind the same limiter with the same
+        // model name would otherwise share an AIMD bucket,
+        // conflating fake and real backpressure signals.
+        let scope = crate::rate_limit::RateScope {
+            bucket_key: format!("MockProvider/{}", config.model),
+            tenant: config.tenant.unwrap_or(uuid::Uuid::nil()),
+            priority: config.priority.unwrap_or_default(),
+        };
+        let permit = self.rate_limiter.acquire(&scope).await?;
+
         match self.next_reply(prompt, config)? {
-            Reply::Fail(error) => Err(error),
+            Reply::Fail(error) => {
+                // Surface a scripted rate-limit error to the limiter
+                // so downstream tests can drive AIMD / parking
+                // behaviour from the scripted queue.
+                match &error {
+                    Error::RateLimit { retry_after, .. } => {
+                        permit.observe(crate::rate_limit::RateOutcome::RateLimited {
+                            retry_after: *retry_after,
+                            info: crate::rate_limit::ProviderRateInfo::default(),
+                        });
+                    }
+                    _ => permit.observe(crate::rate_limit::RateOutcome::OtherFailure),
+                }
+                Err(error)
+            }
             Reply::Respond(response) => {
+                // Defer observation to stream-end so a scripted
+                // `with_stream_error` mid-stream produces an
+                // `OtherFailure` rather than a misleading `Success`.
                 let events = lower_response(response, &self.chunking);
-                Ok(Response::from_stream(futures_util::stream::iter(events)))
+                let stream = futures_util::stream::iter(events);
+                let observed = crate::rate_limit::observe_response_stream(
+                    stream,
+                    permit,
+                    crate::rate_limit::ProviderRateInfo::default(),
+                );
+                Ok(Response::from_stream(observed))
             }
         }
     }
@@ -986,5 +1042,77 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 4);
         assert_eq!(complete.text(), "raw");
+    }
+
+    /// End-to-end wiring test: `MockProvider` + `InMemoryRateLimiter`
+    /// + `ObservingStream`. A scripted 429 must be observed as
+    /// `RateLimited` by the limiter (i.e. the bucket's `rps` halves
+    /// on the next inspection), proving the whole permit-lifecycle
+    /// flow — acquire → ObservingStream wraps → mid-stream Error
+    /// surfaces → RatePermit::Drop fires observe — is wired
+    /// correctly.
+    #[tokio::test]
+    async fn end_to_end_mock_provider_429_observed_by_limiter() {
+        use std::sync::Arc;
+
+        let limiter = Arc::new(
+            crate::rate_limit::InMemoryRateLimiter::try_with_config(
+                crate::rate_limit::InMemoryRateLimiterConfig {
+                    initial_rps: 4.0,
+                    min_rps: 0.1,
+                    max_rps: 100.0,
+                    additive_step: 1.0,
+                    multiplicative_decrease: 0.5,
+                    default_park: std::time::Duration::from_millis(1),
+                    max_park: std::time::Duration::from_millis(10),
+                    bucket_ttl: std::time::Duration::from_secs(300),
+                },
+            )
+            .unwrap(),
+        );
+        let provider = MockProvider::builder()
+            .reply("ok") // first success → rps stays at initial 4.0
+            .fail(Error::rate_limit(Some(0), "synthetic 429"))
+            .build()
+            .with_rate_limiter(limiter.clone());
+
+        // First call succeeds.
+        let _ = provider
+            .generate(&Prompt::user("x"), &cfg())
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        // Inspect the limiter: bucket should exist, rps unchanged.
+        let rps_initial = limiter
+            .first_bucket_rps()
+            .expect("bucket must exist after one acquire");
+        assert!(
+            (rps_initial - 5.0).abs() < 0.01,
+            "after one Success at additive_step=1 starting from initial_rps=4.0, \
+             rps should grow to 5.0, got {rps_initial}",
+        );
+
+        // Second call: synthetic 429. The mock recognises
+        // `Error::RateLimit` specifically and observes the permit as
+        // `RateLimited` (the typed rate-limit path) rather than
+        // `OtherFailure` — that's the wiring we're proving exists.
+        match provider.generate(&Prompt::user("y"), &cfg()).await {
+            Err(Error::RateLimit { .. }) => {}
+            Err(other) => panic!("expected RateLimit, got {other:?}"),
+            Ok(_) => panic!("expected Err"),
+        }
+        // The `OtherFailure` outcome triggers the AIMD halving (the
+        // limiter doesn't know whether OtherFailure was overload-shaped
+        // or a deterministic 4xx; defaults to a soft decrease).
+        // After the halving from 5.0 with multiplicative_decrease 0.5,
+        // rps should be 2.5.
+        let rps_after_429 = limiter.first_bucket_rps().unwrap();
+        assert!(
+            (rps_after_429 - 2.5).abs() < 0.01,
+            "after a failure with multiplicative_decrease=0.5, rps should halve to 2.5, \
+             got {rps_after_429}",
+        );
     }
 }

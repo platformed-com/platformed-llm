@@ -213,6 +213,23 @@ pub struct RawConfig {
     /// Structured-output constraint (JSON mode / JSON schema). `None`
     /// means unconstrained text output.
     pub response_format: Option<ResponseFormat>,
+    /// Opaque tenant identifier consulted by the provider's
+    /// [`crate::rate_limit::RateLimiter`] for fair queueing. `None`
+    /// collapses to a single anonymous tenant ([`Uuid::nil`](uuid::Uuid::nil)) —
+    /// fine for single-tenant deployments; multi-tenant callers
+    /// should set this per request so the limiter can isolate one
+    /// tenant's burst from another.
+    ///
+    /// Map your own tenant identifier (workspace id, user id, …) to
+    /// a stable [`Uuid`](uuid::Uuid) once per tenant — e.g. UUIDv5 over your
+    /// identifier namespace — and reuse it across requests.
+    pub tenant: Option<uuid::Uuid>,
+    /// Latency priority for the rate limiter. Defaults to
+    /// [`crate::Priority::Interactive`] when unset — most callers
+    /// run user-facing requests, so we minimise their queueing
+    /// latency by default. Background batches should explicitly
+    /// pick [`crate::Priority::Background`].
+    pub priority: Option<crate::rate_limit::Priority>,
 }
 
 /// User-facing request spec. Bundles the [`RawConfig`] payload with
@@ -296,6 +313,8 @@ pub struct ConfigBuilder {
     store: Option<bool>,
     reasoning: Option<ReasoningConfig>,
     response_format: Option<ResponseFormat>,
+    tenant: Option<uuid::Uuid>,
+    priority: Option<crate::rate_limit::Priority>,
     #[allow(clippy::type_complexity)]
     middleware_override: Option<Vec<std::sync::Arc<dyn crate::middleware::Middleware>>>,
 }
@@ -319,6 +338,8 @@ impl ConfigBuilder {
             store: None,
             reasoning: None,
             response_format: None,
+            tenant: None,
+            priority: None,
             middleware_override: None,
         }
     }
@@ -424,6 +445,28 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the opaque tenant identifier the provider's
+    /// [`crate::rate_limit::RateLimiter`] uses for fair queueing.
+    /// Required for multi-tenant deployments — a missing tenant
+    /// collapses every request into one anonymous tenant
+    /// ([`uuid::Uuid::nil`]), so a single noisy caller can starve
+    /// every other request through the shared limiter.
+    ///
+    /// Map your own tenant identifier to a stable [`Uuid`](uuid::Uuid) once per
+    /// tenant (e.g. UUIDv5 over your id namespace) and reuse it.
+    pub fn tenant(mut self, tenant: uuid::Uuid) -> Self {
+        self.tenant = Some(tenant);
+        self
+    }
+
+    /// Set the latency priority. See [`crate::Priority`] for the
+    /// scheduling model — interactive beats standard beats
+    /// background, strictly, across tenants.
+    pub fn priority(mut self, priority: crate::rate_limit::Priority) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
     /// Override the middleware chain. Pass `Vec::new()` to disable all
     /// polyfills (validation will still run and surface unsupported
     /// requests as `Error::Config`). Pass a custom list to add your
@@ -458,6 +501,8 @@ impl ConfigBuilder {
                 store: self.store,
                 reasoning: self.reasoning,
                 response_format: self.response_format,
+                tenant: self.tenant,
+                priority: self.priority,
             },
             middleware_override: self.middleware_override,
         }

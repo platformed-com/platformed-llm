@@ -40,6 +40,8 @@ pub struct GoogleProvider {
     /// Optional object-name prefix for uploaded files (default
     /// `platformed-llm/`).
     gcs_prefix: Option<String>,
+    /// Cooperative rate limiter consulted before every send.
+    rate_limiter: crate::rate_limit::SharedRateLimiter,
 }
 
 impl GoogleProvider {
@@ -51,6 +53,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         })
     }
 
@@ -68,6 +71,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         })
     }
 
@@ -79,6 +83,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         })
     }
 
@@ -92,6 +97,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            rate_limiter: crate::rate_limit::default_shared_limiter(),
         }
     }
 
@@ -125,6 +131,14 @@ impl GoogleProvider {
     /// `platformed-llm/`. A trailing `/` makes it a folder.
     pub fn with_gcs_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.gcs_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Attach a shared [`crate::rate_limit::RateLimiter`]. See the
+    /// equivalent method on the OpenAI provider for the model — same
+    /// trait, same semantics.
+    pub fn with_rate_limiter(mut self, limiter: crate::rate_limit::SharedRateLimiter) -> Self {
+        self.rate_limiter = limiter;
         self
     }
 
@@ -793,12 +807,51 @@ impl Provider for GoogleProvider {
             ],
             body,
         };
-        let response = self.transport.send(req).await?;
+
+        let scope = crate::rate_limit::RateScope {
+            // Vertex quotas are per-project-per-region, so both
+            // `project_id` and `location` must be part of the key —
+            // otherwise two `GoogleProvider` instances for different
+            // GCP projects sharing one limiter would collide, and
+            // one project's 429 would halve/park the shared bucket
+            // while the other's quota was untouched. Mirrors the
+            // `account_key()` shape on the OpenAI side.
+            bucket_key: format!(
+                "Vertex-Google/{}/{}/{}",
+                self.endpoint.project_id(),
+                self.endpoint.location(),
+                config.model,
+            ),
+            tenant: config.tenant.unwrap_or(uuid::Uuid::nil()),
+            priority: config.priority.unwrap_or_default(),
+        };
+        let permit = self.rate_limiter.acquire(&scope).await?;
+        let response = match self.transport.send(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                permit.observe(crate::rate_limit::RateOutcome::OtherFailure);
+                return Err(e);
+            }
+        };
 
         if !(200..300).contains(&response.status) {
             let status = response.status;
             // Read Retry-After before `collect_body` consumes the response.
             let retry_after = crate::transport::parse_retry_after(response.header("retry-after"));
+            // A 5xx with `Retry-After` is semantically a
+            // rate-limit-ish signal (Gemini sometimes sends 503 with
+            // a backoff hint under partial-quota exhaustion). Report
+            // it as `RateLimited` so the limiter parks for the
+            // suggested duration alongside the AIMD halving.
+            let rate_limited = status == 429 || (status >= 500 && retry_after.is_some());
+            if rate_limited {
+                permit.observe(crate::rate_limit::RateOutcome::RateLimited {
+                    retry_after: retry_after.map(std::time::Duration::from_secs),
+                    info: crate::rate_limit::ProviderRateInfo::default(),
+                });
+            } else {
+                permit.observe(crate::rate_limit::RateOutcome::OtherFailure);
+            }
             let body_bytes = response.collect_body().await.unwrap_or_default();
             let body_text = String::from_utf8_lossy(&body_bytes);
             // Vertex 4xx envelopes carry `"status": "UNAUTHENTICATED"` /
@@ -833,6 +886,12 @@ impl Provider for GoogleProvider {
                 ),
             });
         }
+
+        // Success path: defer the limiter observation to stream-end
+        // — see `rate_limit::observe_stream`. We do this even though
+        // Vertex Gemini doesn't have a known mid-stream rate-limit
+        // signal yet, so transport drops mid-response are reported as
+        // `OtherFailure` rather than `Success`.
 
         // Create SSE stream from response (Gemini supports ?alt=sse)
         let sse_stream = SseStream::new("Google", response.body);
@@ -878,7 +937,12 @@ impl Provider for GoogleProvider {
             .map(|events| futures_util::stream::iter(events.into_iter()))
             .flatten();
 
-        Ok(Response::from_stream(event_stream))
+        let observed = crate::rate_limit::observe_response_stream(
+            event_stream,
+            permit,
+            crate::rate_limit::ProviderRateInfo::default(),
+        );
+        Ok(Response::from_stream(observed))
     }
 }
 
