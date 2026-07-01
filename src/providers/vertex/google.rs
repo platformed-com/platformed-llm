@@ -676,24 +676,27 @@ fn normalize_schema_keys(
                 };
                 out.insert(k, mapped);
             }
-            // Gemini's `Schema` proto has no union type and rejects an
-            // array-valued `type`. Lower a JSON-Schema nullable union
-            // (`["T", "null"]`) to a scalar `type` + `nullable: true`. A
-            // union of several concrete types has no Gemini equivalent, so
-            // leave it for the API to reject rather than guess at a mapping.
+            // Gemini's `Schema` proto has no union `type`; an array-valued
+            // `type` reaches the wire raw and Vertex rejects it with a 400.
+            // Lower the nullable-scalar idiom (`["T", "null"]`) to a scalar
+            // `type` + `nullable: true`. A wider union (`["T1", "T2"]`,
+            // with or without `"null"`) has no one-to-one scalar form, so
+            // it passes through untouched for the API to reject.
             "type" => match v {
-                Value::Array(members) if members.iter().any(|m| m.as_str() == Some("null")) => {
+                Value::Array(members)
+                    if members.iter().any(|m| m.as_str() == Some("null"))
+                        && members
+                            .iter()
+                            .filter(|m| m.as_str() != Some("null"))
+                            .count()
+                            == 1 =>
+                {
                     let mut concrete = members
                         .into_iter()
                         .filter(|m| m.as_str() != Some("null"))
                         .collect::<Vec<_>>();
                     out.insert("nullable".to_string(), Value::Bool(true));
-                    let lowered = if concrete.len() == 1 {
-                        concrete.swap_remove(0)
-                    } else {
-                        Value::Array(concrete)
-                    };
-                    out.insert(k, lowered);
+                    out.insert(k, concrete.swap_remove(0));
                 }
                 other => {
                     out.insert(k, other);
@@ -1820,6 +1823,48 @@ mod tests {
         assert_eq!(
             field["nullable"], true,
             "the null member must become nullable: true: {field}",
+        );
+    }
+
+    /// Only the nullable-scalar idiom lowers. A union of several concrete
+    /// types alongside `"null"` has no one-to-one scalar form, so it must
+    /// pass through untouched — not be partially rewritten by dropping
+    /// `"null"` while leaving an array-valued `type`.
+    #[test]
+    fn response_format_multitype_union_passes_through() {
+        use crate::types::ResponseFormat;
+        use std::borrow::Cow;
+        let schema_raw = serde_json::value::RawValue::from_string(
+            r#"{
+                "type": "object",
+                "properties": {
+                    "value": { "type": ["string", "number", "null"] }
+                }
+            }"#
+            .to_string(),
+        )
+        .unwrap();
+        let prompt = crate::Prompt::user("hi");
+        let cfg = Config::builder("gemini")
+            .response_format(ResponseFormat::JsonSchema {
+                name: "Out".to_string(),
+                schema: Cow::Owned(schema_raw),
+                strict: true,
+            })
+            .build();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let field = &json["generationConfig"]["responseSchema"]["properties"]["value"];
+        assert_eq!(
+            field["type"],
+            serde_json::json!(["string", "number", "null"]),
+            "a multi-type union must pass through untouched: {field}",
+        );
+        assert!(
+            field.get("nullable").is_none(),
+            "no nullable flag should be added for an unlowered union: {field}",
         );
     }
 
