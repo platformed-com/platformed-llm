@@ -75,6 +75,19 @@ Implement each provider as a separate module:
 3. Add Vertex providers (sharing auth/transport logic)
 4. Ensure streaming and function calling work across all providers
 
+## Coverage
+
+`scripts/coverage.sh` is the single generator — CI and local runs use it, so
+the numbers can't drift. Run it locally to see coverage:
+
+```bash
+scripts/coverage.sh          # prints the line/region/function summary
+scripts/coverage.sh --html   # also renders target/llvm-cov/html/ for drill-down
+```
+
+Codecov headlines **line** coverage; that's the figure that ties out with a
+local run (region/function are extra local detail Codecov doesn't surface).
+
 ## Important Instructions
 
 ### API Design Principles

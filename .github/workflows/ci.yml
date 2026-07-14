@@ -122,3 +122,35 @@ jobs:
       # so a broken doc snippet still fails CI.
       - name: cargo test --doc
         run: cargo test --doc --all-features --verbose
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Cache test model (shared with llama-gguf-e2e)
+        uses: actions/cache@v4
+        with:
+          path: target/test-models
+          key: llama-gguf-models-v1-smollm2-135m-q8
+      - name: Run coverage
+        env:
+          # cargo-llvm-cov redirects CARGO_TARGET_DIR to
+          # target/llvm-cov-target, which would move the model download
+          # out of the cached target/test-models. Pin the cache dir back
+          # to the shared location so the ~150 MB GGUF model is restored,
+          # not re-fetched.
+          PLATFORMED_LLM_MODEL_CACHE: ${{ github.workspace }}/target/test-models
+        run: ./scripts/coverage.sh
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: target/llvm-cov/lcov.info
+          disable_search: true
+          fail_ci_if_error: false
