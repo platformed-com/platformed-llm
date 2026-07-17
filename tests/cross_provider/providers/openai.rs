@@ -43,19 +43,20 @@ impl ProviderTestSetup for OpenAITestSetup {
                 }
             ],
             "stream": true,
-            "store": false
+            "store": true
         });
 
         // The first turn's `response.completed` carries
         // `"id":"resp_1"`. The lib lifts that into a
         // `ProviderContinuation::OpenAI` on the CompleteResponse;
         // `with_response()` folds it into the conversation as an
-        // `InputItem::Continuation`. The follow-up request therefore
-        // sends ONLY the tool result + `previous_response_id` —
-        // server-side state covers the elided prefix. (Prior to this
-        // wiring, the lib silently dropped the continuation and re-
-        // sent the full history, which is the bug this fixture now
-        // pins against.)
+        // `InputItem::Continuation`. Because this turn is sent with
+        // `store: true`, the response is retained server-side, so the
+        // follow-up chains on it: it sends ONLY the tool result +
+        // `previous_response_id`, and the elided prefix is covered by
+        // server-side state. (With `store: false` the response isn't
+        // retained and the follow-up instead resends the full history —
+        // see `store_false_ignores_continuation_and_resends_history`.)
         let followup = json!({
             "model": "gpt-4o-mini",
             "input": [
@@ -69,7 +70,7 @@ impl ProviderTestSetup for OpenAITestSetup {
             "max_output_tokens": 150,
             "previous_response_id": "resp_1",
             "stream": true,
-            "store": false
+            "store": true
         });
 
         let scripted = ScriptedTransport::new(vec![

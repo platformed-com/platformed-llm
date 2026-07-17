@@ -151,11 +151,25 @@ impl OpenAIProvider {
     ) -> ResponsesRequest {
         let messages = prompt.items();
 
-        // Scan history for the latest InputItem::Continuation carrying
-        // an OpenAI hint. Items at and before that index are elided —
-        // the server already has them via `previous_response_id`.
-        // Continuation markers for other providers are ignored.
-        let (previous_response_id, start_index) = find_latest_openai_continuation(messages);
+        // Continuing a turn from a prior response via `previous_response_id`
+        // only works when that prior response was retained server-side, which
+        // the Responses API does only for requests sent with `store: true`.
+        // Under `store: false` (the default, chosen when prompt/response
+        // content must not be persisted by the provider) no such server-side
+        // state exists, so a `previous_response_id` is rejected with
+        // `previous_response_not_found`. Chaining and the history elision it
+        // implies are therefore gated on `store`: when not storing, ignore any
+        // continuation markers and resend the whole transcript each turn.
+        let store = config.store.unwrap_or(false);
+        let (previous_response_id, start_index) = if store {
+            // Scan history for the latest InputItem::Continuation carrying an
+            // OpenAI hint. Items at and before that index are elided — the
+            // server already has them via `previous_response_id`. Continuation
+            // markers for other providers are ignored.
+            find_latest_openai_continuation(messages)
+        } else {
+            (None, 0)
+        };
 
         let mut input: Vec<crate::providers::openai::types::OpenAIInputMessage> = Vec::new();
         for item in &messages[start_index..] {
@@ -177,7 +191,7 @@ impl OpenAIProvider {
             parallel_tool_calls: config.parallel_tool_calls,
             previous_response_id,
             stream: None,
-            store: Some(config.store.unwrap_or(false)),
+            store: Some(store),
             reasoning: config.reasoning.as_ref().map(convert_reasoning),
             stop: config.stop.clone(),
             presence_penalty: config.presence_penalty,
@@ -1919,13 +1933,38 @@ mod tests {
                 },
             ))
             .with_user("follow-up");
-        let cfg = Config::builder("gpt-5").build();
+        // Chaining is only used when the prior response was stored.
+        let cfg = Config::builder("gpt-5").store(true).build();
         let body =
             provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_1"));
         // Only the items after the assistant turn carrying the
         // continuation reach the wire.
         assert_eq!(body.input.len(), 1);
+    }
+
+    /// With `store: false` (the default) the prior response was never
+    /// retained server-side, so a `previous_response_id` would be rejected.
+    /// The continuation marker is ignored and the full transcript is resent.
+    #[test]
+    fn store_false_ignores_continuation_and_resends_history() {
+        use crate::types::{InputItem, ProviderContinuation};
+        let prompt = Prompt::user("first turn")
+            .with_assistant("first answer")
+            .with_item(InputItem::assistant_continuation(
+                ProviderContinuation::OpenAI {
+                    response_id: "resp_1".to_string(),
+                },
+            ))
+            .with_user("follow-up");
+        let cfg = Config::builder("gpt-5").build();
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
+        assert!(body.previous_response_id.is_none());
+        assert_eq!(body.store, Some(false));
+        // Nothing is elided: both user turns and the assistant answer reach
+        // the wire (the continuation part itself drops out in flattening).
+        assert_eq!(body.input.len(), 3);
     }
 
     /// Full roundtrip: a `CompleteResponse` from a prior turn, folded
@@ -1952,7 +1991,7 @@ mod tests {
         let prompt = Prompt::user("first turn")
             .with_response(&prior)
             .with_user("follow-up");
-        let cfg = Config::builder("gpt-5").build();
+        let cfg = Config::builder("gpt-5").store(true).build();
         let body =
             provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_prior"));
@@ -1979,7 +2018,7 @@ mod tests {
                 },
             ))
             .with_user("c");
-        let cfg = Config::builder("gpt-5").build();
+        let cfg = Config::builder("gpt-5").store(true).build();
         let body =
             provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_new"));
@@ -2000,7 +2039,9 @@ mod tests {
                 },
             ))
             .with_user("b");
-        let cfg = Config::builder("gpt-5").build();
+        // Storing is enabled so this exercises the provider-mismatch path
+        // (a Gemini marker is ignored by OpenAI) rather than the store gate.
+        let cfg = Config::builder("gpt-5").store(true).build();
         let body =
             provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert!(body.previous_response_id.is_none());
