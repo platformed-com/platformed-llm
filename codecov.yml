@@ -1,0 +1,15 @@
+# Coverage is informational while the wire-up beds in: Codecov reports the
+# delta on every PR but never fails the check. Promote to a required/blocking
+# status in a follow-up once the signal has proven stable.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach, diff, flags, files"
+  require_changes: false
