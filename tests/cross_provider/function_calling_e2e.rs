@@ -29,6 +29,9 @@ async fn run_function_calling_test<T: ProviderTestSetup>() -> Result<(), Box<dyn
         .temperature(0.7)
         .max_tokens(150)
         .tools(vec![create_weather_tool()])
+        // Store the response so the OpenAI follow-up can chain on
+        // `previous_response_id`; a no-op for providers that don't store.
+        .store(true)
         .build();
 
     // First turn: ScriptedTransport asserts the lib's emitted request
@@ -102,6 +105,7 @@ async fn run_function_calling_test<T: ProviderTestSetup>() -> Result<(), Box<dyn
     let followup_cfg = Config::builder(config.model)
         .temperature(0.7)
         .max_tokens(150)
+        .store(true)
         .build();
 
     // Second turn: ScriptedTransport asserts the follow-up body shape.

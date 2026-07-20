@@ -480,8 +480,6 @@ Delta[3] "333"
 Delta[3] " m"
 Delta[3] ")."
 PartEnd[3]
-PartStart[4] continuation kind=OpenAI id=<n>
-PartEnd[4]
 Done finish=Stop input=<n> output=<n>
 
 === final ===
@@ -490,4 +488,3 @@ part[0] reasoning len=452 signature_len=0
 part[1] reasoning len=493 signature_len=0
 part[2] reasoning len=454 signature_len=0
 part[3] text "Let t be hours after 3:00 pm when they meet (t ≥ 1). The distances they travel add to 470 km:\n80t + 100(t − 1) = 470\n180t − 100 = 470 → 180t = 570 → t = 570/180 = 19/6 = 3 1/6 h = 3 h 10 min.\n\nThey meet at 3:00 + 3:10 = 6:10 pm.\n\nDistance from Paris = 80t = 80 × 19/6 = 760/3 ≈ 253.33 km (253 km 333 m)." annotations=0
-part[4] continuation kind=OpenAI id=<n>

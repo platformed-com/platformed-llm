@@ -17,11 +17,8 @@ Delta[0] " objects"
 Delta[0] " present"
 Delta[0] "."
 PartEnd[0]
-PartStart[1] continuation kind=OpenAI id=<n>
-PartEnd[1]
 Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
 part[0] text "The image is a plain, bright yellow background with no other details or objects present." annotations=0
-part[1] continuation kind=OpenAI id=<n>
