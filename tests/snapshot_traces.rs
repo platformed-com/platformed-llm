@@ -87,6 +87,10 @@ struct Trace {
     response_sse: Vec<u8>,
     snapshot_path: PathBuf,
     request_model: String,
+    /// `store` the capture was sent with. A continuation marker is only
+    /// surfaced for a stored response, so this drives the continuation
+    /// invariant in `validate_complete_response`.
+    request_store: bool,
 }
 
 fn load_all_traces() -> Vec<Trace> {
@@ -117,12 +121,18 @@ fn load_all_traces() -> Vec<Trace> {
                 None => continue,
             };
             let request_path = dir.join(format!("{scenario}.request.json"));
-            let request_model = read_json(&request_path)
+            let request_json = read_json(&request_path);
+            let request_model = request_json
                 .as_ref()
                 .and_then(|v| v.get("model"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("model")
                 .to_string();
+            let request_store = request_json
+                .as_ref()
+                .and_then(|v| v.get("store"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             // Error captures don't have an SSE-shaped body. They're
             // exercised by `error_traces_e2e` instead. Skip any trace
             // whose meta declares it a failure capture — covers both
@@ -151,6 +161,7 @@ fn load_all_traces() -> Vec<Trace> {
                 response_sse,
                 snapshot_path,
                 request_model,
+                request_store,
             });
         }
     }
@@ -428,6 +439,7 @@ fn validate_complete_response(
     complete: &CompleteResponse,
     provider: Provider,
     scenario: &str,
+    stored: bool,
 ) -> Result<(), String> {
     use platformed_llm::AnnotationKind;
     match scenario {
@@ -504,10 +516,12 @@ fn validate_complete_response(
         }
         _ => {}
     }
-    // Provider-specific sanity: every provider that surfaces a
-    // continuation should emit it as an AssistantPart::Continuation
-    // with the right kind. OpenAI guarantees one per response;
-    // Gemini/Anthropic don't surface continuations today.
+    // Provider-specific sanity: OpenAI surfaces a continuation
+    // (`AssistantPart::Continuation`) only for a *stored* response — a
+    // `previous_response_id` chains onto retained state, so an unstored
+    // response has no valid id to hand back. Presence must therefore track
+    // the request's `store`. Gemini/Anthropic don't surface continuations
+    // today.
     if matches!(provider, Provider::OpenAI) {
         let has_openai_cont = complete.content.iter().any(|p| {
             matches!(
@@ -517,9 +531,16 @@ fn validate_complete_response(
                 )
             )
         });
-        if !has_openai_cont {
-            return Err("OpenAI response missing AssistantPart::Continuation — \
+        if stored && !has_openai_cont {
+            return Err(
+                "stored OpenAI response missing AssistantPart::Continuation — \
                  the streaming wiring may have regressed"
+                    .to_string(),
+            );
+        }
+        if !stored && has_openai_cont {
+            return Err("unstored (store:false) OpenAI response surfaced a \
+                 continuation — an id for an unstored response is not chainable"
                 .to_string());
         }
     }
@@ -634,7 +655,12 @@ async fn unified_event_snapshots_match() {
             }
         };
 
-        if let Err(msg) = validate_complete_response(&complete, trace.provider, &trace.scenario) {
+        if let Err(msg) = validate_complete_response(
+            &complete,
+            trace.provider,
+            &trace.scenario,
+            trace.request_store,
+        ) {
             failures.push(format!("{label}: {msg}"));
             continue;
         }

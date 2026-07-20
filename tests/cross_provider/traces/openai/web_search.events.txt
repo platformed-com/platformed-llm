@@ -94,12 +94,9 @@ Delta[1] "([rust-lang.org](https://rust-lang.org/learn/get-started/?utm_source=o
 PartUpdate[1] annotation kind=UrlCitation start=374 end=451 source="https://rust-lang.org/learn/get-started/?utm_source=openai" title=Some("Getting started - Rust Programming Language")
 Delta[1] " "
 PartEnd[1]
-PartStart[2] continuation kind=OpenAI id=<n>
-PartEnd[2]
 Done finish=Stop input=<n> output=<n>
 
 === final ===
 finish=Stop
 part[0] builtin_tool_call kind=WebSearch arguments="{\"type\":\"search\",\"queries\":[\"latest stable version of Rust programming language October 2023\"],\"query\":\"latest stable version of Rust programming language October 2023\"}" result=None
 part[1] text "As of May 13, 2026, the latest stable version of the Rust programming language is 1.95.0, released on April 16, 2026. ([endoflife.date](https://endoflife.date/rust?utm_source=openai))\n\nTo install or update to this version, you can use the `rustup` tool by running:\n\n```bash\nrustup update stable\n```\n\nThis command will ensure you have the most recent stable release of Rust. ([rust-lang.org](https://rust-lang.org/learn/get-started/?utm_source=openai)) " annotations=2
-part[2] continuation kind=OpenAI id=<n>
