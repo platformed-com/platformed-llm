@@ -11,7 +11,7 @@
 #
 # Runs on *stable* with region+line coverage (no --branch): --branch needs
 # nightly and, combined with async-trait's instantiation shape, trips
-# LLVM #119558 (a SIGSEGV in `llvm-cov export`). Region+line is the metric
+# LLVM #119558 (a SIGSEGV in `llvm-cov export`). Line is the metric
 # Codecov headlines regardless.
 #
 # --all-features pulls in the llama-gguf e2e test, which downloads a ~150 MB
