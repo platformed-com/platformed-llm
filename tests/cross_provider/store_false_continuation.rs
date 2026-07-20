@@ -3,17 +3,18 @@
 //! OpenAI's Responses API returns a `response.completed` frame carrying an
 //! `id` *even when the request set `store: false`* — the recorded
 //! `traces/openai/function_call.response.sse` (captured with `store: false`,
-//! per its `function_call.request.json`) contains one. The accumulator
-//! surfaces that id as a `ProviderContinuation::OpenAI`, so folding the
-//! response back into the next turn puts a continuation marker in history.
+//! per its `function_call.request.json`) contains one. But an unstored
+//! response is not retained server-side, so that id can't be chained from:
+//! a later `previous_response_id` referencing it is rejected with
+//! `previous_response_not_found`.
 //!
-//! The bug: a follow-up would then thread that id through as
-//! `previous_response_id` while still `store: false`. Nothing was retained
-//! server-side to chain from, so OpenAI rejects the request with
-//! `previous_response_not_found`. This test drives the real consumer flow —
-//! replay the recorded bytes → accumulate → `with_response` → follow-up —
-//! over ground-truth captured bytes, and pins that the follow-up does **not**
-//! chain under `store: false`.
+//! The fix surfaces a continuation marker only for *stored* responses, so
+//! folding an unstored response back into the next turn adds no marker and
+//! the follow-up naturally resends the full transcript. This test drives the
+//! real consumer flow — replay the recorded `store: false` bytes →
+//! accumulate → `with_response` → follow-up — over ground-truth captured
+//! bytes, and pins that (a) no chainable continuation is surfaced and (b) the
+//! follow-up does not chain.
 
 use std::fs;
 use std::pin::Pin;
@@ -25,7 +26,7 @@ use futures_util::{Stream, StreamExt};
 use platformed_llm::accumulator::ResponseAccumulator;
 use platformed_llm::providers::OpenAIProvider;
 use platformed_llm::transport::{Transport, TransportImpl, TransportRequest, TransportResponse};
-use platformed_llm::{generate, Config, Error, Prompt, ProviderContinuation};
+use platformed_llm::{generate, Config, Error, Prompt};
 use serde_json::Value;
 
 /// Transport that records the outbound request body and replays a fixed
@@ -112,15 +113,14 @@ async fn store_false_response_id_is_not_chained_on_followup() {
         .map(|c| c.call_id.clone());
     let complete = accumulator.finalize().expect("finalize turn 1");
 
-    // The captured `store: false` response still carried a response id, and
-    // the lib surfaced it as an OpenAI continuation. This is the fact that
-    // makes the chaining bug reachable at all — pin it against real bytes.
+    // The captured response carried a response id even though it was
+    // `store: false` — but because it wasn't retained, the lib must NOT
+    // surface a chainable continuation for it. This is the crux: no marker
+    // means the follow-up can't chain onto an id that points at nothing.
     assert!(
-        matches!(
-            complete.continuation(),
-            Some(ProviderContinuation::OpenAI { .. })
-        ),
-        "recorded store:false response should surface an OpenAI continuation, got {:?}",
+        complete.continuation().is_none(),
+        "a store:false response is not retained, so no chainable continuation \
+         should be surfaced, got {:?}",
         complete.continuation(),
     );
 

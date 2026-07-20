@@ -196,6 +196,13 @@ pub struct ResponsesResponse {
     pub id: String,
     pub output: Vec<ResponseItem>,
     pub usage: Option<OpenAIUsage>,
+    /// Whether the provider retained this response server-side, echoed back
+    /// from the request's `store`. A later turn can only chain onto this
+    /// response via `previous_response_id` if it was stored, so this gates
+    /// whether we surface a continuation marker for it. Absent (`None`) is
+    /// treated as not stored.
+    #[serde(default)]
+    pub store: Option<bool>,
     /// Populated by `response.incomplete` events with `{ reason: ... }`
     /// where `reason` is one of `max_output_tokens`, `content_filter`,
     /// or similar. We map this onto `FinishReason::Length` /

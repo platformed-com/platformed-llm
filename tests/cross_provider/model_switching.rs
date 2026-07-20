@@ -174,9 +174,7 @@ async fn send_to_openai(prompt: &Prompt) -> Value {
         "http://placeholder".into(),
         Transport::new(transport),
     );
-    // Store the turn so the OpenAI continuation chains (and prior history is
-    // elided) rather than being ignored under the default `store: false`.
-    let cfg = Config::builder("gpt-4").store(true).build();
+    let cfg = Config::builder("gpt-4").build();
     let _ = generate(&provider, prompt, &cfg)
         .await
         .expect("generate succeeded");
