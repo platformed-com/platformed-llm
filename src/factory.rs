@@ -28,6 +28,32 @@ impl ProviderType {
     }
 }
 
+/// Capacity pool a Vertex request is served from, sent as the
+/// `X-Vertex-AI-LLM-Request-Type` header.
+#[derive(Clone, Copy, Debug)]
+pub enum VertexRequestType {
+    /// On-demand capacity. The request is not attributed to the
+    /// project's provisioned-throughput commitment.
+    Shared,
+    /// Provisioned-throughput capacity only. Vertex returns 429
+    /// `RESOURCE_EXHAUSTED` once the commitment is saturated; the
+    /// request does not spill over to on-demand capacity.
+    Dedicated,
+}
+
+impl VertexRequestType {
+    /// Name of the header carrying [`Self::as_str`].
+    pub const HEADER: &'static str = "X-Vertex-AI-LLM-Request-Type";
+
+    /// The header value Vertex expects for this pool.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VertexRequestType::Shared => "shared",
+            VertexRequestType::Dedicated => "dedicated",
+        }
+    }
+}
+
 /// Configuration for creating providers.
 ///
 /// Fields are public for inspection but the safe way to *construct*
@@ -88,6 +114,13 @@ pub struct ProviderConfig {
     /// when `provider_type == ProviderType::Google`. Mutate via
     /// [`Self::with_google_gcs_prefix`].
     pub google_gcs_prefix: Option<String>,
+    /// Capacity pool for Vertex requests, sent as the
+    /// `X-Vertex-AI-LLM-Request-Type` header. `None` omits the header,
+    /// leaving Vertex's default: provisioned throughput first, spilling
+    /// over to on-demand once the commitment is saturated. Only applied
+    /// when `provider_type == ProviderType::Google`. Mutate via
+    /// [`Self::with_vertex_request_type`].
+    pub vertex_request_type: Option<VertexRequestType>,
 }
 
 impl ProviderConfig {
@@ -106,6 +139,7 @@ impl ProviderConfig {
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
+            vertex_request_type: None,
         }
     }
 
@@ -137,6 +171,7 @@ impl ProviderConfig {
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
+            vertex_request_type: None,
         })
     }
 
@@ -167,6 +202,7 @@ impl ProviderConfig {
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
+            vertex_request_type: None,
         })
     }
 
@@ -222,6 +258,14 @@ impl ProviderConfig {
     /// bucket. Ignored unless `provider_type == ProviderType::Google`.
     pub fn with_google_gcs_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.google_gcs_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Set the capacity pool Vertex serves the request from
+    /// (`X-Vertex-AI-LLM-Request-Type` header). Ignored unless
+    /// `provider_type == ProviderType::Google`.
+    pub fn with_vertex_request_type(mut self, request_type: VertexRequestType) -> Self {
+        self.vertex_request_type = Some(request_type);
         self
     }
 
@@ -308,6 +352,7 @@ impl fmt::Debug for ProviderConfig {
             anthropic_beta,
             google_gcs_bucket,
             google_gcs_prefix,
+            vertex_request_type,
         } = self;
 
         f.debug_struct("ProviderConfig")
@@ -326,6 +371,7 @@ impl fmt::Debug for ProviderConfig {
             .field("anthropic_beta", &anthropic_beta)
             .field("google_gcs_bucket", &google_gcs_bucket)
             .field("google_gcs_prefix", &google_gcs_prefix)
+            .field("vertex_request_type", &vertex_request_type)
             .finish()
     }
 }
@@ -388,6 +434,9 @@ impl ProviderFactory {
                 }
                 if let Some(prefix) = &config.google_gcs_prefix {
                     provider = provider.with_gcs_prefix(prefix.clone());
+                }
+                if let Some(request_type) = config.vertex_request_type {
+                    provider = provider.with_request_type(request_type);
                 }
                 if let Some(limiter) = &config.rate_limiter {
                     provider = provider.with_rate_limiter(limiter.clone());
@@ -714,6 +763,7 @@ mod tests {
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
+            vertex_request_type: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -738,6 +788,7 @@ mod tests {
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
+            vertex_request_type: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -762,6 +813,7 @@ mod tests {
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
+            vertex_request_type: None,
         };
         let err = ProviderFactory::create(&config)
             .await
@@ -786,6 +838,7 @@ mod tests {
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
+            vertex_request_type: None,
         };
         let err = ProviderFactory::create(&config)
             .await
