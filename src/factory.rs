@@ -657,6 +657,23 @@ mod tests {
         let _provider = ProviderFactory::create(&config).await.unwrap();
     }
 
+    /// Same construction-succeeds proof for the Vertex request type. That the
+    /// header itself reaches the wire is covered by
+    /// `tests/vertex_request_type_header.rs`.
+    #[cfg(feature = "google")]
+    #[tokio::test]
+    async fn create_google_propagates_vertex_request_type() {
+        let config = ProviderConfig::vertex(
+            ProviderType::Google,
+            "test-project".into(),
+            "us-east1".into(),
+            "ya29.token".into(),
+        )
+        .unwrap()
+        .with_vertex_request_type(VertexRequestType::Shared);
+        let _provider = ProviderFactory::create(&config).await.unwrap();
+    }
+
     /// Same construction-succeeds proof for Anthropic beta ids.
     #[cfg(feature = "anthropic-vertex")]
     #[tokio::test]

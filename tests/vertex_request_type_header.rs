@@ -86,9 +86,8 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// The header name and value are written out in full rather than read from
-/// `VertexRequestType` — asserting against the same source the provider renders
-/// from would pass even if that source were wrong.
+/// Hardcoded to keep this assertion independent of the constants the provider
+/// renders from — reading them back would pass even if they were wrong.
 #[tokio::test]
 async fn shared_request_type_sends_shared_header() {
     let headers = headers_for(Some(VertexRequestType::Shared)).await;
