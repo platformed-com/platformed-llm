@@ -12,7 +12,7 @@ use bytes::Bytes;
 
 use super::endpoint::VertexEndpoint;
 use super::google_types::*;
-use crate::factory::ProviderType;
+use crate::factory::{ProviderType, VertexRequestType};
 use crate::provider::Provider;
 use crate::providers::file_resolve::{
     media_type_extension, percent_encode, resolve_refs, NoLibraryUpload, ProviderUploader,
@@ -42,6 +42,10 @@ pub struct GoogleProvider {
     gcs_prefix: Option<String>,
     /// Cooperative rate limiter consulted before every send.
     rate_limiter: crate::rate_limit::SharedRateLimiter,
+    /// Capacity pool requests are served from. `None` omits the
+    /// `X-Vertex-AI-LLM-Request-Type` header, leaving Vertex's default of
+    /// provisioned throughput with spillover to on-demand.
+    request_type: Option<VertexRequestType>,
 }
 
 impl GoogleProvider {
@@ -54,6 +58,7 @@ impl GoogleProvider {
             gcs_bucket: None,
             gcs_prefix: None,
             rate_limiter: crate::rate_limit::default_shared_limiter(),
+            request_type: None,
         })
     }
 
@@ -72,6 +77,7 @@ impl GoogleProvider {
             gcs_bucket: None,
             gcs_prefix: None,
             rate_limiter: crate::rate_limit::default_shared_limiter(),
+            request_type: None,
         })
     }
 
@@ -84,6 +90,7 @@ impl GoogleProvider {
             gcs_bucket: None,
             gcs_prefix: None,
             rate_limiter: crate::rate_limit::default_shared_limiter(),
+            request_type: None,
         })
     }
 
@@ -98,6 +105,7 @@ impl GoogleProvider {
             gcs_bucket: None,
             gcs_prefix: None,
             rate_limiter: crate::rate_limit::default_shared_limiter(),
+            request_type: None,
         }
     }
 
@@ -139,6 +147,13 @@ impl GoogleProvider {
     /// trait, same semantics.
     pub fn with_rate_limiter(mut self, limiter: crate::rate_limit::SharedRateLimiter) -> Self {
         self.rate_limiter = limiter;
+        self
+    }
+
+    /// Set the capacity pool requests are served from, sent as the
+    /// `X-Vertex-AI-LLM-Request-Type` header.
+    pub fn with_request_type(mut self, request_type: VertexRequestType) -> Self {
+        self.request_type = Some(request_type);
         self
     }
 
@@ -825,14 +840,17 @@ impl Provider for GoogleProvider {
         );
 
         let body = serde_json::to_vec(&google_request)?;
-        let req = TransportRequest {
-            url,
-            headers: vec![
-                self.endpoint.auth_header().await?,
-                ("Content-Type".to_string(), "application/json".to_string()),
-            ],
-            body,
-        };
+        let mut headers = vec![
+            self.endpoint.auth_header().await?,
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        if let Some(request_type) = self.request_type {
+            headers.push((
+                VertexRequestType::HEADER.to_string(),
+                request_type.as_str().to_string(),
+            ));
+        }
+        let req = TransportRequest { url, headers, body };
 
         let scope = crate::rate_limit::RateScope {
             // Vertex quotas are per-project-per-region, so both
