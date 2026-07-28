@@ -35,8 +35,8 @@ impl TransportImpl for RecordingTransport {
     async fn send(&self, req: TransportRequest) -> Result<TransportResponse, Error> {
         *self.headers.lock().unwrap() = Some(req.headers.clone());
 
-        let body = br#"{"error":{"code":400,"message":"stop here","status":"INVALID_ARGUMENT"}}"#
-            .to_vec();
+        let body =
+            br#"{"error":{"code":400,"message":"stop here","status":"INVALID_ARGUMENT"}}"#.to_vec();
         let stream: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> =
             Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from(body))]));
         Ok(TransportResponse {
