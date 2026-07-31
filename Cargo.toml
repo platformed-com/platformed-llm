@@ -36,12 +36,9 @@ reqwest = { version = "0.12", features = [
     "json",
     "stream",
 ], default-features = false, optional = true }
-# Used only to downcast a `reqwest` error's source chain to
-# `hyper::Error` when classifying transport failures as retryable —
-# hyper reports a connection lost mid-body as a reqwest *decode*
-# error, and the source chain is the only way to tell that apart from
-# a corrupt payload. Must stay on the same major as the hyper behind
-# `reqwest`, or the downcast silently stops matching.
+# Only for downcasting reqwest error sources in retry classification.
+# Must stay on the same major as reqwest's own hyper, or the downcast
+# silently stops matching.
 hyper = { version = "1", default-features = false, optional = true }
 # Lazy JSON value used by the OpenAI and Vertex wire-type structs.
 ijson = { version = "0.1", optional = true }
