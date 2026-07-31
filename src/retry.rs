@@ -35,14 +35,18 @@
 //!   `server_error` / `server_overloaded` / `internal_error`
 //!   frames).
 //! - [`Error::Transport`] for any of the network failure shapes
-//!   (`is_connect()` / `is_timeout()` / `is_request()` / `is_body()`)
-//!   — TLS handshake reset, connect timeout, DNS hiccup, mid-body
-//!   connection drop. The library deliberately errs on the side of
-//!   over-retrying: `is_body()` also fires for deterministic decode
-//!   failures (gzip corruption, broken UTF-8), but in practice
-//!   mid-body connection drops dominate, and silently giving up on
-//!   them is worse than burning 4× latency on the rare bad-decode
-//!   case.
+//!   (`is_connect()` / `is_timeout()` / `is_request()` / `is_body()`,
+//!   plus `is_decode()` when the source chain carries a `hyper`/IO
+//!   cause — hyper reports a connection lost mid-body as a decode
+//!   error wrapping the transport cause) — TLS handshake reset,
+//!   connect timeout, DNS hiccup, mid-body connection drop. The
+//!   library deliberately errs on the side of over-retrying:
+//!   `is_body()` also fires for deterministic decode failures (gzip
+//!   corruption, broken UTF-8), but in practice mid-body connection
+//!   drops dominate, and silently giving up on them is worse than
+//!   burning 4× latency on the rare bad-decode case. Decode errors
+//!   with no transport-level cause (a payload that genuinely failed
+//!   to parse) stay terminal.
 //!
 //! Every retry is a fresh request; the helper does not attempt to
 //! "resume" a partially-streamed response.
