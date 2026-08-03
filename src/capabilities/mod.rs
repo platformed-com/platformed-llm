@@ -305,7 +305,7 @@ mod tests {
             assert_eq!(c.max_output_tokens, 16_384, "{m}");
         }
 
-        // gpt-5 family: 5.4 / 5.5 are 1.05M context; base 5 is 400k.
+        // gpt-5 family: 5.4 / 5.5 / 5.6 are 1.05M context; base 5 is 400k.
         assert_eq!(Capabilities::openai("gpt-5").context_window_tokens, 400_000);
         assert_eq!(
             Capabilities::openai("gpt-5.4").context_window_tokens,
@@ -315,6 +315,14 @@ mod tests {
             Capabilities::openai("gpt-5.5").context_window_tokens,
             1_050_000
         );
+        // The 5.6 tier names must reach the family row, not the `gpt-` catch-all.
+        for m in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(
+                Capabilities::openai(m).context_window_tokens,
+                1_050_000,
+                "{m}"
+            );
+        }
 
         // gpt-4.1 — 1M context.
         assert_eq!(
