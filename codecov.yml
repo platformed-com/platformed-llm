@@ -1,14 +1,10 @@
-# Coverage is informational while the wire-up beds in: Codecov reports the
-# delta on every PR but never fails the check. Promote to a required/blocking
-# status in a follow-up once the signal has proven stable.
+# Codecov posts a coverage report comment on every PR, with no pass/fail
+# verdict: whether new code needs more coverage is the PR author's
+# judgement call, so no status comparison is configured.
 coverage:
   status:
-    project:
-      default:
-        informational: true
-    patch:
-      default:
-        informational: true
+    project: off
+    patch: off
 
 comment:
   layout: "reach, diff, flags, files"
