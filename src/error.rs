@@ -248,16 +248,18 @@ impl Error {
     /// re-issuing the same request is likely to behave differently
     /// next time.
     ///
-    /// Returns `true` for [`Self::RateLimit`], for [`Self::Transport`]
-    /// **only when** the wrapped `reqwest::Error` is a connect or
-    /// timeout failure (the unambiguously transient network shapes
-    /// — request-build, body-read, decode, and startup errors stay
-    /// terminal because they could equally be deterministic bugs),
-    /// and for [`Self::Provider`] when its `retryable` flag is set
-    /// (5xx / 429, mid-stream connection-drop errors that we
-    /// classified as transient at their site). All other variants
-    /// are terminal — re-issuing the same request won't change the
-    /// outcome (bad auth, malformed prompt, model unavailable,
+    /// Returns `true` for [`Self::RateLimit`]; for [`Self::Transport`]
+    /// when the wrapped `reqwest::Error` is a connect, timeout,
+    /// request-send, or body failure, or a decode failure whose
+    /// source chain carries a transport-level cause (a connection
+    /// lost mid-body surfaces as a decode error wrapping a
+    /// `hyper`/IO error — decode failures caused by the payload
+    /// itself stay terminal); and for [`Self::Provider`] when its
+    /// `retryable` flag is set (5xx / 429, mid-stream
+    /// connection-drop errors that we classified as transient at
+    /// their site). All other variants are terminal — re-issuing
+    /// the same request won't change the outcome (bad auth,
+    /// malformed prompt, model unavailable,
     /// context-window-exceeded, etc.).
     ///
     /// **"Retryable" is not the same as "safe to retry without
@@ -293,16 +295,28 @@ impl Error {
                 //   corruption, broken UTF-8). We deliberately err on
                 //   the side of over-retrying: a connection drop
                 //   mid-stream is by far the more common shape, and
-                //   silently giving up on it (the false-negative the
-                //   prior carve-out preferred) is more painful in
+                //   silently giving up on it is more painful in
                 //   production than burning 4× latency on the
                 //   genuinely-corrupt-decode case.
+                // - `is_decode()` with a transport-level source —
+                //   hyper reports a connection lost mid-body as a
+                //   *decode* error ("error decoding response body")
+                //   wrapping the underlying `hyper::Error` / IO
+                //   error, so those are connection drops in decode
+                //   clothing (h2 stream resets mid-SSE arrive this
+                //   way).
                 //
                 // What stays terminal: `is_builder()` (startup config
-                // error), `is_decode()` for JSON/wire-format decode
-                // failures (we surface those as `Serialization`
-                // anyway), and anything else not in the above set.
-                e.is_connect() || e.is_timeout() || e.is_request() || e.is_body()
+                // error), `is_decode()` whose chain carries no
+                // transport-level source (a payload that genuinely
+                // failed to parse — e.g. `serde_json::Error` — fails
+                // identically on a re-read), and anything else not in
+                // the above set.
+                e.is_connect()
+                    || e.is_timeout()
+                    || e.is_request()
+                    || e.is_body()
+                    || (e.is_decode() && has_transport_source(e))
             }
             Error::RateLimit { .. } => true,
             Error::Provider { retryable, .. } => *retryable,
@@ -334,6 +348,25 @@ impl Error {
             _ => None,
         }
     }
+}
+
+/// Whether a `reqwest` error's source chain carries a transport-level
+/// cause (`hyper::Error` or `std::io::Error`). Distinguishes a
+/// connection lost mid-body — which hyper reports as a *decode*
+/// failure wrapping the transport error — from a payload that
+/// genuinely failed to parse (`serde_json::Error` et al.). Walks the
+/// full chain because the transport cause can sit below intermediate
+/// wrappers (reqwest's compressed-body paths interpose an IO layer).
+#[cfg(feature = "reqwest")]
+fn has_transport_source(e: &reqwest::Error) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        if cause.is::<hyper::Error>() || cause.is::<std::io::Error>() {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 /// Status fragment for the `Provider` Display. Returns only the

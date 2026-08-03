@@ -36,6 +36,10 @@ reqwest = { version = "0.12", features = [
     "json",
     "stream",
 ], default-features = false, optional = true }
+# Only for downcasting reqwest error sources in retry classification.
+# Must stay on the same major as reqwest's own hyper, or the downcast
+# silently stops matching.
+hyper = { version = "1", default-features = false, optional = true }
 # Lazy JSON value used by the OpenAI and Vertex wire-type structs.
 ijson = { version = "0.1", optional = true }
 # Application Default Credentials provider for Vertex.
@@ -111,7 +115,7 @@ default = []
 
 # Default `ReqwestTransport`. Implied by every hosted-provider feature
 # since all of them need an HTTP client.
-reqwest = ["dep:reqwest"]
+reqwest = ["dep:reqwest", "dep:hyper"]
 
 # Cloud providers.
 openai = ["reqwest", "dep:ijson"]

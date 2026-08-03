@@ -1133,6 +1133,7 @@ dependencies = [
  "futures",
  "futures-util",
  "gcp_auth",
+ "hyper",
  "ijson",
  "llama-gguf",
  "memchr",
