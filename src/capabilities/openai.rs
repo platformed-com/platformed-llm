@@ -1,7 +1,7 @@
 //! OpenAI capability table.
 //!
 //! Sourced from <https://developers.openai.com/api/docs/models> as of
-//! 2026-06. Keep the per-row comments accurate — they're the audit
+//! 2026-08. Keep the per-row comments accurate — they're the audit
 //! trail for the next refresh.
 
 use super::{Capabilities, ModelEntry, ModelMatch};
@@ -22,7 +22,9 @@ const fn caps(context: u32, output: u32) -> Capabilities {
 
 /// OpenAI model table, ordered most-specific first.
 pub(super) static MODELS: &[ModelEntry] = &[
-    // ----- GPT-5 family (released 2025; gpt-5.5 added 2026-04) -----
+    // ----- GPT-5 family (released 2025; gpt-5.5 added 2026-04, gpt-5.6 added 2026-07) -----
+    // `gpt-5.6` covers the sol / terra / luna tiers, which share limits.
+    (Prefix("gpt-5.6"), caps(1_050_000, 128_000)),
     (Prefix("gpt-5.5"), caps(1_050_000, 128_000)),
     (Prefix("gpt-5.4-mini"), caps(400_000, 128_000)),
     (Prefix("gpt-5.4-nano"), caps(400_000, 128_000)),
