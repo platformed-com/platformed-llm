@@ -48,8 +48,8 @@ use platformed_llm::transport::{
     Transport, TransportImpl, TransportRequest, TransportResponse, UploadRequest,
 };
 use platformed_llm::{
-    Config, Error, FileResolver, FunctionCall, InputItem, Prompt, ProviderScope, ReasoningConfig,
-    ReasoningEffort, ReasoningSummary, ResolvedFile, ResolvedHandle, Tool,
+    Config, Error, FileResolver, FileResolverError, FunctionCall, InputItem, Prompt, ProviderScope,
+    ReasoningConfig, ReasoningEffort, ReasoningSummary, ResolvedFile, ResolvedHandle, Tool,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -351,18 +351,21 @@ impl FileResolver for CapturingFileResolver {
         &self,
         _id: &str,
         _scope: &ProviderScope,
-    ) -> Result<Option<ResolvedHandle>, Error> {
+    ) -> Result<Option<ResolvedHandle>, FileResolverError> {
         // Always a miss so capture exercises the real upload path.
         Ok(None)
     }
 
-    async fn open(&self, id: &str, _scope: &ProviderScope) -> Result<ResolvedFile, Error> {
-        let (path, media_type) = self
-            .files
-            .get(id)
-            .ok_or_else(|| Error::config(format!("no local file registered for Ref `{id}`")))?;
-        let bytes = std::fs::read(path)
-            .map_err(|e| Error::config(format!("read {}: {e}", path.display())))?;
+    async fn open(
+        &self,
+        id: &str,
+        _scope: &ProviderScope,
+    ) -> Result<ResolvedFile, FileResolverError> {
+        let (path, media_type) = self.files.get(id).ok_or_else(|| {
+            FileResolverError::terminal(format!("no local file registered for Ref `{id}`"))
+        })?;
+        // The `io::Error` converts into `FileResolverError` through `?`.
+        let bytes = std::fs::read(path)?;
         let len = bytes.len() as u64;
         let body = futures_util::stream::once(async move { Ok(Bytes::from(bytes)) });
         Ok(ResolvedFile::Stream {
@@ -377,7 +380,7 @@ impl FileResolver for CapturingFileResolver {
         id: &str,
         _scope: &ProviderScope,
         handle: ResolvedHandle,
-    ) -> Result<(), Error> {
+    ) -> Result<(), FileResolverError> {
         eprintln!("  uploaded Ref `{id}` → {}", handle.uri);
         self.uploaded.lock().unwrap().push(handle.uri);
         Ok(())

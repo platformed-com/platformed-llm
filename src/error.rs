@@ -128,6 +128,23 @@ pub enum Error {
         /// The unsupported modality (`"audio"`, `"video"`).
         modality: &'static str,
     },
+
+    /// A caller-supplied [`FileResolver`](crate::FileResolver) failed to
+    /// resolve a file `Ref` — its backing store or database was unreachable,
+    /// the referenced file was missing, and so on. `source` is the resolver's
+    /// own error; `retryable` is its hint. Produced by converting a
+    /// [`FileResolverError`](crate::FileResolverError) at the resolution
+    /// boundary — distinct from [`Self::Config`] (no resolver was configured)
+    /// and [`Self::Provider`] (a genuine upstream-provider failure).
+    #[error("file resolver error: {source}")]
+    FileResolver {
+        /// The resolver's underlying error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+        /// Whether the resolver classified the failure as transient (feeds
+        /// [`Self::is_retryable`]).
+        retryable: bool,
+    },
 }
 
 impl Error {
@@ -320,6 +337,7 @@ impl Error {
             }
             Error::RateLimit { .. } => true,
             Error::Provider { retryable, .. } => *retryable,
+            Error::FileResolver { retryable, .. } => *retryable,
             Error::Auth { .. }
             | Error::Serialization(_)
             | Error::Config(_)
@@ -390,6 +408,7 @@ fn retry_after_suffix(retry_after: Option<Duration>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileResolverError;
 
     #[test]
     fn provider_constructor_preserves_provider_and_message() {
@@ -506,6 +525,10 @@ mod tests {
         assert!(Error::rate_limit(None, "slow down").is_retryable());
         assert!(Error::provider_with_status("OpenAI", 503, "down").is_retryable());
         assert!(Error::provider_with_status("OpenAI", 429, "slow").is_retryable());
+        assert!(Error::from(FileResolverError::transient("store 503")).is_retryable());
+        // The blanket `From` / `?` path is transient by default.
+        let via_from: Error = FileResolverError::from("bare wrapped error").into();
+        assert!(via_from.is_retryable());
     }
 
     #[test]
@@ -520,6 +543,32 @@ mod tests {
         assert!(!Error::ModelNotAvailable("gpt-x".into()).is_retryable());
         assert!(!Error::context_window_exceeded("OpenAI", "too long").is_retryable());
         assert!(!Error::compaction("empty memo").is_retryable());
+        assert!(!Error::from(FileResolverError::terminal("missing file")).is_retryable());
+    }
+
+    #[test]
+    fn file_resolver_error_preserves_source_and_message() {
+        // A resolver wraps its own std error; `?` reaches this via the blanket
+        // `From`, which classifies it transient. The wrapped error surfaces as
+        // both the Display message and the error `source`.
+        let io = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let resolver_err: FileResolverError = io.into();
+        assert!(resolver_err.is_retryable());
+
+        let err: Error = resolver_err.into();
+        assert!(matches!(
+            err,
+            Error::FileResolver {
+                retryable: true,
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("no such file"));
+        assert!(std::error::Error::source(&err).is_some());
+
+        // `terminal` opts out of the retryable default.
+        let terminal: Error = FileResolverError::terminal("forbidden").into();
+        assert!(!terminal.is_retryable());
     }
 
     #[test]
