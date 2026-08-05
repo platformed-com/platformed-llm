@@ -160,10 +160,11 @@ pub enum ResolvedFile {
         /// efficient single-shot / resumable upload path; `None` forces a
         /// chunked (degraded) upload, which some endpoints reject.
         content_length: Option<u64>,
-        /// The byte stream. Mirrors
-        /// [`TransportResponse::body`](crate::transport::TransportResponse::body);
-        /// dropping it mid-upload must terminate cleanly.
-        body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
+        /// The byte stream. Its item error is [`FileResolverError`] — a
+        /// mid-stream read failure is the resolver's, not the library's, and
+        /// stays retryable by default like any other `?`-propagated resolver
+        /// error. Dropping it mid-upload must terminate cleanly.
+        body: Pin<Box<dyn Stream<Item = Result<Bytes, FileResolverError>> + Send>>,
     },
     /// The caller already holds a provider-specific reference for this
     /// `(id, scope)` — a provider file ID, or a provider-scoped URI such as a

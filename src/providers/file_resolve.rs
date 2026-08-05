@@ -22,7 +22,7 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::Stream;
+use futures_util::{Stream, TryStreamExt};
 
 use crate::types::files::now_unix_secs;
 use crate::types::{
@@ -182,6 +182,10 @@ pub(crate) async fn resolve_refs(
                 content_length,
                 body,
             } => {
+                // The body's item error is the caller's `FileResolverError`;
+                // the internal uploader works in the library's `Error`, so bridge
+                // it here at the caller/library boundary.
+                let body = Box::pin(body.map_err(Error::from));
                 let handle = uploader.upload(&media_type, content_length, body).await?;
                 resolver.store(&id, scope, handle.clone()).await?;
                 map.insert(
