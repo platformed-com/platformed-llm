@@ -697,7 +697,7 @@ mod tests {
     #[cfg(feature = "openai")]
     #[tokio::test]
     async fn create_openai_propagates_file_resolver() {
-        use crate::types::{ProviderScope, ResolvedFile, ResolvedHandle};
+        use crate::types::{FileResolverError, ProviderScope, ResolvedFile, ResolvedHandle};
         // Minimal resolver that never gets called — we're only
         // asserting Arc propagation here.
         struct NoOpResolver;
@@ -707,18 +707,22 @@ mod tests {
                 &self,
                 _id: &str,
                 _scope: &ProviderScope,
-            ) -> Result<Option<ResolvedHandle>, Error> {
+            ) -> Result<Option<ResolvedHandle>, FileResolverError> {
                 Ok(None)
             }
-            async fn open(&self, _id: &str, _scope: &ProviderScope) -> Result<ResolvedFile, Error> {
-                Err(Error::config("noop"))
+            async fn open(
+                &self,
+                _id: &str,
+                _scope: &ProviderScope,
+            ) -> Result<ResolvedFile, FileResolverError> {
+                Err(FileResolverError::terminal("noop"))
             }
             async fn store(
                 &self,
                 _id: &str,
                 _scope: &ProviderScope,
                 _handle: ResolvedHandle,
-            ) -> Result<(), Error> {
+            ) -> Result<(), FileResolverError> {
                 Ok(())
             }
         }

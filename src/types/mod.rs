@@ -19,7 +19,9 @@ pub use config::{
     Config, ConfigBuilder, ProviderContinuation, RawConfig, ReasoningConfig, ReasoningEffort,
     ReasoningSummary, ResponseFormat, ToolChoice, Usage,
 };
-pub use files::{FileResolver, LruFileResolver, ProviderScope, ResolvedFile, ResolvedHandle};
+pub use files::{
+    FileResolver, FileResolverError, LruFileResolver, ProviderScope, ResolvedFile, ResolvedHandle,
+};
 pub use message::{
     Annotation, AnnotationKind, AssistantPart, ComputerUseConfig, FileSource, FinishReason,
     Function, FunctionCall, InputItem, ProviderBuiltin, Tool, UserPart,

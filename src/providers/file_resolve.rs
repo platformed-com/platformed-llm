@@ -241,6 +241,7 @@ impl ProviderUploader for NoLibraryUpload {
 mod tests {
     use super::*;
     use crate::factory::ProviderType;
+    use crate::types::FileResolverError;
     use futures_util::stream;
     use std::sync::Mutex;
 
@@ -273,10 +274,14 @@ mod tests {
             &self,
             id: &str,
             _scope: &ProviderScope,
-        ) -> Result<Option<ResolvedHandle>, Error> {
+        ) -> Result<Option<ResolvedHandle>, FileResolverError> {
             Ok(self.cached.lock().unwrap().get(id).cloned())
         }
-        async fn open(&self, id: &str, _scope: &ProviderScope) -> Result<ResolvedFile, Error> {
+        async fn open(
+            &self,
+            id: &str,
+            _scope: &ProviderScope,
+        ) -> Result<ResolvedFile, FileResolverError> {
             *self
                 .open_calls
                 .lock()
@@ -287,14 +292,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .remove(id)
-                .ok_or_else(|| Error::config(format!("no open scripted for {id}")))
+                .ok_or_else(|| FileResolverError::terminal(format!("no open scripted for {id}")))
         }
         async fn store(
             &self,
             id: &str,
             _scope: &ProviderScope,
             handle: ResolvedHandle,
-        ) -> Result<(), Error> {
+        ) -> Result<(), FileResolverError> {
             self.stored.lock().unwrap().push((id.to_string(), handle));
             Ok(())
         }

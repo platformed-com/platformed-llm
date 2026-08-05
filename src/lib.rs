@@ -82,8 +82,8 @@ pub use response::{CompleteResponse, Response};
 pub use retry::{retry, RetryPolicy};
 pub use types::{
     Annotation, AnnotationKind, AssistantPart, ComputerUseConfig, Config, ConfigBuilder,
-    FileResolver, FileSource, FinishReason, Function, FunctionCall, InputItem, LruFileResolver,
-    PartKind, PartUpdate, Prompt, ProviderBuiltin, ProviderContinuation, ProviderScope, RawConfig,
-    ReasoningConfig, ReasoningEffort, ReasoningSummary, ResolvedFile, ResolvedHandle,
-    ResponseFormat, StreamEvent, Tool, ToolChoice, Usage, UserPart,
+    FileResolver, FileResolverError, FileSource, FinishReason, Function, FunctionCall, InputItem,
+    LruFileResolver, PartKind, PartUpdate, Prompt, ProviderBuiltin, ProviderContinuation,
+    ProviderScope, RawConfig, ReasoningConfig, ReasoningEffort, ReasoningSummary, ResolvedFile,
+    ResolvedHandle, ResponseFormat, StreamEvent, Tool, ToolChoice, Usage, UserPart,
 };

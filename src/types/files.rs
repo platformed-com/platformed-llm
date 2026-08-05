@@ -228,6 +228,88 @@ impl std::fmt::Debug for ResolvedFile {
     }
 }
 
+/// The error a [`FileResolver`] returns: the caller's own failure (a database
+/// or object-store error, a missing file, …) plus whether retrying the request
+/// might clear it. The library converts it into
+/// [`Error::FileResolver`](crate::Error::FileResolver) at the resolution
+/// boundary, preserving the wrapped error as the [`source`](std::error::Error::source).
+///
+/// Like `anyhow::Error`, this is deliberately **not** a [`std::error::Error`]
+/// itself: that lets the blanket [`From`] turn any boxed-error-convertible
+/// value — a `std` error, an `anyhow::Error`, a `String`, a `&str` — into it,
+/// so a resolver body can lean on `?`.
+///
+/// **The `?` / [`From`] path marks the failure retryable.** Re-resolving is
+/// safe by contract — [`FileResolver::open`] is a factory the library may call
+/// again — so an unclassified failure (a `?`-propagated store or database
+/// error) is treated as transient rather than assumed terminal, giving the
+/// request's retry policy a chance to clear it. Reach for
+/// [`terminal`](FileResolverError::terminal) for a failure a retry cannot fix
+/// (a missing or forbidden file).
+pub struct FileResolverError {
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    retryable: bool,
+}
+
+impl FileResolverError {
+    /// Wrap a **transient** failure — a store or database temporarily
+    /// unreachable, which a retry may clear. Same classification as the blanket
+    /// [`From`] / `?`; use it when you want the intent explicit at the call site.
+    pub fn transient(
+        source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            retryable: true,
+        }
+    }
+
+    /// Wrap a **terminal** failure — retrying the request won't help (e.g. the
+    /// file is missing or forbidden). Surfaces through
+    /// [`Error::is_retryable`](crate::Error::is_retryable) as non-retryable.
+    pub fn terminal(source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>) -> Self {
+        Self {
+            source: source.into(),
+            retryable: false,
+        }
+    }
+
+    /// Whether the failure was classified as transient (a retry may help).
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+impl<E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>> From<E> for FileResolverError {
+    fn from(source: E) -> Self {
+        Self::transient(source)
+    }
+}
+
+impl std::fmt::Display for FileResolverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::fmt::Debug for FileResolverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileResolverError")
+            .field("retryable", &self.retryable)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+impl From<FileResolverError> for Error {
+    fn from(e: FileResolverError) -> Self {
+        Error::FileResolver {
+            source: e.source,
+            retryable: e.retryable,
+        }
+    }
+}
+
 /// Caller-supplied indirection between portable file IDs and
 /// provider-specific upload handles — the "file registry".
 ///
@@ -240,6 +322,11 @@ impl std::fmt::Debug for ResolvedFile {
 /// same `(id, scope)` — on a transient upload failure, on recovery from an
 /// expired/evicted handle, or on a redirect — and each call **must** yield an
 /// independently readable payload.
+///
+/// Methods return [`FileResolverError`]: wrap your own error with `?` (or
+/// [`FileResolverError::terminal`] to opt out of the retryable default) rather
+/// than reaching for a [`crate::Error`] variant, which is the library's own
+/// taxonomy.
 #[async_trait]
 pub trait FileResolver: Send + Sync {
     /// Return a cached provider handle for `(id, scope)` if the caller has
@@ -249,11 +336,15 @@ pub trait FileResolver: Send + Sync {
         &self,
         id: &str,
         scope: &ProviderScope,
-    ) -> Result<Option<ResolvedHandle>, Error>;
+    ) -> Result<Option<ResolvedHandle>, FileResolverError>;
 
     /// Produce the file for `(id, scope)`. May be called repeatedly; each
     /// call must yield a fresh, independent [`ResolvedFile`].
-    async fn open(&self, id: &str, scope: &ProviderScope) -> Result<ResolvedFile, Error>;
+    async fn open(
+        &self,
+        id: &str,
+        scope: &ProviderScope,
+    ) -> Result<ResolvedFile, FileResolverError>;
 
     /// Persist a handle the library just uploaded so future `lookup` calls
     /// for `(id, scope)` hit it.
@@ -262,7 +353,7 @@ pub trait FileResolver: Send + Sync {
         id: &str,
         scope: &ProviderScope,
         handle: ResolvedHandle,
-    ) -> Result<(), Error>;
+    ) -> Result<(), FileResolverError>;
 }
 
 /// An in-memory LRU cache in front of another [`FileResolver`].
@@ -373,7 +464,7 @@ impl FileResolver for LruFileResolver {
         &self,
         id: &str,
         scope: &ProviderScope,
-    ) -> Result<Option<ResolvedHandle>, Error> {
+    ) -> Result<Option<ResolvedHandle>, FileResolverError> {
         let now = now_unix_secs();
         // Cache probe — guard dropped before any await.
         {
@@ -392,7 +483,11 @@ impl FileResolver for LruFileResolver {
         Ok(result)
     }
 
-    async fn open(&self, id: &str, scope: &ProviderScope) -> Result<ResolvedFile, Error> {
+    async fn open(
+        &self,
+        id: &str,
+        scope: &ProviderScope,
+    ) -> Result<ResolvedFile, FileResolverError> {
         self.inner.open(id, scope).await
     }
 
@@ -401,7 +496,7 @@ impl FileResolver for LruFileResolver {
         id: &str,
         scope: &ProviderScope,
         handle: ResolvedHandle,
-    ) -> Result<(), Error> {
+    ) -> Result<(), FileResolverError> {
         self.cache.lock().unwrap().put(scope, id, handle.clone());
         self.inner.store(id, scope, handle).await
     }
@@ -427,19 +522,23 @@ mod tests {
             &self,
             _id: &str,
             _scope: &ProviderScope,
-        ) -> Result<Option<ResolvedHandle>, Error> {
+        ) -> Result<Option<ResolvedHandle>, FileResolverError> {
             self.lookups.fetch_add(1, Ordering::SeqCst);
             Ok(self.handle.lock().unwrap().clone())
         }
-        async fn open(&self, _id: &str, _scope: &ProviderScope) -> Result<ResolvedFile, Error> {
-            Err(Error::config("not used"))
+        async fn open(
+            &self,
+            _id: &str,
+            _scope: &ProviderScope,
+        ) -> Result<ResolvedFile, FileResolverError> {
+            Err(FileResolverError::terminal("not used"))
         }
         async fn store(
             &self,
             _id: &str,
             _scope: &ProviderScope,
             handle: ResolvedHandle,
-        ) -> Result<(), Error> {
+        ) -> Result<(), FileResolverError> {
             self.stores.fetch_add(1, Ordering::SeqCst);
             *self.handle.lock().unwrap() = Some(handle);
             Ok(())

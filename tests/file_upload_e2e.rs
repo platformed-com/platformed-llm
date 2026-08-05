@@ -26,8 +26,8 @@ use platformed_llm::transport::{
     Transport, TransportImpl, TransportRequest, TransportResponse, UploadRequest,
 };
 use platformed_llm::{
-    generate, Config, Error, FileResolver, FileSource, InputItem, Prompt, ProviderScope,
-    ResolvedFile, ResolvedHandle, StreamEvent, UserPart,
+    generate, Config, Error, FileResolver, FileResolverError, FileSource, InputItem, Prompt,
+    ProviderScope, ResolvedFile, ResolvedHandle, StreamEvent, UserPart,
 };
 use serde_json::Value;
 
@@ -88,11 +88,15 @@ impl FileResolver for LocalFileResolver {
         &self,
         _id: &str,
         _scope: &ProviderScope,
-    ) -> Result<Option<ResolvedHandle>, Error> {
+    ) -> Result<Option<ResolvedHandle>, FileResolverError> {
         Ok(None)
     }
 
-    async fn open(&self, _id: &str, _scope: &ProviderScope) -> Result<ResolvedFile, Error> {
+    async fn open(
+        &self,
+        _id: &str,
+        _scope: &ProviderScope,
+    ) -> Result<ResolvedFile, FileResolverError> {
         Ok(ResolvedFile::Stream {
             media_type: "image/png".to_string(),
             content_length: Some(3),
@@ -107,7 +111,7 @@ impl FileResolver for LocalFileResolver {
         _id: &str,
         _scope: &ProviderScope,
         _handle: ResolvedHandle,
-    ) -> Result<(), Error> {
+    ) -> Result<(), FileResolverError> {
         Ok(())
     }
 }
