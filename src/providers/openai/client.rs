@@ -797,6 +797,19 @@ fn find_latest_openai_continuation(
     (None, 0)
 }
 
+/// Whether an OpenAI error `type`/`code` string marks a transient
+/// server-side condition. These are the strings OpenAI attaches to
+/// conditions that surface as a retryable 5xx before the stream opens,
+/// so in-stream classification must reach the same verdict — otherwise
+/// a blip mid-stream becomes terminal where the same blip pre-stream
+/// would retry cleanly.
+fn is_transient(kind: &str) -> bool {
+    matches!(
+        kind,
+        "server_error" | "server_overloaded" | "internal_error" | "service_unavailable_error"
+    )
+}
+
 /// Map an OpenAI annotation onto the unified [`Annotation`] surface.
 ///
 /// `Other` variants (forward-compat tag values we don't recognize) are
@@ -914,21 +927,8 @@ impl OpenAIStreamState {
                         format!("{}: {}", error.r#type, error.message),
                     ));
                 }
-                // Mid-stream transient codes mirror the *pre*-stream
-                // 5xx classification: a `server_error` /
-                // `server_overloaded` / `internal_error` frame is the
-                // same upstream condition the HTTP layer would
-                // surface as a 5xx, so the retryable verdict should
-                // match. Without this, a transient blip mid-stream
-                // becomes terminal where the same blip pre-stream
-                // would retry cleanly.
-                let retryable = matches!(
-                    error.r#type.as_str(),
-                    "server_error" | "server_overloaded" | "internal_error"
-                ) || matches!(
-                    error.code.as_deref(),
-                    Some("server_error" | "server_overloaded" | "internal_error")
-                );
+                let retryable = is_transient(error.r#type.as_str())
+                    || matches!(error.code.as_deref(), Some(c) if is_transient(c));
                 Err(Error::Provider {
                     provider: "OpenAI",
                     status: None,
@@ -1184,18 +1184,9 @@ impl OpenAIStreamState {
                 let message = inner_error
                     .map(|e| format!("{}: {}", e.r#type, e.message))
                     .unwrap_or_else(|| "response failed without error details".to_string());
-                // Same retryable-by-transient-type rule as the
-                // mid-stream `error` frame: a `server_error` /
-                // `server_overloaded` / `internal_error` is the
-                // streaming counterpart of a pre-stream 5xx.
                 let retryable = inner_error.is_some_and(|e| {
-                    matches!(
-                        e.r#type.as_str(),
-                        "server_error" | "server_overloaded" | "internal_error"
-                    ) || matches!(
-                        e.code.as_deref(),
-                        Some("server_error" | "server_overloaded" | "internal_error")
-                    )
+                    is_transient(e.r#type.as_str())
+                        || matches!(e.code.as_deref(), Some(c) if is_transient(c))
                 });
                 Err(Error::Provider {
                     provider: "OpenAI",
@@ -1646,26 +1637,47 @@ mod tests {
         }
     }
 
+    /// The transient allowlist mirrors the pre-stream 5xx
+    /// classification: these are the error strings OpenAI uses for
+    /// conditions that would surface as a retryable 5xx before the
+    /// stream opens. The expected strings are duplicated literally
+    /// here on purpose — a test that read the same list the code
+    /// reads would pass tautologically and could never catch a
+    /// deleted entry.
+    #[test]
+    fn transient_allowlist_matches_expected_strings() {
+        for s in [
+            "server_error",
+            "server_overloaded",
+            "internal_error",
+            "service_unavailable_error",
+        ] {
+            assert!(is_transient(s), "{s} must classify as transient");
+        }
+        for s in ["invalid_request_error", "context_length_exceeded", ""] {
+            assert!(!is_transient(s), "{s:?} must not classify as transient");
+        }
+    }
+
     /// In-stream `Error` events with codes *other than*
     /// `context_length_exceeded` must still fall through to the
     /// generic `Error::Provider` path — the typed variant is reserved
-    /// for the one signal compaction callers care about.
-    /// Transient codes (`server_error`, `server_overloaded`,
-    /// `internal_error`) carry `retryable: true` so the retry helper
-    /// honours them — mirroring the pre-stream 5xx classification.
-    /// Without that, a mid-stream blip would become terminal where
-    /// the same blip pre-stream would retry cleanly.
+    /// for the one signal compaction callers care about. OpenAI's
+    /// 503-equivalent arrives as `type: "service_unavailable_error"`
+    /// with no `code`, so the type arm alone must produce a
+    /// retryable verdict.
     #[test]
-    fn in_stream_transient_error_stays_generic_but_retryable() {
+    fn in_stream_transient_type_alone_is_retryable() {
         use crate::providers::openai::types::ErrorDetails;
         let mut state = OpenAIStreamState::new();
         let err = state
             .process(OpenAIStreamEvent::Error {
                 error: ErrorDetails {
-                    message: "model overloaded".to_string(),
-                    r#type: "server_error".to_string(),
+                    message: "Our servers are currently overloaded. Please try again later."
+                        .to_string(),
+                    r#type: "service_unavailable_error".to_string(),
                     param: None,
-                    code: Some("server_overloaded".to_string()),
+                    code: None,
                 },
             })
             .expect_err("Error event must produce an Err");
@@ -1674,11 +1686,124 @@ mod tests {
                 provider: "OpenAI",
                 retryable,
                 ..
+            } => assert!(retryable, "transient type with no code must be retryable"),
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
+    /// A transient `code` under a non-transient `type` must still be
+    /// retryable — the code arm classifies independently of the type
+    /// arm.
+    #[test]
+    fn in_stream_transient_code_alone_is_retryable() {
+        use crate::providers::openai::types::ErrorDetails;
+        let mut state = OpenAIStreamState::new();
+        let err = state
+            .process(OpenAIStreamEvent::Error {
+                error: ErrorDetails {
+                    message: "internal error".to_string(),
+                    r#type: "error".to_string(),
+                    param: None,
+                    code: Some("internal_error".to_string()),
+                },
+            })
+            .expect_err("Error event must produce an Err");
+        match err {
+            Error::Provider {
+                provider: "OpenAI",
+                retryable,
+                ..
+            } => assert!(
+                retryable,
+                "transient code under other type must be retryable"
+            ),
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
+    /// `response.failed` frames classify retryability with the same
+    /// transient allowlist as the mid-stream `error` frame — a
+    /// transient failure must not become terminal just because it
+    /// arrived as the terminal frame shape.
+    #[test]
+    fn response_failed_transient_type_is_retryable() {
+        use crate::providers::openai::types::ErrorDetails;
+        let mut state = OpenAIStreamState::new();
+        let err = state
+            .process(OpenAIStreamEvent::ResponseFailed {
+                response: None,
+                error: Some(ErrorDetails {
+                    message: "Our servers are currently overloaded. Please try again later."
+                        .to_string(),
+                    r#type: "service_unavailable_error".to_string(),
+                    param: None,
+                    code: None,
+                }),
+            })
+            .expect_err("response.failed must produce an Err");
+        match err {
+            Error::Provider {
+                provider: "OpenAI",
+                retryable,
+                ..
+            } => assert!(retryable, "transient response.failed must be retryable"),
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
+    /// The `response.failed` handler's code arm classifies
+    /// independently of its type arm, mirroring the mid-stream frame —
+    /// the two call sites compose the arms separately, so each needs
+    /// its own coverage.
+    #[test]
+    fn response_failed_transient_code_alone_is_retryable() {
+        use crate::providers::openai::types::ErrorDetails;
+        let mut state = OpenAIStreamState::new();
+        let err = state
+            .process(OpenAIStreamEvent::ResponseFailed {
+                response: None,
+                error: Some(ErrorDetails {
+                    message: "internal error".to_string(),
+                    r#type: "error".to_string(),
+                    param: None,
+                    code: Some("internal_error".to_string()),
+                }),
+            })
+            .expect_err("response.failed must produce an Err");
+        match err {
+            Error::Provider {
+                provider: "OpenAI",
+                retryable,
+                ..
+            } => assert!(
+                retryable,
+                "transient code under other type must be retryable"
+            ),
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
+    /// A `response.failed` carrying no error details anywhere is
+    /// non-retryable: with nothing to classify, terminal is the only
+    /// safe verdict.
+    #[test]
+    fn response_failed_without_details_is_not_retryable() {
+        let mut state = OpenAIStreamState::new();
+        let err = state
+            .process(OpenAIStreamEvent::ResponseFailed {
+                response: None,
+                error: None,
+            })
+            .expect_err("response.failed must produce an Err");
+        match err {
+            Error::Provider {
+                provider: "OpenAI",
+                retryable,
+                message,
+                ..
             } => {
-                assert!(
-                    retryable,
-                    "transient mid-stream server_error must be retryable to mirror pre-stream 5xx",
-                );
+                assert!(!retryable, "unclassifiable failure must not be retryable");
+                assert!(message.contains("without error details"));
             }
             other => panic!("expected Provider, got {other:?}"),
         }
