@@ -171,7 +171,8 @@ pub enum ResolvedFile {
         /// A **hint** the provider honors on a best-effort basis: OpenAI turns
         /// it into a real `expires_after` TTL (clamped to its 1h–30d window);
         /// Gemini/GCS stamps it as the object's `customTime` **only** when the
-        /// bucket is [configured to expire on it](crate::GoogleProvider). The
+        /// bucket is configured to expire on it (see
+        /// `GoogleProvider::with_gcs_lifecycle_expiry`). The
         /// provider reports what it actually committed to via the returned
         /// [`ResolvedHandle::expires_at`], which the caller then persists in
         /// [`FileResolver::store`] — so the stored expiry is ground truth, not
