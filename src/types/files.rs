@@ -165,6 +165,18 @@ pub enum ResolvedFile {
         /// stays retryable by default like any other `?`-propagated resolver
         /// error. Dropping it mid-upload must terminate cleanly.
         body: Pin<Box<dyn Stream<Item = Result<Bytes, FileResolverError>> + Send>>,
+        /// The caller's **preferred** expiry for the uploaded file, as a Unix
+        /// timestamp (seconds since the epoch, UTC), or `None` for "no expiry".
+        ///
+        /// A **hint** the provider honors on a best-effort basis: OpenAI turns
+        /// it into a real `expires_after` TTL (clamped to its 1h–30d window);
+        /// Gemini/GCS stamps it as the object's `customTime` **only** when the
+        /// bucket is [configured to expire on it](crate::GoogleProvider). The
+        /// provider reports what it actually committed to via the returned
+        /// [`ResolvedHandle::expires_at`], which the caller then persists in
+        /// [`FileResolver::store`] — so the stored expiry is ground truth, not
+        /// this preference.
+        preferred_expiry: Option<i64>,
     },
     /// The caller already holds a provider-specific reference for this
     /// `(id, scope)` — a provider file ID, or a provider-scoped URI such as a
@@ -210,11 +222,13 @@ impl std::fmt::Debug for ResolvedFile {
             ResolvedFile::Stream {
                 media_type,
                 content_length,
+                preferred_expiry,
                 ..
             } => f
                 .debug_struct("ResolvedFile::Stream")
                 .field("media_type", media_type)
                 .field("content_length", content_length)
+                .field("preferred_expiry", preferred_expiry)
                 .finish_non_exhaustive(),
             ResolvedFile::ProviderHandle(h) => f
                 .debug_tuple("ResolvedFile::ProviderHandle")

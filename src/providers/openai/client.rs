@@ -7,6 +7,7 @@ use crate::providers::file_resolve::{
     media_type_extension, resolve_refs, ProviderUploader, ResolvedRef,
 };
 use crate::transport::{Method, Transport, TransportRequest, UploadRequest};
+use crate::types::files::now_unix_secs;
 use crate::types::{
     Annotation, AnnotationKind, FileResolver, PartKind, PartUpdate, ProviderBuiltin, ProviderScope,
     ReasoningConfig, ReasoningEffort, ReasoningSummary, ResolvedHandle, ToolChoice,
@@ -1284,6 +1285,11 @@ impl OpenAIStreamState {
 /// run is vanishingly unlikely.
 const MULTIPART_BOUNDARY: &str = "platformedllmFormBoundary8x4mZqW2pT";
 
+/// OpenAI's `expires_after.seconds` window: 1 hour to 30 days. A caller's
+/// preferred expiry is clamped into this range.
+const OPENAI_MIN_EXPIRY_SECS: i64 = 3600;
+const OPENAI_MAX_EXPIRY_SECS: i64 = 2_592_000;
+
 /// Best-effort filename (OpenAI requires one) derived from the MIME type.
 fn filename_for(media_type: &str) -> String {
     match media_type_extension(media_type) {
@@ -1304,6 +1310,7 @@ impl ProviderUploader for OpenAIProvider {
         &self,
         media_type: &str,
         content_length: Option<u64>,
+        preferred_expiry: Option<i64>,
         body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
     ) -> Result<ResolvedHandle, Error> {
         let boundary = MULTIPART_BOUNDARY;
@@ -1314,10 +1321,29 @@ impl ProviderUploader for OpenAIProvider {
         } else {
             "user_data"
         };
+        // A caller-preferred expiry becomes an `expires_after` part: OpenAI
+        // anchors the TTL at `created_at` and accepts a `seconds` in
+        // [3600, 2_592_000] (1h–30d). The preference is a hint, so clamp into
+        // that window rather than erroring; the true `expires_at` comes back on
+        // the file object below. A preference already in the past clamps to the
+        // 1h floor.
+        let expires_after = preferred_expiry.map(|exp| {
+            let secs =
+                (exp - now_unix_secs()).clamp(OPENAI_MIN_EXPIRY_SECS, OPENAI_MAX_EXPIRY_SECS);
+            format!(
+                "--{b}\r\nContent-Disposition: form-data; name=\"expires_after[anchor]\"\r\n\r\n\
+                 created_at\r\n\
+                 --{b}\r\nContent-Disposition: form-data; name=\"expires_after[seconds]\"\r\n\r\n\
+                 {secs}\r\n",
+                b = boundary,
+            )
+        });
         let head = format!(
-            "--{b}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\n{purpose}\r\n\
+            "{expires}\
+             --{b}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\n{purpose}\r\n\
              --{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{fname}\"\r\n\
              Content-Type: {mt}\r\n\r\n",
+            expires = expires_after.as_deref().unwrap_or(""),
             b = boundary,
             fname = filename_for(media_type),
             mt = media_type,
@@ -1371,12 +1397,18 @@ impl ProviderUploader for OpenAIProvider {
         #[derive(serde::Deserialize)]
         struct FileObj {
             id: String,
+            /// Present (non-null) only when the file was uploaded with an
+            /// `expires_after`; the server's committed expiry, Unix seconds.
+            #[serde(default)]
+            expires_at: Option<i64>,
         }
         let obj: FileObj = serde_json::from_slice(&bytes)?;
         Ok(ResolvedHandle {
             uri: obj.id,
             media_type: media_type.to_string(),
-            expires_at: None,
+            // Ground truth from the server, not our clamped request value —
+            // `None` when no expiry was requested.
+            expires_at: obj.expires_at,
         })
     }
 }
@@ -1550,6 +1582,114 @@ mod tests {
 
     fn provider() -> OpenAIProvider {
         OpenAIProvider::new("k".to_string()).unwrap()
+    }
+
+    /// Recorded `(url, body)` of the last upload.
+    type Captured = Arc<Mutex<Option<(String, Vec<u8>)>>>;
+
+    /// Upload-only transport that records the request URL + body and replays a
+    /// canned response, so the multipart the provider emits is observable.
+    struct CapturingUpload {
+        captured: Captured,
+        status: u16,
+        resp_body: String,
+    }
+    #[async_trait::async_trait]
+    impl crate::transport::TransportImpl for CapturingUpload {
+        async fn send(
+            &self,
+            _req: TransportRequest,
+        ) -> Result<crate::transport::TransportResponse, Error> {
+            unimplemented!("capturing transport is upload-only")
+        }
+        async fn send_upload(
+            &self,
+            req: UploadRequest,
+        ) -> Result<crate::transport::TransportResponse, Error> {
+            let url = req.url.clone();
+            let mut buf = Vec::new();
+            let mut body = req.body;
+            while let Some(chunk) = body.next().await {
+                buf.extend_from_slice(&chunk.unwrap());
+            }
+            *self.captured.lock().unwrap() = Some((url, buf));
+            let b = Bytes::from(self.resp_body.clone().into_bytes());
+            Ok(crate::transport::TransportResponse {
+                status: self.status,
+                headers: vec![],
+                body: Box::pin(futures_util::stream::once(async move { Ok(b) })),
+            })
+        }
+    }
+
+    fn capturing_provider(status: u16, resp_body: &str) -> (OpenAIProvider, Captured) {
+        let captured = Arc::new(Mutex::new(None));
+        let t = Transport::new(CapturingUpload {
+            captured: captured.clone(),
+            status,
+            resp_body: resp_body.to_string(),
+        });
+        let p = OpenAIProvider::with_transport("k".into(), "https://api.test/v1".into(), t);
+        (p, captured)
+    }
+
+    fn abc_body() -> Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> {
+        Box::pin(futures_util::stream::once(async {
+            Ok(Bytes::from_static(b"abc"))
+        }))
+    }
+
+    /// A preferred expiry beyond OpenAI's 30-day ceiling clamps to the max and
+    /// is emitted as `expires_after`; the handle takes the server's committed
+    /// `expires_at`, not our clamped request value.
+    #[tokio::test]
+    async fn upload_emits_expires_after_clamped_to_max() {
+        let (p, cap) = capturing_provider(200, r#"{"id":"file-xyz","expires_at":1234567890}"#);
+        let far_future = now_unix_secs() + 100 * 86_400; // > 30d
+        let handle = p
+            .upload("application/pdf", Some(3), Some(far_future), abc_body())
+            .await
+            .unwrap();
+        assert_eq!(handle.uri, "file-xyz");
+        assert_eq!(handle.expires_at, Some(1234567890));
+        let (url, body) = cap.lock().unwrap().clone().unwrap();
+        assert!(url.ends_with("/files"), "url was {url}");
+        let s = String::from_utf8(body).unwrap();
+        assert!(s.contains(r#"name="expires_after[anchor]""#));
+        assert!(s.contains("created_at"));
+        assert!(s.contains(r#"name="expires_after[seconds]""#));
+        assert!(s.contains("2592000"), "seconds should clamp to 30d max");
+    }
+
+    /// A preferred expiry already in the past clamps up to the 1-hour floor.
+    #[tokio::test]
+    async fn upload_clamps_past_expiry_to_min() {
+        let (p, cap) = capturing_provider(200, r#"{"id":"f","expires_at":1}"#);
+        let past = now_unix_secs() - 10;
+        p.upload("application/pdf", Some(3), Some(past), abc_body())
+            .await
+            .unwrap();
+        let (_url, body) = cap.lock().unwrap().clone().unwrap();
+        let s = String::from_utf8(body).unwrap();
+        assert!(s.contains("3600"), "seconds should clamp to 1h min");
+    }
+
+    /// No preferred expiry → no `expires_after` part, and a response without
+    /// `expires_at` yields a handle with `None`.
+    #[tokio::test]
+    async fn upload_without_expiry_omits_expires_after() {
+        let (p, cap) = capturing_provider(200, r#"{"id":"file-xyz"}"#);
+        let handle = p
+            .upload("application/pdf", Some(3), None, abc_body())
+            .await
+            .unwrap();
+        assert_eq!(handle.expires_at, None);
+        let (_url, body) = cap.lock().unwrap().clone().unwrap();
+        let s = String::from_utf8(body).unwrap();
+        assert!(
+            !s.contains("expires_after"),
+            "unexpected expires_after: {s}"
+        );
     }
 
     /// `generate()` rejects audio (and video) with a typed

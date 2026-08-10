@@ -372,6 +372,7 @@ impl FileResolver for CapturingFileResolver {
             media_type: media_type.clone(),
             content_length: Some(len),
             body: Box::pin(body),
+            preferred_expiry: None,
         })
     }
 

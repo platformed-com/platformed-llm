@@ -40,6 +40,12 @@ pub struct GoogleProvider {
     /// Optional object-name prefix for uploaded files (default
     /// `platformed-llm/`).
     gcs_prefix: Option<String>,
+    /// Whether the configured bucket has an Object Lifecycle Management rule
+    /// keyed on `customTime` (see [`Self::with_gcs_lifecycle_expiry`]). Only
+    /// when set does a stream's preferred expiry get stamped as `customTime`
+    /// and reflected in the returned handle — otherwise GCS never deletes the
+    /// object and advertising an expiry would be a lie.
+    gcs_lifecycle_expiry: bool,
     /// Cooperative rate limiter consulted before every send.
     rate_limiter: crate::rate_limit::SharedRateLimiter,
     /// Capacity pool requests are served from. `None` omits the
@@ -57,6 +63,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            gcs_lifecycle_expiry: false,
             rate_limiter: crate::rate_limit::default_shared_limiter(),
             request_type: None,
         })
@@ -76,6 +83,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            gcs_lifecycle_expiry: false,
             rate_limiter: crate::rate_limit::default_shared_limiter(),
             request_type: None,
         })
@@ -89,6 +97,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            gcs_lifecycle_expiry: false,
             rate_limiter: crate::rate_limit::default_shared_limiter(),
             request_type: None,
         })
@@ -104,6 +113,7 @@ impl GoogleProvider {
             file_resolver: None,
             gcs_bucket: None,
             gcs_prefix: None,
+            gcs_lifecycle_expiry: false,
             rate_limiter: crate::rate_limit::default_shared_limiter(),
             request_type: None,
         }
@@ -139,6 +149,28 @@ impl GoogleProvider {
     /// `platformed-llm/`. A trailing `/` makes it a folder.
     pub fn with_gcs_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.gcs_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Declare that the configured bucket has an Object Lifecycle Management
+    /// rule that deletes objects based on their `customTime` — e.g.
+    /// `{ action: Delete, condition: { daysSinceCustomTime: 0 } }` to expire
+    /// each object once its `customTime` passes.
+    ///
+    /// **Opt-in and unverified.** GCS has no per-request TTL, so the library
+    /// cannot enforce expiry itself; it can only stamp `customTime` and trust
+    /// your bucket's lifecycle rule to do the deleting. Enabling this without
+    /// such a rule means objects are stamped but never deleted — so it defaults
+    /// to off, and when off a streamed upload's
+    /// [`preferred_expiry`](crate::ResolvedFile::Stream) is ignored and the
+    /// returned handle carries `expires_at: None`.
+    ///
+    /// When on, a stream's preferred expiry is written as the object's
+    /// `customTime` and echoed back on the handle. Lifecycle deletion is
+    /// day-granular and asynchronous (it can lag the `customTime` by up to a
+    /// day), so treat the expiry as a best-effort cleanup, not a hard deadline.
+    pub fn with_gcs_lifecycle_expiry(mut self, enabled: bool) -> Self {
+        self.gcs_lifecycle_expiry = enabled;
         self
     }
 
@@ -994,6 +1026,9 @@ impl Provider for GoogleProvider {
 /// bearer used for Vertex.
 const GCS_UPLOAD_HOST: &str = "https://storage.googleapis.com";
 
+/// Boundary for the `multipart/related` upload used when stamping `customTime`.
+const GCS_MULTIPART_BOUNDARY: &str = "platformedllmGcsRelatedBoundary9k2Lp";
+
 #[async_trait]
 impl ProviderUploader for GoogleProvider {
     /// Stream `body` to a Cloud Storage object and return its `gs://` URI.
@@ -1002,10 +1037,19 @@ impl ProviderUploader for GoogleProvider {
     /// (`uploadType=media`), authenticated with the endpoint's Vertex OAuth
     /// token. The object lives in the configured bucket under the configured
     /// prefix with a random name; Gemini reads it via `fileData.fileUri`.
+    ///
+    /// When the caller supplies a `preferred_expiry` **and** the bucket is
+    /// declared to expire on `customTime`
+    /// ([`with_gcs_lifecycle_expiry`](Self::with_gcs_lifecycle_expiry)), the
+    /// upload switches to a `multipart/related` request that stamps the object's
+    /// `customTime`, and the returned handle carries that expiry. Otherwise the
+    /// preference is ignored and the handle has no expiry — GCS objects are
+    /// durable until something else deletes them.
     async fn upload(
         &self,
         media_type: &str,
         content_length: Option<u64>,
+        preferred_expiry: Option<i64>,
         body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
     ) -> Result<ResolvedHandle, Error> {
         let bucket = self.gcs_bucket.as_deref().ok_or_else(|| {
@@ -1016,20 +1060,60 @@ impl ProviderUploader for GoogleProvider {
             "" => format!("{prefix}{}", Uuid::new_v4()),
             ext => format!("{prefix}{}.{ext}", Uuid::new_v4()),
         };
-        let url = format!(
-            "{GCS_UPLOAD_HOST}/upload/storage/v1/b/{bucket}/o?uploadType=media&name={}",
-            percent_encode(&object),
-        );
-        let headers = vec![
-            self.endpoint.auth_header().await?,
-            ("Content-Type".to_string(), media_type.to_string()),
-        ];
-        let req = UploadRequest {
-            method: Method::Post,
-            url,
-            headers,
-            content_length,
-            body,
+        // Only stamp `customTime` when the bucket is known to act on it — else
+        // we'd advertise an expiry GCS never enforces.
+        let custom_time = preferred_expiry.filter(|_| self.gcs_lifecycle_expiry);
+
+        let req = if let Some(exp) = custom_time {
+            // `multipart/related`: a JSON metadata part carrying `customTime`
+            // (and the object name), followed by the media part streaming `body`.
+            let metadata = format!(
+                r#"{{"name":{name},"customTime":"{time}"}}"#,
+                name = serde_json::Value::String(object.clone()),
+                time = rfc3339_utc(exp),
+            );
+            let head = format!(
+                "--{b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n\
+                 --{b}\r\nContent-Type: {mt}\r\n\r\n",
+                b = GCS_MULTIPART_BOUNDARY,
+                mt = media_type,
+            );
+            let tail = format!("\r\n--{GCS_MULTIPART_BOUNDARY}--\r\n");
+            let head_b = Bytes::from(head.into_bytes());
+            let tail_b = Bytes::from(tail.into_bytes());
+            let total_len = content_length.map(|n| head_b.len() as u64 + n + tail_b.len() as u64);
+            let stream_body = futures_util::stream::once(async move { Ok(head_b) })
+                .chain(body)
+                .chain(futures_util::stream::once(async move { Ok(tail_b) }));
+            UploadRequest {
+                method: Method::Post,
+                url: format!(
+                    "{GCS_UPLOAD_HOST}/upload/storage/v1/b/{bucket}/o?uploadType=multipart"
+                ),
+                headers: vec![
+                    self.endpoint.auth_header().await?,
+                    (
+                        "Content-Type".to_string(),
+                        format!("multipart/related; boundary={GCS_MULTIPART_BOUNDARY}"),
+                    ),
+                ],
+                content_length: total_len,
+                body: Box::pin(stream_body),
+            }
+        } else {
+            UploadRequest {
+                method: Method::Post,
+                url: format!(
+                    "{GCS_UPLOAD_HOST}/upload/storage/v1/b/{bucket}/o?uploadType=media&name={}",
+                    percent_encode(&object),
+                ),
+                headers: vec![
+                    self.endpoint.auth_header().await?,
+                    ("Content-Type".to_string(), media_type.to_string()),
+                ],
+                content_length,
+                body,
+            }
         };
         let response = self.transport.send_upload(req).await?;
         let status = response.status;
@@ -1045,9 +1129,37 @@ impl ProviderUploader for GoogleProvider {
         Ok(ResolvedHandle {
             uri: format!("gs://{bucket}/{object}"),
             media_type: media_type.to_string(),
-            expires_at: None,
+            // We stamped `customTime`, so a lifecycle rule will delete the object
+            // around then; report it so the handle refreshes ahead of deletion.
+            expires_at: custom_time,
         })
     }
+}
+
+/// Format `unix_secs` (seconds since the Unix epoch, UTC) as an RFC 3339
+/// timestamp — the shape GCS expects for `customTime`. Hand-rolled because the
+/// crate carries no date dependency; uses Howard Hinnant's `civil_from_days`.
+fn rfc3339_utc(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let secs_of_day = unix_secs.rem_euclid(86_400);
+    // civil_from_days: days since 1970-01-01 -> (year, month, day), proleptic
+    // Gregorian. See https://howardhinnant.github.io/date_algorithms.html.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+    let (hh, mm, ss) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
+    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 /// Convert a [`FileSource`] (any modality) to a Gemini part: `inlineData` for
@@ -1481,6 +1593,119 @@ pub(crate) fn convert_response_stateful(
 mod tests {
     use super::*;
     use crate::types::Config;
+    use std::sync::Mutex;
+
+    #[test]
+    fn rfc3339_utc_formats_known_instants() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+        assert_eq!(rfc3339_utc(1_234_567_890), "2009-02-13T23:31:30Z");
+        // Leap day.
+        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    /// Recorded `(url, body)` of the last upload.
+    type Captured = Arc<Mutex<Option<(String, Vec<u8>)>>>;
+
+    /// Upload-only transport recording the request URL + body, replaying an
+    /// empty 200 (GCS upload ignores the response body).
+    struct CapturingUpload {
+        captured: Captured,
+    }
+    #[async_trait]
+    impl crate::transport::TransportImpl for CapturingUpload {
+        async fn send(
+            &self,
+            _req: TransportRequest,
+        ) -> Result<crate::transport::TransportResponse, Error> {
+            unimplemented!("capturing transport is upload-only")
+        }
+        async fn send_upload(
+            &self,
+            req: UploadRequest,
+        ) -> Result<crate::transport::TransportResponse, Error> {
+            let url = req.url.clone();
+            let mut buf = Vec::new();
+            let mut body = req.body;
+            while let Some(chunk) = body.next().await {
+                buf.extend_from_slice(&chunk.unwrap());
+            }
+            *self.captured.lock().unwrap() = Some((url, buf));
+            Ok(crate::transport::TransportResponse {
+                status: 200,
+                headers: vec![],
+                body: Box::pin(futures_util::stream::once(async {
+                    Ok(Bytes::from_static(b"{}"))
+                })),
+            })
+        }
+    }
+
+    fn capturing_provider(lifecycle_expiry: bool) -> (GoogleProvider, Captured) {
+        let captured = Arc::new(Mutex::new(None));
+        let endpoint =
+            VertexEndpoint::with_access_token("proj".into(), "us-central1".into(), "tok".into());
+        let t = Transport::new(CapturingUpload {
+            captured: captured.clone(),
+        });
+        let p = GoogleProvider::with_transport(endpoint, t)
+            .with_gcs_bucket("bkt")
+            .with_gcs_lifecycle_expiry(lifecycle_expiry);
+        (p, captured)
+    }
+
+    fn abc_body() -> Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>> {
+        Box::pin(futures_util::stream::once(async {
+            Ok(Bytes::from_static(b"abc"))
+        }))
+    }
+
+    /// With the lifecycle opt-in **off**, a preferred expiry is ignored: plain
+    /// `uploadType=media`, no `customTime`, and no expiry on the handle.
+    #[tokio::test]
+    async fn gcs_ignores_expiry_without_lifecycle_optin() {
+        let (p, cap) = capturing_provider(false);
+        let handle = p
+            .upload("application/pdf", Some(3), Some(2_000_000_000), abc_body())
+            .await
+            .unwrap();
+        assert_eq!(handle.expires_at, None);
+        assert!(handle.uri.starts_with("gs://bkt/"));
+        let (url, body) = cap.lock().unwrap().clone().unwrap();
+        assert!(url.contains("uploadType=media"), "url was {url}");
+        let s = String::from_utf8_lossy(&body);
+        assert!(!s.contains("customTime"));
+    }
+
+    /// With the opt-in **on**, a preferred expiry becomes a `multipart/related`
+    /// upload stamping `customTime`, echoed back on the handle.
+    #[tokio::test]
+    async fn gcs_stamps_custom_time_with_lifecycle_optin() {
+        let (p, cap) = capturing_provider(true);
+        let exp = 2_000_000_000;
+        let handle = p
+            .upload("application/pdf", Some(3), Some(exp), abc_body())
+            .await
+            .unwrap();
+        assert_eq!(handle.expires_at, Some(exp));
+        let (url, body) = cap.lock().unwrap().clone().unwrap();
+        assert!(url.contains("uploadType=multipart"), "url was {url}");
+        let s = String::from_utf8_lossy(&body);
+        assert!(s.contains(&format!(r#""customTime":"{}""#, rfc3339_utc(exp))));
+    }
+
+    /// Opt-in on but no preferred expiry → still the plain media path.
+    #[tokio::test]
+    async fn gcs_optin_without_expiry_uses_media_path() {
+        let (p, cap) = capturing_provider(true);
+        let handle = p
+            .upload("application/pdf", Some(3), None, abc_body())
+            .await
+            .unwrap();
+        assert_eq!(handle.expires_at, None);
+        let (url, _body) = cap.lock().unwrap().clone().unwrap();
+        assert!(url.contains("uploadType=media"), "url was {url}");
+    }
 
     #[test]
     fn detect_context_exceeded_in_invalid_argument_error() {

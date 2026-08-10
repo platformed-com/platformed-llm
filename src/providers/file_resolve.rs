@@ -59,10 +59,16 @@ pub(crate) enum ResolvedRef {
 #[async_trait]
 pub(crate) trait ProviderUploader: Sync {
     /// Upload `body` and return a provider handle referencing it.
+    ///
+    /// `preferred_expiry` is the caller's requested expiry (Unix seconds, UTC)
+    /// from [`ResolvedFile::Stream`], or `None`. Implementors honor it on a
+    /// best-effort basis and report the expiry they actually committed to via
+    /// the returned [`ResolvedHandle::expires_at`].
     async fn upload(
         &self,
         media_type: &str,
         content_length: Option<u64>,
+        preferred_expiry: Option<i64>,
         body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
     ) -> Result<ResolvedHandle, Error>;
 }
@@ -181,12 +187,15 @@ pub(crate) async fn resolve_refs(
                 media_type,
                 content_length,
                 body,
+                preferred_expiry,
             } => {
                 // The body's item error is the caller's `FileResolverError`;
                 // the internal uploader works in the library's `Error`, so bridge
                 // it here at the caller/library boundary.
                 let body = Box::pin(body.map_err(Error::from));
-                let handle = uploader.upload(&media_type, content_length, body).await?;
+                let handle = uploader
+                    .upload(&media_type, content_length, preferred_expiry, body)
+                    .await?;
                 resolver.store(&id, scope, handle.clone()).await?;
                 map.insert(
                     id,
@@ -229,6 +238,7 @@ impl ProviderUploader for NoLibraryUpload {
         &self,
         _media_type: &str,
         _content_length: Option<u64>,
+        _preferred_expiry: Option<i64>,
         body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
     ) -> Result<ResolvedHandle, Error> {
         drop(body);
@@ -319,6 +329,7 @@ mod tests {
             &self,
             media_type: &str,
             _content_length: Option<u64>,
+            preferred_expiry: Option<i64>,
             body: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
         ) -> Result<ResolvedHandle, Error> {
             // Drain so the stream is genuinely consumed.
@@ -332,7 +343,8 @@ mod tests {
             Ok(ResolvedHandle {
                 uri: format!("file-uploaded-{}", *n),
                 media_type: media_type.to_string(),
-                expires_at: None,
+                // Echo the caller's preference so tests can assert it round-trips.
+                expires_at: preferred_expiry,
             })
         }
     }
@@ -348,10 +360,15 @@ mod tests {
     }
 
     fn stream_file(media_type: &str) -> ResolvedFile {
+        stream_file_with_expiry(media_type, None)
+    }
+
+    fn stream_file_with_expiry(media_type: &str, preferred_expiry: Option<i64>) -> ResolvedFile {
         ResolvedFile::Stream {
             media_type: media_type.to_string(),
             content_length: Some(3),
             body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"abc")) })),
+            preferred_expiry,
         }
     }
 
@@ -404,6 +421,26 @@ mod tests {
             1,
             "uploaded handle persisted"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_preferred_expiry_threads_to_store() {
+        // The uploader echoes the stream's preferred expiry as the handle's
+        // committed expiry; that ground-truth value is what gets persisted.
+        let r = FakeResolver::new();
+        r.opens.lock().unwrap().insert(
+            "a".into(),
+            stream_file_with_expiry("application/pdf", Some(1_234_567_890)),
+        );
+        let up = CountingUploader {
+            calls: Mutex::new(0),
+        };
+        resolve_refs(&[img_ref("a")], &scope(), Some(&r), &up)
+            .await
+            .unwrap();
+        let stored = r.stored.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].1.expires_at, Some(1_234_567_890));
     }
 
     #[tokio::test]

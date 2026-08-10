@@ -92,6 +92,7 @@ impl FileResolver for LocalFileResolver {
             body: Box::pin(futures_util::stream::once(async {
                 Ok(Bytes::from_static(b"png"))
             })),
+            preferred_expiry: None,
         })
     }
     async fn store(
