@@ -1303,6 +1303,11 @@ impl ProviderUploader for OpenAIProvider {
     /// Stream `body` to `POST /v1/files` as `multipart/form-data` (never
     /// buffering it whole) and return the resulting `file_id`.
     ///
+    /// A `preferred_expiry` is sent as `expires_after`, with the TTL clamped to
+    /// OpenAI's accepted `[3600, 2_592_000]` (1h–30d) window; the handle's
+    /// `expires_at` is taken from the server's response, not the clamped
+    /// request value.
+    ///
     /// The multipart framing is hand-rolled because the `reqwest` `multipart`
     /// feature isn't enabled and the library streams the file part. Best-effort
     /// against the documented `/v1/files` contract; needs live-API verification.
@@ -1639,6 +1644,16 @@ mod tests {
         }))
     }
 
+    /// The exact value emitted in the `expires_after[seconds]` field, parsed
+    /// out of the multipart body — pins the framed number rather than a loose
+    /// substring (which would let `3600` match `36000`).
+    fn emitted_expires_seconds(body: &str) -> Option<i64> {
+        let rest = body
+            .split_once("name=\"expires_after[seconds]\"\r\n\r\n")?
+            .1;
+        rest.split_once("\r\n")?.0.parse().ok()
+    }
+
     /// A preferred expiry beyond OpenAI's 30-day ceiling clamps to the max and
     /// is emitted as `expires_after`; the handle takes the server's committed
     /// `expires_at`, not our clamped request value.
@@ -1657,8 +1672,32 @@ mod tests {
         let s = String::from_utf8(body).unwrap();
         assert!(s.contains(r#"name="expires_after[anchor]""#));
         assert!(s.contains("created_at"));
-        assert!(s.contains(r#"name="expires_after[seconds]""#));
-        assert!(s.contains("2592000"), "seconds should clamp to 30d max");
+        assert_eq!(
+            emitted_expires_seconds(&s),
+            Some(2_592_000),
+            "clamp to 30d max"
+        );
+    }
+
+    /// A mid-range preference passes through unclamped — the case the two
+    /// clamp-rail tests can't see. A units bug (e.g. treating the hint as
+    /// milliseconds) would land far outside `7195..=7200` while still
+    /// saturating both rails, so this is what actually pins the arithmetic.
+    /// The range absorbs the ≤1s skew between the test's and provider's
+    /// separate `now_unix_secs()` reads.
+    #[tokio::test]
+    async fn upload_passes_through_midrange_seconds() {
+        let (p, cap) = capturing_provider(200, r#"{"id":"f","expires_at":1}"#);
+        let target = now_unix_secs() + 7200; // 2h, inside [3600, 2_592_000]
+        p.upload("application/pdf", Some(3), Some(target), abc_body())
+            .await
+            .unwrap();
+        let (_url, body) = cap.lock().unwrap().clone().unwrap();
+        let secs = emitted_expires_seconds(&String::from_utf8(body).unwrap());
+        assert!(
+            matches!(secs, Some(s) if (7195..=7200).contains(&s)),
+            "want ~7200s, got {secs:?}"
+        );
     }
 
     /// A preferred expiry already in the past clamps up to the 1-hour floor.
@@ -1671,7 +1710,7 @@ mod tests {
             .unwrap();
         let (_url, body) = cap.lock().unwrap().clone().unwrap();
         let s = String::from_utf8(body).unwrap();
-        assert!(s.contains("3600"), "seconds should clamp to 1h min");
+        assert_eq!(emitted_expires_seconds(&s), Some(3600), "clamp to 1h min");
     }
 
     /// No preferred expiry → no `expires_after` part, and a response without

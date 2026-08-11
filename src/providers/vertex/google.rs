@@ -166,9 +166,12 @@ impl GoogleProvider {
     /// returned handle carries `expires_at: None`.
     ///
     /// When on, a stream's preferred expiry is written as the object's
-    /// `customTime` and echoed back on the handle. Lifecycle deletion is
-    /// day-granular and asynchronous (it can lag the `customTime` by up to a
-    /// day), so treat the expiry as a best-effort cleanup, not a hard deadline.
+    /// `customTime` and echoed back on the handle. Deletion is performed by
+    /// your lifecycle rule, asynchronously and with no timing guarantee from
+    /// GCS — Google explicitly says not to rely on an action running within any
+    /// bound of its condition being met. (A `daysSinceCustomTime` rule also
+    /// can't express a sub-day condition.) So treat the expiry as best-effort
+    /// cleanup, not a hard deadline.
     pub fn with_gcs_lifecycle_expiry(mut self, enabled: bool) -> Self {
         self.gcs_lifecycle_expiry = enabled;
         self
@@ -1026,22 +1029,21 @@ impl Provider for GoogleProvider {
 /// bearer used for Vertex.
 const GCS_UPLOAD_HOST: &str = "https://storage.googleapis.com";
 
-/// Boundary for the `multipart/related` upload used when stamping `customTime`.
-const GCS_MULTIPART_BOUNDARY: &str = "platformedllmGcsRelatedBoundary9k2Lp";
-
 #[async_trait]
 impl ProviderUploader for GoogleProvider {
     /// Stream `body` to a Cloud Storage object and return its `gs://` URI.
     ///
-    /// Uses the GCS JSON API single-request media upload
-    /// (`uploadType=media`), authenticated with the endpoint's Vertex OAuth
+    /// Uses the GCS JSON API, authenticated with the endpoint's Vertex OAuth
     /// token. The object lives in the configured bucket under the configured
-    /// prefix with a random name; Gemini reads it via `fileData.fileUri`.
+    /// prefix with a random name; Gemini reads it via `fileData.fileUri`. The
+    /// wire shape depends on whether an expiry is stamped (below): a plain
+    /// `uploadType=media` request normally, or `multipart/related` when a
+    /// `customTime` is attached.
     ///
     /// When the caller supplies a `preferred_expiry` **and** the bucket is
     /// declared to expire on `customTime`
     /// ([`with_gcs_lifecycle_expiry`](Self::with_gcs_lifecycle_expiry)), the
-    /// upload switches to a `multipart/related` request that stamps the object's
+    /// upload uses the `multipart/related` path that stamps the object's
     /// `customTime`, and the returned handle carries that expiry. Otherwise the
     /// preference is ignored and the handle has no expiry — GCS objects are
     /// durable until something else deletes them.
@@ -1067,6 +1069,9 @@ impl ProviderUploader for GoogleProvider {
         let req = if let Some(exp) = custom_time {
             // `multipart/related`: a JSON metadata part carrying `customTime`
             // (and the object name), followed by the media part streaming `body`.
+            // The boundary is per-upload random so it can't collide with — or be
+            // pre-empted by a reader who's read a fixed constant in — the body.
+            let boundary = format!("platformedllm-{}", Uuid::new_v4());
             let metadata = format!(
                 r#"{{"name":{name},"customTime":"{time}"}}"#,
                 name = serde_json::Value::String(object.clone()),
@@ -1075,10 +1080,10 @@ impl ProviderUploader for GoogleProvider {
             let head = format!(
                 "--{b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n\
                  --{b}\r\nContent-Type: {mt}\r\n\r\n",
-                b = GCS_MULTIPART_BOUNDARY,
+                b = boundary,
                 mt = media_type,
             );
-            let tail = format!("\r\n--{GCS_MULTIPART_BOUNDARY}--\r\n");
+            let tail = format!("\r\n--{boundary}--\r\n");
             let head_b = Bytes::from(head.into_bytes());
             let tail_b = Bytes::from(tail.into_bytes());
             let total_len = content_length.map(|n| head_b.len() as u64 + n + tail_b.len() as u64);
@@ -1094,7 +1099,7 @@ impl ProviderUploader for GoogleProvider {
                     self.endpoint.auth_header().await?,
                     (
                         "Content-Type".to_string(),
-                        format!("multipart/related; boundary={GCS_MULTIPART_BOUNDARY}"),
+                        format!("multipart/related; boundary={boundary}"),
                     ),
                 ],
                 content_length: total_len,
@@ -1129,8 +1134,10 @@ impl ProviderUploader for GoogleProvider {
         Ok(ResolvedHandle {
             uri: format!("gs://{bucket}/{object}"),
             media_type: media_type.to_string(),
-            // We stamped `customTime`, so a lifecycle rule will delete the object
-            // around then; report it so the handle refreshes ahead of deletion.
+            // Report the stamped `customTime` so the handle refreshes ahead of
+            // deletion. Whether deletion actually happens is on the caller's
+            // declared lifecycle rule (the opt-in precondition), and GCS runs
+            // it asynchronously with no timing guarantee.
             expires_at: custom_time,
         })
     }

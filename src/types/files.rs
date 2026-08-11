@@ -177,6 +177,13 @@ pub enum ResolvedFile {
         /// [`ResolvedHandle::expires_at`], which the caller then persists in
         /// [`FileResolver::store`] — so the stored expiry is ground truth, not
         /// this preference.
+        ///
+        /// Note the library keeps a small freshness margin
+        /// (`EXPIRY_MARGIN_SECS`, ~60s) and only reuses a cached handle while
+        /// `now + margin < expires_at`. That margin is effectively subtracted
+        /// from the TTL, so a preference within ~a minute of `now` yields a
+        /// handle that's never reused and re-uploaded on every request — pick a
+        /// value comfortably longer than the margin if you want reuse.
         preferred_expiry: Option<i64>,
     },
     /// The caller already holds a provider-specific reference for this
@@ -224,7 +231,10 @@ impl std::fmt::Debug for ResolvedFile {
                 media_type,
                 content_length,
                 preferred_expiry,
-                ..
+                // Named (not `..`) so a future field is an E0027 here rather
+                // than silently dropped from the Debug output. `body` stays
+                // deliberately unprinted; `finish_non_exhaustive` reflects that.
+                body: _,
             } => f
                 .debug_struct("ResolvedFile::Stream")
                 .field("media_type", media_type)

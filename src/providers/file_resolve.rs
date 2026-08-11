@@ -53,9 +53,11 @@ pub(crate) enum ResolvedRef {
     },
 }
 
-/// Provider-specific upload of a streamed file. Implemented by providers that
-/// own a file store (OpenAI); Vertex providers return an error directing the
-/// caller to supply a durable handle/URL instead.
+/// Provider-specific upload of a streamed file. Implemented by providers with
+/// somewhere to put the bytes: OpenAI's Files API, or Gemini/GCS when a bucket
+/// is configured. Providers with no library-owned store (Anthropic, or Gemini
+/// without a bucket) return an error directing the caller to supply a durable
+/// handle/URL instead.
 #[async_trait]
 pub(crate) trait ProviderUploader: Sync {
     /// Upload `body` and return a provider handle referencing it.
