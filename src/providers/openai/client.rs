@@ -1580,6 +1580,29 @@ mod tests {
         OpenAIProvider::new("k".to_string()).unwrap()
     }
 
+    /// `account_key()` feeds both the rate-limit bucket key and
+    /// `ProviderScope::account`, so every account-shaping input — base
+    /// URL, organization, project — must be reflected in it: two
+    /// providers pointed at different upstreams must not share a
+    /// bucket or scope.
+    #[test]
+    fn account_key_reflects_base_url_org_and_project() {
+        assert_eq!(provider().account_key(), "https://api.openai.com/v1");
+
+        let eu = OpenAIProvider::new_with_base_url(
+            "k".to_string(),
+            "https://eu.api.openai.com/v1".to_string(),
+        )
+        .unwrap();
+        assert_eq!(eu.account_key(), "https://eu.api.openai.com/v1");
+
+        let scoped = provider().with_organization("org-A").with_project("proj-A");
+        assert_eq!(
+            scoped.account_key(),
+            "https://api.openai.com/v1|org-A|proj-A"
+        );
+    }
+
     /// Recorded `(url, body)` of the last upload.
     type Captured = Arc<Mutex<Option<(String, Vec<u8>)>>>;
 
