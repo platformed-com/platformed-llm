@@ -97,6 +97,12 @@ pub struct ProviderConfig {
     /// when `provider_type == ProviderType::OpenAI`. Mutate via
     /// [`Self::with_openai_project`].
     pub openai_project: Option<String>,
+    /// Base URL for the OpenAI API, without a trailing slash (e.g.
+    /// `https://eu.api.openai.com/v1` for EU data residency). `None`
+    /// means the default `https://api.openai.com/v1`. Only applied
+    /// when `provider_type == ProviderType::OpenAI`. Mutate via
+    /// [`Self::with_openai_base_url`].
+    pub openai_base_url: Option<String>,
     /// Anthropic beta feature ids (e.g.
     /// `"computer-use-2025-01-24"`). Each id is sent in the
     /// `anthropic-beta` header. Only applied when `provider_type
@@ -136,6 +142,7 @@ impl ProviderConfig {
             file_resolver: None,
             openai_organization: None,
             openai_project: None,
+            openai_base_url: None,
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
@@ -168,6 +175,7 @@ impl ProviderConfig {
             file_resolver: None,
             openai_organization: None,
             openai_project: None,
+            openai_base_url: None,
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
@@ -199,6 +207,7 @@ impl ProviderConfig {
             file_resolver: None,
             openai_organization: None,
             openai_project: None,
+            openai_base_url: None,
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
@@ -236,6 +245,14 @@ impl ProviderConfig {
     /// unless `provider_type == ProviderType::OpenAI`.
     pub fn with_openai_project(mut self, project: impl Into<String>) -> Self {
         self.openai_project = Some(project.into());
+        self
+    }
+
+    /// Set the base URL for the OpenAI API, without a trailing slash
+    /// (e.g. `https://eu.api.openai.com/v1`). Ignored unless
+    /// `provider_type == ProviderType::OpenAI`.
+    pub fn with_openai_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.openai_base_url = Some(base_url.into());
         self
     }
 
@@ -279,7 +296,8 @@ impl ProviderConfig {
     /// dev machines with leftover env state.
     ///
     /// Per-provider env vars:
-    /// - **openai**: `OPENAI_API_KEY` (required).
+    /// - **openai**: `OPENAI_API_KEY` (required), `OPENAI_BASE_URL`
+    ///   (optional — defaults to `https://api.openai.com/v1`).
     /// - **google** / **anthropic**: `GOOGLE_CLOUD_PROJECT` (required),
     ///   `GOOGLE_CLOUD_REGION` (default `europe-west1`),
     ///   `VERTEX_ACCESS_TOKEN` (optional — uses ADC when absent).
@@ -304,7 +322,18 @@ impl ProviderConfig {
         match provider_type.to_lowercase().as_str() {
             "openai" => {
                 let api_key = required("OPENAI_API_KEY")?;
-                Ok(Self::openai(api_key))
+                let config = Self::openai(api_key);
+                // An empty OPENAI_BASE_URL is treated as absent (fall
+                // through to the provider default) rather than a blank URL,
+                // and surrounding whitespace (e.g. a trailing newline from a
+                // hand-edited env file) is stripped rather than concatenated
+                // into request URLs.
+                match env::var("OPENAI_BASE_URL") {
+                    Ok(url) if !url.trim().is_empty() => {
+                        Ok(config.with_openai_base_url(url.trim()))
+                    }
+                    _ => Ok(config),
+                }
             }
             kind @ ("google" | "anthropic") => {
                 let provider = if kind == "google" {
@@ -349,6 +378,7 @@ impl fmt::Debug for ProviderConfig {
             file_resolver,
             openai_organization,
             openai_project,
+            openai_base_url,
             anthropic_beta,
             google_gcs_bucket,
             google_gcs_prefix,
@@ -368,6 +398,7 @@ impl fmt::Debug for ProviderConfig {
             )
             .field("openai_organization", &openai_organization)
             .field("openai_project", &openai_project)
+            .field("openai_base_url", &openai_base_url)
             .field("anthropic_beta", &anthropic_beta)
             .field("google_gcs_bucket", &google_gcs_bucket)
             .field("google_gcs_prefix", &google_gcs_prefix)
@@ -393,7 +424,12 @@ impl ProviderFactory {
                     .api_key
                     .as_ref()
                     .ok_or_else(|| Error::config("API key required for OpenAI provider"))?;
-                let mut provider = OpenAIProvider::new(api_key.clone())?;
+                let mut provider = match &config.openai_base_url {
+                    Some(base_url) => {
+                        OpenAIProvider::new_with_base_url(api_key.clone(), base_url.clone())?
+                    }
+                    None => OpenAIProvider::new(api_key.clone())?,
+                };
                 if let Some(org) = &config.openai_organization {
                     provider = provider.with_organization(org.clone());
                 }
@@ -635,9 +671,21 @@ mod tests {
             .with_openai_project("proj-A");
         // Construction succeeds (no panic from a missing field /
         // wrong builder method). The actual scope-affecting wiring
-        // is covered by `bucket_key_includes_account_scope` over in
-        // the openai client module.
+        // is covered by `account_key_reflects_base_url_org_and_project`
+        // over in the openai client module.
         let _provider = ProviderFactory::create(&with_org).await.unwrap();
+    }
+
+    /// Same construction-succeeds proof for the OpenAI base URL. That a
+    /// custom base URL lands in the provider's rate-limit bucket key and
+    /// scope is covered by `account_key_reflects_base_url_org_and_project`
+    /// in the openai client module.
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn create_openai_propagates_base_url() {
+        let config = ProviderConfig::openai("sk-test".into())
+            .with_openai_base_url("https://eu.api.openai.com/v1");
+        let _provider = ProviderFactory::create(&config).await.unwrap();
     }
 
     /// Same construction-succeeds proof for Google's GCS bucket
@@ -781,6 +829,7 @@ mod tests {
             file_resolver: None,
             openai_organization: None,
             openai_project: None,
+            openai_base_url: None,
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
@@ -806,6 +855,7 @@ mod tests {
             file_resolver: None,
             openai_organization: None,
             openai_project: None,
+            openai_base_url: None,
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
@@ -831,6 +881,7 @@ mod tests {
             file_resolver: None,
             openai_organization: None,
             openai_project: None,
+            openai_base_url: None,
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
@@ -856,6 +907,7 @@ mod tests {
             file_resolver: None,
             openai_organization: None,
             openai_project: None,
+            openai_base_url: None,
             anthropic_beta: Vec::new(),
             google_gcs_bucket: None,
             google_gcs_prefix: None,
@@ -894,6 +946,7 @@ mod tests {
     const TRACKED: &[&str] = &[
         "PROVIDER_TYPE",
         "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
         "GOOGLE_CLOUD_PROJECT",
         "GOOGLE_CLOUD_REGION",
         "VERTEX_ACCESS_TOKEN",
@@ -952,6 +1005,48 @@ mod tests {
         assert!(matches!(config.provider_type, ProviderType::OpenAI));
         assert_eq!(config.api_key, Some("sk-test-key".to_string()));
         assert_eq!(config.project_id, None);
+    }
+
+    #[test]
+    fn from_env_openai_with_base_url() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        g.set("PROVIDER_TYPE", "openai");
+        g.set("OPENAI_API_KEY", "sk-test-key");
+        g.set("OPENAI_BASE_URL", "https://eu.api.openai.com/v1");
+
+        let config = ProviderConfig::from_env().expect("openai config");
+        assert_eq!(
+            config.openai_base_url,
+            Some("https://eu.api.openai.com/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn from_env_openai_trims_base_url() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        g.set("PROVIDER_TYPE", "openai");
+        g.set("OPENAI_API_KEY", "sk-test-key");
+        g.set("OPENAI_BASE_URL", " https://eu.api.openai.com/v1\n");
+
+        let config = ProviderConfig::from_env().expect("openai config");
+        assert_eq!(
+            config.openai_base_url,
+            Some("https://eu.api.openai.com/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn from_env_openai_blank_base_url_is_absent() {
+        let _l = lock();
+        let g = EnvGuard::fresh();
+        g.set("PROVIDER_TYPE", "openai");
+        g.set("OPENAI_API_KEY", "sk-test-key");
+        g.set("OPENAI_BASE_URL", "  ");
+
+        let config = ProviderConfig::from_env().expect("openai config");
+        assert_eq!(config.openai_base_url, None);
     }
 
     #[test]
