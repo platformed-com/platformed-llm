@@ -36,7 +36,7 @@ pub enum Error {
         provider: &'static str,
         /// HTTP status if the failure was an HTTP response.
         status: Option<u16>,
-        /// `true` when the operation is safe to retry (5xx or 429).
+        /// `true` when the operation is safe to retry.
         retryable: bool,
         /// Provider-supplied wait hint from a `Retry-After` header (or
         /// equivalent). RFC 7231 explicitly defines `Retry-After` on
@@ -150,7 +150,9 @@ pub enum Error {
 impl Error {
     /// Build a provider error with sensible defaults. `status` and
     /// `retryable` default to `None` / `false` — callers that have the
-    /// HTTP status should use [`Error::provider_with_status`].
+    /// HTTP status should use [`Error::provider_with_status`], and
+    /// those that know the failure is transient
+    /// [`Error::provider_retryable`].
     pub fn provider(provider: &'static str, message: impl Into<String>) -> Self {
         Error::Provider {
             provider,
@@ -173,6 +175,19 @@ impl Error {
             provider,
             status: Some(status),
             retryable,
+            retry_after: None,
+            message: message.into(),
+        }
+    }
+
+    /// Build a retryable provider error. The counterpart to
+    /// [`Error::provider`] for failures raised without an HTTP round
+    /// trip, where there is no status to infer retryability from.
+    pub fn provider_retryable(provider: &'static str, message: impl Into<String>) -> Self {
+        Error::Provider {
+            provider,
+            status: None,
+            retryable: true,
             retry_after: None,
             message: message.into(),
         }
@@ -425,6 +440,20 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn provider_retryable_sets_the_flag_without_a_status() {
+        let err = Error::provider_retryable("Library", "Test error");
+        assert!(err.is_retryable());
+        assert!(matches!(
+            err,
+            Error::Provider {
+                status: None,
+                retryable: true,
+                ..
+            }
+        ));
     }
 
     #[test]

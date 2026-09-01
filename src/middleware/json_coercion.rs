@@ -221,9 +221,13 @@ fn unique_tool_name(base: &str, existing: Option<&[Tool]>) -> String {
 ///   as-is (multi-turn tool use in progress).
 /// - synth tool didn't fire but real tools did → legitimate
 ///   intermediate turn (model is gathering info); pass through.
-/// - neither fired → the model free-texted instead of producing the
-///   structured answer. Surface an error rather than returning the
-///   silently-suppressed text as an empty response.
+/// - neither fired on a `Stop` turn → the model free-texted instead of
+///   producing the structured answer. Surface a retryable error rather
+///   than returning the silently-suppressed text as an empty response;
+///   a fresh sample can comply.
+/// - neither fired on any other finish reason → that reason (`Length`,
+///   `ContentFilter`, …) already explains why nothing arrived, so pass
+///   `Done` through and let the caller act on it.
 fn rewrite_synth_tool_stream(
     inner: Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>>,
     synth_tool_name: String,
@@ -323,18 +327,24 @@ fn rewrite_synth_tool_stream(
                                 finish_reason,
                                 usage,
                             }))
-                        } else {
-                            // Provider-agnostic middleware-layer
-                            // failure — the model didn't comply with
-                            // our coercion polyfill. Not retryable;
-                            // a fresh request would likely produce
-                            // the same uncoercible output.
-                            Some(Err(Error::provider(
+                        } else if matches!(finish_reason, FinishReason::Stop) {
+                            // Clean finish with nothing structured: the
+                            // model didn't comply with our coercion
+                            // polyfill. Retryable — a fresh sample can.
+                            Some(Err(Error::provider_retryable(
                                 "Library",
                                 "json_coercion: model did not invoke the structured-response \
                                  tool and made no other tool call — the request asked for \
                                  structured output but the model returned free-form text",
                             )))
+                        } else {
+                            // Every other reason is self-describing;
+                            // wrapping it in a middleware error would
+                            // hide it from the caller.
+                            Some(Ok(StreamEvent::Done {
+                                finish_reason,
+                                usage,
+                            }))
                         }
                     }
                 }
@@ -1011,9 +1021,9 @@ mod tests {
     }
 
     /// When the model never invokes the synth tool and makes no other
-    /// tool call — it just free-texted instead of producing structured
-    /// output — the suppressed text must not surface as a silent empty
-    /// response. The coerced stream errors instead.
+    /// tool call on an otherwise clean `Stop`, the suppressed text must
+    /// not surface as a silent empty response. The coerced stream
+    /// errors instead, retryably.
     #[tokio::test]
     async fn free_text_without_synth_tool_errors() {
         let events: Vec<Result<StreamEvent, Error>> = vec![
@@ -1047,10 +1057,37 @@ mod tests {
             err,
             Error::Provider {
                 provider: "Library",
-                retryable: false,
+                retryable: true,
                 ..
             }
         ));
         assert!(err.to_string().contains("structured output"), "got: {err}");
+    }
+
+    /// Any other finish reason reaching the same no-tool-call path
+    /// already says why nothing structured arrived, so it propagates to
+    /// the caller instead of being masked by a middleware error.
+    #[tokio::test]
+    async fn non_stop_miss_propagates_finish_reason() {
+        for reason in [FinishReason::ContentFilter, FinishReason::Length] {
+            let events: Vec<Result<StreamEvent, Error>> = vec![Ok(StreamEvent::Done {
+                finish_reason: reason.clone(),
+                usage: Usage::default(),
+            })];
+            let provider = MockProvider::new(events);
+            let prompt = Prompt::user("hi");
+            let config = Config::builder("claude-sonnet-4-5")
+                .response_format(json_schema_rf("Answer", r#"{"type":"object"}"#))
+                .build();
+
+            let response = generate(&provider, &prompt, &config)
+                .await
+                .unwrap()
+                .buffer()
+                .await
+                .expect("non-Stop miss should propagate, not error");
+            assert_eq!(response.finish_reason, reason);
+            assert!(response.content.is_empty());
+        }
     }
 }

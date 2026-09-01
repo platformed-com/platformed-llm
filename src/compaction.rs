@@ -336,10 +336,15 @@ impl Compactor {
         let summary = summary_response.text();
         let trimmed = summary.trim();
         if trimmed.is_empty() {
-            return Err(Error::compaction(
+            // The finish reason is the only thing separating these
+            // causes — a `ContentFilter` block needs a different
+            // recovery from a model that merely returned nothing.
+            return Err(Error::compaction(format!(
                 "summarisation response produced no usable text \
-                 (empty / whitespace / refusal / pure tool-call)",
-            ));
+                 (empty / whitespace / refusal / pure tool-call) \
+                 (finish_reason: {:?})",
+                summary_response.finish_reason
+            )));
         }
         let memo = format!("{}{}", self.memo_prefix, trimmed);
         // 6. Rebuild: system + user(memo) + held-out groups.
@@ -1167,6 +1172,38 @@ mod tests {
                 );
             }
             other => panic!("expected Error::Compaction for empty summary, got {other:?}"),
+        }
+    }
+
+    /// The empty-summary guard fires for several distinct causes, and
+    /// only the finish reason tells them apart — a content-filtered
+    /// block wants a different recovery (rephrase, switch model) from
+    /// a model that simply returned nothing.
+    #[tokio::test]
+    async fn empty_summary_error_names_the_finish_reason() {
+        use crate::FinishReason;
+        let filtered = MockResponse::from_parts(Vec::new(), FinishReason::ContentFilter);
+        let provider = MockProvider::builder().reply(filtered).build();
+        let config = Config::builder("test-model").build();
+        let prompt = Prompt::system("sys")
+            .with_user("q1")
+            .with_assistant("a1")
+            .with_user("q2")
+            .with_assistant("a2")
+            .with_user("live");
+
+        let result = Compactor::new()
+            .with_keep_recent_turns(1)
+            .compact(&provider, &config, prompt)
+            .await;
+        match result {
+            Err(Error::Compaction { reason }) => {
+                assert!(
+                    reason.contains("ContentFilter"),
+                    "error must name the finish reason: got {reason:?}"
+                );
+            }
+            other => panic!("expected Error::Compaction, got {other:?}"),
         }
     }
 
