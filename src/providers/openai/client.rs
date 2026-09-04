@@ -256,6 +256,12 @@ impl OpenAIProvider {
                                         file_id: None,
                                     });
                                 }
+                                Some(ResolvedRef::Inline { data, media_type }) => {
+                                    parts.push(OpenAIContentPart::InputImage {
+                                        image_url: Some(format!("data:{media_type};base64,{data}")),
+                                        file_id: None,
+                                    });
+                                }
                                 None => {
                                     tracing::debug!("OpenAI: unresolved image Ref {id}; dropping")
                                 }
@@ -322,6 +328,16 @@ impl OpenAIProvider {
                                         file_data: None,
                                         file_id: None,
                                         filename: None,
+                                    });
+                                }
+                                // `file_data` is rejected without a `filename`,
+                                // so one is derived from the MIME type.
+                                Some(ResolvedRef::Inline { data, media_type }) => {
+                                    parts.push(OpenAIContentPart::InputFile {
+                                        file_url: None,
+                                        file_data: Some(format!("data:{media_type};base64,{data}")),
+                                        file_id: None,
+                                        filename: Some(filename_for(media_type)),
                                     });
                                 }
                                 None => {
@@ -2580,6 +2596,50 @@ mod tests {
         assert_eq!(part["type"], "input_file");
         assert_eq!(part["file_url"], "https://example.com/x.pdf");
         assert!(part["file_id"].is_null());
+    }
+
+    /// An inline result rides in the request as a `data:` URL, on both
+    /// modalities — the same wire form a caller-supplied
+    /// [`FileSource::Base64`] takes.
+    #[test]
+    fn inline_resolved_ref_emits_data_urls() {
+        use crate::providers::file_resolve::ResolvedRef;
+        use crate::types::{FileSource, InputItem, UserPart};
+
+        let prompt = Prompt::new().with_item(InputItem::User {
+            content: vec![
+                UserPart::Document(FileSource::Ref("doc1".into())),
+                UserPart::Image(FileSource::Ref("img1".into())),
+            ],
+        });
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(
+            "doc1".to_string(),
+            ResolvedRef::Inline {
+                data: "JVBERi0=".into(),
+                media_type: "application/pdf".into(),
+            },
+        );
+        resolved.insert(
+            "img1".to_string(),
+            ResolvedRef::Inline {
+                data: "iVBORw0=".into(),
+                media_type: "image/png".into(),
+            },
+        );
+        let cfg = Config::builder("gpt-5").build();
+        let req = provider().convert_request(&prompt, cfg.raw(), &resolved);
+        let json = serde_json::to_value(&req).unwrap();
+        let parts = &json["input"][0]["content"];
+        assert_eq!(parts[0]["type"], "input_file");
+        assert_eq!(
+            parts[0]["file_data"],
+            "data:application/pdf;base64,JVBERi0="
+        );
+        assert_eq!(parts[0]["filename"], "file.pdf");
+        assert!(parts[0]["file_id"].is_null());
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["image_url"], "data:image/png;base64,iVBORw0=");
     }
 
     fn fn_item(call_id: Option<&str>, name: Option<&str>, arguments: Option<&str>) -> ResponseItem {

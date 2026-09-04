@@ -23,6 +23,8 @@ parking_lot = "0.12"
 # proc-macro-free crate.
 pin-project-lite = "0.2"
 memchr = "2.7"
+# Encodes `ResolvedFile::Inline` bytes for the providers' inline file shapes.
+base64 = "0.22"
 futures = "0.3"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }

@@ -382,6 +382,11 @@ fn ref_to_source(resolved: &HashMap<String, ResolvedRef>, id: &str) -> Option<ij
             "type": "url",
             "url": uri.clone(),
         })),
+        Some(ResolvedRef::Inline { data, media_type }) => Some(ijson::ijson!({
+            "type": "base64",
+            "media_type": media_type.clone(),
+            "data": data.clone(),
+        })),
         None => {
             tracing::debug!("Anthropic: unresolved file Ref {id}; dropping");
             None
@@ -1197,6 +1202,36 @@ mod tests {
             .unwrap();
         assert_eq!(body.messages.len(), 1);
         assert_eq!(body.messages[0].role, "user");
+    }
+
+    /// An inline result lands as a `{type:"base64", media_type, data}` source —
+    /// the same shape a caller-supplied [`FileSource::Base64`] takes, which is
+    /// what makes a `Ref` usable on Vertex, where Anthropic has no file store.
+    #[test]
+    fn inline_resolved_ref_emits_base64_source() {
+        use crate::providers::file_resolve::ResolvedRef;
+        use crate::types::{FileSource, InputItem, UserPart};
+
+        let prompt = Prompt::new().with_item(InputItem::User {
+            content: vec![UserPart::Document(FileSource::Ref("doc1".into()))],
+        });
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(
+            "doc1".to_string(),
+            ResolvedRef::Inline {
+                data: "JVBERi0=".into(),
+                media_type: "application/pdf".into(),
+            },
+        );
+        let cfg = Config::builder("claude").build();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &resolved)
+            .unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let source = &json["messages"][0]["content"][0]["source"];
+        assert_eq!(source["type"], "base64");
+        assert_eq!(source["media_type"], "application/pdf");
+        assert_eq!(source["data"], "JVBERi0=");
     }
 
     /// A resolved document `Ref` (handle) lands as a `{type:"file", file_id}`

@@ -1190,14 +1190,15 @@ fn file_source_to_part(
                 file_uri: u.clone(),
             },
         }),
-        FileSource::Ref(id) => ref_to_file_data(resolved, id, fallback_mime),
+        FileSource::Ref(id) => ref_to_part(resolved, id, fallback_mime),
     }
 }
 
-/// Resolve a file `Ref` to a Gemini `fileData` part, or `None` (logged) when
-/// the id wasn't resolved. Both handle and URL results become a `fileData`
-/// `fileUri` — a `gs://` or `https` URI Vertex fetches at request time.
-fn ref_to_file_data(
+/// Resolve a file `Ref` to a Gemini part, or `None` (logged) when the id wasn't
+/// resolved. Handle and URL results become a `fileData` `fileUri` — a `gs://`
+/// or `https` URI Vertex fetches at request time; an inline result becomes
+/// `inlineData`, the bytes themselves.
+fn ref_to_part(
     resolved: &HashMap<String, ResolvedRef>,
     id: &str,
     fallback_mime: &str,
@@ -1214,6 +1215,19 @@ fn ref_to_file_data(
                 file_data: GoogleFileData {
                     mime_type: mime,
                     file_uri: uri.clone(),
+                },
+            })
+        }
+        Some(ResolvedRef::Inline { data, media_type }) => {
+            let mime = if media_type.is_empty() {
+                fallback_mime.to_string()
+            } else {
+                media_type.clone()
+            };
+            Some(GooglePart::InlineData {
+                inline_data: GoogleInlineData {
+                    mime_type: mime,
+                    data: data.clone(),
                 },
             })
         }
@@ -1862,6 +1876,36 @@ mod tests {
         let part = &json["contents"][0]["parts"][0]["fileData"];
         assert_eq!(part["fileUri"], "gs://bucket/x.pdf");
         assert_eq!(part["mimeType"], "application/pdf");
+    }
+
+    /// A `Ref` the resolver answered with bytes rather than a reference emits
+    /// `inlineData`, so a caller with no bucket and no public URL can still
+    /// attach a file.
+    #[test]
+    fn inline_resolved_ref_emits_inline_data() {
+        use crate::providers::file_resolve::ResolvedRef;
+        use crate::types::{FileSource, InputItem, UserPart};
+
+        let prompt = crate::Prompt::new().with_item(InputItem::User {
+            content: vec![UserPart::Document(FileSource::Ref("doc1".into()))],
+        });
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(
+            "doc1".to_string(),
+            ResolvedRef::Inline {
+                data: "JVBERi0=".into(),
+                media_type: "application/pdf".into(),
+            },
+        );
+        let cfg = Config::builder("gemini").build();
+        let body = provider()
+            .convert_request(&prompt, cfg.raw(), &resolved)
+            .unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let part = &json["contents"][0]["parts"][0]["inlineData"];
+        assert_eq!(part["data"], "JVBERi0=");
+        assert_eq!(part["mimeType"], "application/pdf");
+        assert!(json["contents"][0]["parts"][0]["fileData"].is_null());
     }
 
     /// Video inputs map like the other modalities: a URL → `fileData` (with the

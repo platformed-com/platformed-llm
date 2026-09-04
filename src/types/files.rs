@@ -202,6 +202,26 @@ pub enum ResolvedFile {
         /// MIME type of the file the URL points at.
         media_type: String,
     },
+    /// The bytes themselves, carried in the request body rather than referenced.
+    ///
+    /// Every other variant names somewhere the provider can reach the file:
+    /// its own store, a bucket, a public URL. This one is for a caller that has
+    /// bytes and no such place — a file store that can only stream, against a
+    /// provider with no library-owned store to upload them to.
+    ///
+    /// The library base64-encodes them once per request and each provider emits
+    /// its own inline shape (`inlineData`, a `data:` URL, a `base64` source).
+    /// Two consequences follow from the bytes travelling in the request:
+    /// nothing is uploaded, so [`FileResolver::store`] is not called and no
+    /// handle is reused across requests; and the encoded size — 4/3 of the
+    /// file — counts against the provider's request limit, which is 20 MB on
+    /// Vertex.
+    Inline {
+        /// The file's bytes, unencoded.
+        data: Bytes,
+        /// MIME type of the file.
+        media_type: String,
+    },
 }
 
 impl ResolvedFile {
@@ -221,6 +241,14 @@ impl ResolvedFile {
     /// [`ResolvedHandle::anthropic_file`].
     pub fn anthropic_file(file_id: impl Into<String>, media_type: impl Into<String>) -> Self {
         ResolvedHandle::anthropic_file(file_id, media_type).into_file()
+    }
+
+    /// The file's bytes, sent in the request — see [`ResolvedFile::Inline`].
+    pub fn inline(data: impl Into<Bytes>, media_type: impl Into<String>) -> Self {
+        ResolvedFile::Inline {
+            data: data.into(),
+            media_type: media_type.into(),
+        }
     }
 }
 
@@ -250,6 +278,13 @@ impl std::fmt::Debug for ResolvedFile {
                 .field("uri", uri)
                 .field("media_type", media_type)
                 .finish(),
+            // The bytes are the payload, not an identifier; printing them would
+            // dump a whole file into a log line.
+            ResolvedFile::Inline { data, media_type } => f
+                .debug_struct("ResolvedFile::Inline")
+                .field("len", &data.len())
+                .field("media_type", media_type)
+                .finish_non_exhaustive(),
         }
     }
 }

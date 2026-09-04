@@ -16,11 +16,19 @@
 //! - **Anthropic (Vertex)** has no library-owned file store, so a `Stream` is
 //!   rejected — the resolver must return a durable handle (or, for a public
 //!   file, a public URL via [`ResolvedFile::Url`](crate::ResolvedFile::Url)).
+//!
+//! A resolver with nowhere to put the bytes — a store that can only stream,
+//! against a provider with no library-owned store — returns
+//! [`ResolvedFile::Inline`](crate::ResolvedFile::Inline) instead, and the bytes
+//! ride in the request. That is resolved here rather than by each provider so
+//! a file named in several parts is encoded once.
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
 
@@ -49,6 +57,14 @@ pub(crate) enum ResolvedRef {
         /// The URL.
         uri: String,
         /// MIME type of the referenced file.
+        media_type: String,
+    },
+    /// Carry the bytes in the request instead of referencing them.
+    Inline {
+        /// Base64-encoded file bytes, already in the form every provider's
+        /// inline shape wants.
+        data: String,
+        /// MIME type of the file.
         media_type: String,
     },
 }
@@ -219,6 +235,16 @@ pub(crate) async fn resolve_refs(
             ResolvedFile::Url { uri, media_type } => {
                 map.insert(id, ResolvedRef::Url { uri, media_type });
             }
+            // No upload happened, so there is no handle to `store`.
+            ResolvedFile::Inline { data, media_type } => {
+                map.insert(
+                    id,
+                    ResolvedRef::Inline {
+                        data: BASE64.encode(&data),
+                        media_type,
+                    },
+                );
+            }
         }
     }
     Ok(map)
@@ -246,8 +272,9 @@ impl ProviderUploader for NoLibraryUpload {
         drop(body);
         Err(Error::config(format!(
             "{} has no library-owned file store; have your FileResolver return a durable \
-             reference (e.g. a gs:// URI) via ResolvedFile::ProviderHandle — or a public URL \
-             via ResolvedFile::Url — instead of a Stream",
+             reference (e.g. a gs:// URI) via ResolvedFile::ProviderHandle, a public URL \
+             via ResolvedFile::Url, or the bytes themselves via ResolvedFile::Inline — \
+             instead of a Stream",
             self.provider
         )))
     }
@@ -470,6 +497,50 @@ mod tests {
             r.stored.lock().unwrap().is_empty(),
             "caller-owned handle not re-stored"
         );
+    }
+
+    /// Inline bytes are encoded here, once, and nothing is uploaded — so there
+    /// is no handle to hand back to `store`.
+    #[tokio::test]
+    async fn inline_bytes_are_encoded_and_never_uploaded() {
+        let r = FakeResolver::new();
+        r.opens.lock().unwrap().insert(
+            "a".into(),
+            ResolvedFile::inline(Bytes::from_static(b"%PDF-"), "application/pdf"),
+        );
+        let up = CountingUploader {
+            calls: Mutex::new(0),
+        };
+        let map = resolve_refs(&[img_ref("a")], &scope(), Some(&r), &up)
+            .await
+            .unwrap();
+        assert_eq!(
+            map.get("a"),
+            Some(&ResolvedRef::Inline {
+                data: "JVBERi0=".into(),
+                media_type: "application/pdf".into(),
+            })
+        );
+        assert_eq!(*up.calls.lock().unwrap(), 0);
+        assert!(r.stored.lock().unwrap().is_empty());
+    }
+
+    /// A file named by several parts is opened and encoded once, because the
+    /// resolve pass keys on the id rather than on the part.
+    #[tokio::test]
+    async fn inline_bytes_are_encoded_once_per_request() {
+        let r = FakeResolver::new();
+        r.opens.lock().unwrap().insert(
+            "a".into(),
+            ResolvedFile::inline(Bytes::from_static(b"%PDF-"), "application/pdf"),
+        );
+        let up = CountingUploader {
+            calls: Mutex::new(0),
+        };
+        resolve_refs(&[img_ref("a"), img_ref("a")], &scope(), Some(&r), &up)
+            .await
+            .unwrap();
+        assert_eq!(*r.open_calls.lock().unwrap().get("a").unwrap(), 1);
     }
 
     #[tokio::test]
