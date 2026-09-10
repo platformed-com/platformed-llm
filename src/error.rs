@@ -15,7 +15,7 @@ pub enum Error {
 
     /// Authentication failure (typically a 401). The optional `status`
     /// is the HTTP status code we observed, if any.
-    #[error("authentication failed{}{}", status_suffix(*status), .message)]
+    #[error("authentication failed{}: {}", status_suffix(*status), .message)]
     Auth {
         /// HTTP status observed (typically 401 or 403), if available.
         status: Option<u16>,
@@ -519,6 +519,18 @@ mod tests {
             Error::Auth { status, .. } => assert_eq!(status, Some(401)),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn auth_display_separates_status_from_message() {
+        assert_eq!(
+            Error::auth("bad key").to_string(),
+            "authentication failed: bad key",
+        );
+        assert_eq!(
+            Error::auth_with_status(401, "Google 401: nope").to_string(),
+            "authentication failed, status 401: Google 401: nope",
+        );
     }
 
     #[test]
