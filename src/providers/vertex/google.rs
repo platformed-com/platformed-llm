@@ -875,17 +875,6 @@ impl Provider for GoogleProvider {
         );
 
         let body = serde_json::to_vec(&google_request)?;
-        let mut headers = vec![
-            self.endpoint.auth_header().await?,
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ];
-        if let Some(request_type) = self.request_type {
-            headers.push((
-                VertexRequestType::HEADER.to_string(),
-                request_type.as_str().to_string(),
-            ));
-        }
-        let req = TransportRequest { url, headers, body };
 
         let scope = crate::rate_limit::RateScope {
             // Vertex quotas are per-project-per-region, so both
@@ -905,6 +894,17 @@ impl Provider for GoogleProvider {
             priority: config.priority.unwrap_or_default(),
         };
         let permit = self.rate_limiter.acquire(&scope).await?;
+        let mut headers = vec![
+            self.endpoint.auth_header().await?,
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        if let Some(request_type) = self.request_type {
+            headers.push((
+                VertexRequestType::HEADER.to_string(),
+                request_type.as_str().to_string(),
+            ));
+        }
+        let req = TransportRequest { url, headers, body };
         let response = match self.transport.send(req).await {
             Ok(r) => r,
             Err(e) => {
@@ -1609,6 +1609,66 @@ mod tests {
         assert_eq!(rfc3339_utc(1_234_567_890), "2009-02-13T23:31:30Z");
         // Leap day.
         assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    /// The access token is read only once the rate limiter has released
+    /// the request: a token read before a long park can expire in the
+    /// queue and be sent dead.
+    #[tokio::test]
+    async fn token_is_read_after_rate_limiter_releases() {
+        use crate::rate_limit::{RateLimiter, RatePermit, RateScope};
+        use crate::transport::{TransportImpl, TransportResponse};
+
+        /// Rotates the endpoint's token while the request is parked.
+        struct RotatingLimiter(VertexEndpoint);
+
+        #[async_trait]
+        impl RateLimiter for RotatingLimiter {
+            async fn acquire(&self, _scope: &RateScope) -> Result<RatePermit, Error> {
+                self.0.set_access_token("tok-fresh")?;
+                Ok(RatePermit::new(|_| {}))
+            }
+        }
+
+        /// Records each request's `Authorization` header and answers 401.
+        struct RecordingTransport(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait]
+        impl TransportImpl for RecordingTransport {
+            async fn send(&self, req: TransportRequest) -> Result<TransportResponse, Error> {
+                let auth = req
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == "Authorization")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                self.0.lock().unwrap().push(auth);
+                Ok(TransportResponse {
+                    status: 401,
+                    headers: vec![],
+                    body: Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                        b"{}",
+                    ))])),
+                })
+            }
+        }
+
+        let endpoint = VertexEndpoint::with_access_token(
+            "proj".to_string(),
+            "us-east1".to_string(),
+            "tok-stale".to_string(),
+        );
+        let auths = Arc::new(Mutex::new(Vec::new()));
+        let provider = GoogleProvider::with_transport(
+            endpoint.clone(),
+            Transport::new(RecordingTransport(auths.clone())),
+        )
+        .with_rate_limiter(Arc::new(RotatingLimiter(endpoint)));
+        let cfg = Config::builder("gemini-2.5-flash").build();
+
+        let _ = crate::generate(&provider, &crate::Prompt::user("hi"), &cfg).await;
+
+        assert_eq!(*auths.lock().unwrap(), ["Bearer tok-fresh"]);
     }
 
     /// Recorded `(url, body)` of the last upload.

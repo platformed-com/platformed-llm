@@ -511,14 +511,6 @@ impl Provider for AnthropicViaVertexProvider {
         );
 
         let body = serde_json::to_vec(&anthropic_request)?;
-        let mut headers = vec![
-            self.endpoint.auth_header().await?,
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ];
-        if !self.beta.is_empty() {
-            headers.push(("anthropic-beta".to_string(), self.beta.join(",")));
-        }
-        let req = TransportRequest { url, headers, body };
 
         let scope = crate::rate_limit::RateScope {
             // Vertex quotas are per-project-per-region, so both
@@ -538,6 +530,14 @@ impl Provider for AnthropicViaVertexProvider {
             priority: config.priority.unwrap_or_default(),
         };
         let permit = self.rate_limiter.acquire(&scope).await?;
+        let mut headers = vec![
+            self.endpoint.auth_header().await?,
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        if !self.beta.is_empty() {
+            headers.push(("anthropic-beta".to_string(), self.beta.join(",")));
+        }
+        let req = TransportRequest { url, headers, body };
         let response = match self.transport.send(req).await {
             Ok(r) => r,
             Err(e) => {
@@ -1014,6 +1014,68 @@ mod tests {
     fn provider() -> AnthropicViaVertexProvider {
         AnthropicViaVertexProvider::new("p".to_string(), "us-east5".to_string(), "tok".to_string())
             .unwrap()
+    }
+
+    /// The access token is read only once the rate limiter has released
+    /// the request: a token read before a long park can expire in the
+    /// queue and be sent dead.
+    #[tokio::test]
+    async fn token_is_read_after_rate_limiter_releases() {
+        use std::sync::Mutex;
+
+        use crate::rate_limit::{RateLimiter, RatePermit, RateScope};
+        use crate::transport::{TransportImpl, TransportResponse};
+
+        /// Rotates the endpoint's token while the request is parked.
+        struct RotatingLimiter(VertexEndpoint);
+
+        #[async_trait::async_trait]
+        impl RateLimiter for RotatingLimiter {
+            async fn acquire(&self, _scope: &RateScope) -> Result<RatePermit, Error> {
+                self.0.set_access_token("tok-fresh")?;
+                Ok(RatePermit::new(|_| {}))
+            }
+        }
+
+        /// Records each request's `Authorization` header and answers 401.
+        struct RecordingTransport(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait::async_trait]
+        impl TransportImpl for RecordingTransport {
+            async fn send(&self, req: TransportRequest) -> Result<TransportResponse, Error> {
+                let auth = req
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == "Authorization")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                self.0.lock().unwrap().push(auth);
+                Ok(TransportResponse {
+                    status: 401,
+                    headers: vec![],
+                    body: Box::pin(futures_util::stream::iter(vec![Ok(
+                        bytes::Bytes::from_static(b"{}"),
+                    )])),
+                })
+            }
+        }
+
+        let endpoint = VertexEndpoint::with_access_token(
+            "proj".to_string(),
+            "us-east5".to_string(),
+            "tok-stale".to_string(),
+        );
+        let auths = Arc::new(Mutex::new(Vec::new()));
+        let provider = AnthropicViaVertexProvider::with_transport(
+            endpoint.clone(),
+            Transport::new(RecordingTransport(auths.clone())),
+        )
+        .with_rate_limiter(Arc::new(RotatingLimiter(endpoint)));
+        let cfg = Config::builder("claude-sonnet-4").build();
+
+        let _ = crate::generate(&provider, &Prompt::user("hi"), &cfg).await;
+
+        assert_eq!(*auths.lock().unwrap(), ["Bearer tok-fresh"]);
     }
 
     /// Mid-stream `overloaded_error` and `rate_limit_error` events
