@@ -232,13 +232,14 @@ pub struct GoogleResponse {
     pub error: Option<GoogleApiError>,
 }
 
-/// Google's standard error envelope. It arrives as a chunk on a stream
+/// Google's standard error envelope. It arrives in the body of a stream
 /// that already answered 200 — a quota or backend failure that hits
 /// mid-generation — so the HTTP status alone never reveals it.
 ///
 /// Every field is optional: an envelope whose shape we don't predict
-/// must still parse, because the alternative is a deserialize failure
-/// that reads as a truncated stream and loses the error entirely.
+/// must still parse, because a deserialize failure surfaces as a
+/// terminal parse error naming serde's complaint in place of the
+/// failure the upstream reported.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GoogleApiError {
     #[serde(default)]

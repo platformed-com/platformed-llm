@@ -1981,6 +1981,55 @@ mod tests {
         assert!(err.to_string().contains("Quota exceeded"), "{err}");
     }
 
+    /// Pins every arm of the envelope classifier, including the
+    /// code-less ones: Google supplies `code` inconsistently, and a
+    /// quota envelope that arrives with only its gRPC status name still
+    /// has to reach the caller as a rate limit for the limiter to slow
+    /// down rather than as an opaque provider error.
+    #[test]
+    fn envelope_classification_table() {
+        fn label(err: &Error) -> &'static str {
+            match err {
+                Error::Auth { .. } => "auth",
+                Error::ModelNotAvailable(_) => "model-not-available",
+                Error::RateLimit { .. } => "rate-limit",
+                Error::Provider { .. } => "provider",
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+
+        let cases: &[(Option<u16>, Option<&str>, &str, bool)] = &[
+            (Some(401), None, "auth", false),
+            (Some(403), Some("PERMISSION_DENIED"), "auth", false),
+            (Some(404), Some("NOT_FOUND"), "model-not-available", false),
+            (Some(429), Some("RESOURCE_EXHAUSTED"), "rate-limit", true),
+            (None, Some("RESOURCE_EXHAUSTED"), "rate-limit", true),
+            (Some(500), Some("INTERNAL"), "provider", true),
+            (Some(400), Some("INVALID_ARGUMENT"), "provider", false),
+            (None, Some("UNAVAILABLE"), "provider", true),
+            (None, Some("INTERNAL"), "provider", true),
+            (None, Some("DEADLINE_EXCEEDED"), "provider", true),
+            (None, Some("ABORTED"), "provider", true),
+            (None, Some("INVALID_ARGUMENT"), "provider", false),
+            (None, None, "provider", false),
+        ];
+
+        for (code, status, want_label, want_retryable) in cases {
+            let envelope = GoogleApiError {
+                code: *code,
+                message: Some("boom".to_string()),
+                status: status.map(str::to_string),
+            };
+            let err = error_from_google_envelope(&envelope);
+            assert_eq!(label(&err), *want_label, "for {code:?}/{status:?}");
+            assert_eq!(
+                err.is_retryable(),
+                *want_retryable,
+                "retryability for {code:?}/{status:?}: {err}",
+            );
+        }
+    }
+
     /// Classification falls back to the gRPC status name when no
     /// numeric code is supplied, so a retryable backend blip stays
     /// retryable.

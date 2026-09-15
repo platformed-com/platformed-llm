@@ -295,11 +295,13 @@ impl Error {
     /// re-issuing the same request is likely to behave differently
     /// next time.
     ///
-    /// Returns `true` for [`Self::RateLimit`]; for [`Self::Transport`]
-    /// when the wrapped `reqwest::Error` is a connect, timeout,
-    /// request-send, or body failure, or a decode failure whose
-    /// source chain carries a transport-level cause (a connection
-    /// lost mid-body surfaces as a decode error wrapping a
+    /// Returns `true` for [`Self::RateLimit`]; for
+    /// [`Self::StreamTruncated`], since a body that stopped without
+    /// saying why may well reach the end next time; for
+    /// [`Self::Transport`] when the wrapped `reqwest::Error` is a
+    /// connect, timeout, request-send, or body failure, or a decode
+    /// failure whose source chain carries a transport-level cause (a
+    /// connection lost mid-body surfaces as a decode error wrapping a
     /// `hyper`/IO error — decode failures caused by the payload
     /// itself stay terminal); and for [`Self::Provider`] when its
     /// `retryable` flag is set (5xx / 429, mid-stream

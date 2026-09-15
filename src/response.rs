@@ -216,6 +216,33 @@ mod tests {
         assert_eq!(text, "Test response");
     }
 
+    /// `collect` makes the same judgement as `buffer` — a stream that
+    /// ran out is not a response, however much of one arrived.
+    #[tokio::test]
+    async fn collect_rejects_a_stream_that_ends_without_done() {
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::Text,
+            }),
+            Ok(StreamEvent::Delta {
+                index: 0,
+                delta: "half an ans".to_string(),
+            }),
+        ];
+        let stream = futures_util::stream::iter(events);
+        let err = Response::from_stream(stream)
+            .collect()
+            .await
+            .map(|_| ())
+            .expect_err("a truncated stream is not a response");
+        assert!(
+            matches!(err, Error::StreamTruncated { parts_received: 1 }),
+            "must name the condition and what arrived, got {err:?}",
+        );
+        assert!(err.is_retryable(), "{err}");
+    }
+
     /// A stream whose events simply run out mid-response — the
     /// transport closed cleanly, so no `Err` was ever yielded — is a
     /// truncation. `buffer` must refuse it rather than hand back the

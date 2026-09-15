@@ -63,6 +63,13 @@ async fn main() -> Result<(), Error> {
 
     println!("🏁 Processed {event_count} events");
 
+    // A stream that ran out mid-answer yields no `Err` of its own.
+    if !accumulator.saw_terminator() {
+        return Err(Error::StreamTruncated {
+            parts_received: accumulator.parts_received(),
+        });
+    }
+
     let complete_response = accumulator.finalize();
     let text = complete_response.text();
 

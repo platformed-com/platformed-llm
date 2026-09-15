@@ -406,8 +406,9 @@ pub enum FinishReason {
     /// must not treat it as a clean [`Self::Stop`].
     ///
     /// Whether an early stop was a fault is not decidable from the
-    /// reason alone — the stream's driver decides, and the library's
-    /// own drain sites raise [`Error::StreamTruncated`](crate::Error::StreamTruncated)
-    /// rather than returning this.
+    /// reason alone — the stream's driver decides. Reaching a drain
+    /// site as this means a terminator did arrive naming a reason no
+    /// variant here covers; a stream that stopped without one at all
+    /// raises [`Error::StreamTruncated`](crate::Error::StreamTruncated).
     Incomplete,
 }
