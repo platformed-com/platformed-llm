@@ -966,14 +966,14 @@ impl Provider for GoogleProvider {
             });
         }
 
-        // Success path: defer the limiter observation to stream-end
-        // — see `rate_limit::observe_stream`. We do this even though
-        // Vertex Gemini doesn't have a known mid-stream rate-limit
-        // signal yet, so transport drops mid-response are reported as
+        // Success path: defer the limiter observation to stream-end —
+        // see `rate_limit::observe_stream`. A quota failure can land
+        // mid-generation, and a transport drop mid-response reports as
         // `OtherFailure` rather than `Success`.
 
         // Create SSE stream from response (Gemini supports ?alt=sse)
         let sse_stream = SseStream::new("Google", response.body);
+        let unframed = sse_stream.unframed();
 
         // Create a stateful processor for tracking output items
         let mut state = GoogleStreamState::default();
@@ -1014,7 +1014,18 @@ impl Provider for GoogleProvider {
                 }
             })
             .map(|events| futures_util::stream::iter(events.into_iter()))
-            .flatten();
+            .flatten()
+            // Google can report a mid-generation failure by writing its
+            // error envelope into the body with no SSE framing, which
+            // leaves the parser no field to attach it to, so it sets
+            // those lines aside. They are whole only once the stream
+            // has ended.
+            .chain(
+                futures_util::stream::once(async move {
+                    futures_util::stream::iter(error_from_unframed_body(&unframed.take()).map(Err))
+                })
+                .flatten(),
+            );
 
         let observed = crate::rate_limit::observe_response_stream(
             event_stream,
@@ -1443,6 +1454,30 @@ fn error_from_google_envelope(error: &GoogleApiError) -> Error {
         }
         (None, _) => Error::provider("Google", text),
     }
+}
+
+/// Recover a failure Google wrote into the stream body with no SSE
+/// framing, leaving the parser no field to attach it to. The framed
+/// form of the same envelope is read by `convert_response_stateful`.
+///
+/// Anything that isn't the standard error envelope is left alone: an
+/// unrecognised line is no grounds to invent a failure, and a stream
+/// that ended having reported nothing is already described by
+/// [`Error::StreamTruncated`].
+fn error_from_unframed_body(text: &str) -> Option<Error> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let envelope = serde_json::from_str::<GoogleResponse>(text)
+        .ok()
+        .and_then(|response| response.error);
+    let Some(envelope) = envelope else {
+        tracing::warn!(body = %text, "Google: unframed stream lines carried no error envelope");
+        return None;
+    };
+    tracing::warn!(body = %text, "Google: stream error reported without SSE framing");
+    Some(error_from_google_envelope(&envelope))
 }
 
 /// Stateful per-chunk conversion. `pub(crate)` so unit tests can drive
@@ -1968,6 +2003,109 @@ mod tests {
         let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
         let err = convert_response_stateful(response, &mut state).expect_err("must error");
         assert!(err.to_string().contains("UNKNOWN"), "{err}");
+    }
+
+    /// Google writes its error envelope into the body over several
+    /// lines with no `data:` on any of them, so the SSE parser sets the
+    /// lot aside and the envelope is whole only once rejoined.
+    #[test]
+    fn unframed_error_body_classifies_across_lines() {
+        let body = "{\n  \"error\": {\n    \"code\": 429,\n    \
+                    \"message\": \"Resource exhausted.\",\n    \
+                    \"status\": \"RESOURCE_EXHAUSTED\"\n  }\n}";
+        let err = error_from_unframed_body(body).expect("an envelope must be read");
+        assert!(matches!(err, Error::RateLimit { .. }), "{err:?}");
+        assert!(err.to_string().contains("Resource exhausted"), "{err}");
+    }
+
+    /// Lines that aren't an envelope are not a failure to report. The
+    /// stream ending with nothing said is `StreamTruncated`'s to
+    /// describe, and inventing an error here would blame the upstream
+    /// for something it never claimed.
+    #[test]
+    fn unframed_body_that_is_not_an_envelope_reports_nothing() {
+        assert!(error_from_unframed_body("").is_none());
+        assert!(error_from_unframed_body("   \n  ").is_none());
+        assert!(error_from_unframed_body("not json at all").is_none());
+        assert!(error_from_unframed_body(r#"{"candidates":[]}"#).is_none());
+    }
+
+    /// The whole path: a 200 that streams one framed candidate chunk and
+    /// then an unframed 429. The envelope has to survive a parser that
+    /// is right to ignore it and reach the caller as the rate limit it
+    /// is, or the limiter reads the turn as a plain truncation and skips
+    /// the backpressure.
+    #[tokio::test]
+    async fn unframed_mid_stream_429_surfaces_as_a_rate_limit() {
+        let body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",",
+            "\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+            "{\"error\": {\"code\": 429, \"message\": \"Resource exhausted.\", ",
+            "\"status\": \"RESOURCE_EXHAUSTED\"}}\n",
+        );
+
+        let endpoint = VertexEndpoint::with_access_token(
+            "proj".to_string(),
+            "us-east1".to_string(),
+            "tok".to_string(),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let provider = GoogleProvider::with_transport(
+            endpoint,
+            Transport::new(StaticBody(body.as_bytes().to_vec())),
+        )
+        .with_rate_limiter(Arc::new(RecordingLimiter(outcomes.clone())));
+        let cfg = Config::builder("gemini-2.5-flash").build();
+
+        let err = crate::generate(&provider, &crate::Prompt::user("hi"), &cfg)
+            .await
+            .expect("the 200 itself is fine")
+            .buffer()
+            .await
+            .expect_err("an unframed 429 must not read as a clean stop");
+
+        assert!(matches!(err, Error::RateLimit { .. }), "{err:?}");
+        assert!(err.to_string().contains("Resource exhausted"), "{err}");
+        assert_eq!(outcomes.lock().unwrap().as_slice(), &["rate-limited"]);
+    }
+
+    /// Records the outcome each permit is released with.
+    struct RecordingLimiter(Arc<Mutex<Vec<&'static str>>>);
+
+    #[async_trait]
+    impl crate::rate_limit::RateLimiter for RecordingLimiter {
+        async fn acquire(
+            &self,
+            _scope: &crate::rate_limit::RateScope,
+        ) -> Result<crate::rate_limit::RatePermit, Error> {
+            let seen = self.0.clone();
+            Ok(crate::rate_limit::RatePermit::new(move |outcome| {
+                seen.lock().unwrap().push(match outcome {
+                    crate::rate_limit::RateOutcome::Success { .. } => "success",
+                    crate::rate_limit::RateOutcome::RateLimited { .. } => "rate-limited",
+                    crate::rate_limit::RateOutcome::OtherFailure => "other-failure",
+                    crate::rate_limit::RateOutcome::Cancelled => "cancelled",
+                });
+            }))
+        }
+    }
+
+    /// Replays a fixed 200 body as the response stream.
+    struct StaticBody(Vec<u8>);
+
+    #[async_trait]
+    impl crate::transport::TransportImpl for StaticBody {
+        async fn send(
+            &self,
+            _req: TransportRequest,
+        ) -> Result<crate::transport::TransportResponse, Error> {
+            let body = Bytes::from(self.0.clone());
+            Ok(crate::transport::TransportResponse {
+                status: 200,
+                headers: vec![],
+                body: Box::pin(futures_util::stream::once(async move { Ok(body) })),
+            })
+        }
     }
 
     fn provider() -> GoogleProvider {
