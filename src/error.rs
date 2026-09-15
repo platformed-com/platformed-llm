@@ -78,6 +78,21 @@ pub enum Error {
     #[error("model not available: {0}")]
     ModelNotAvailable(String),
 
+    /// The response stream ended before the provider reported how the
+    /// turn finished, and without raising an error of its own — the
+    /// body simply stopped. What arrived is a fragment of an answer.
+    ///
+    /// Distinct from [`Self::Provider`] because nothing was reported:
+    /// an upstream that fails mid-stream and says so surfaces as the
+    /// error it named, and reaching this variant means the loss went
+    /// unexplained. Retryable, since a fresh request can complete.
+    #[error("response stream ended without a terminator after {parts_received} part(s)")]
+    StreamTruncated {
+        /// Parts accumulated before the stream stopped. Zero means it
+        /// ended before any content arrived.
+        parts_received: usize,
+    },
+
     /// Request rejected because the prompt exceeded the model's
     /// context window. Distinct from a generic
     /// [`Self::Provider`] error so callers running long-lived
@@ -351,6 +366,7 @@ impl Error {
                     || (e.is_decode() && has_transport_source(e))
             }
             Error::RateLimit { .. } => true,
+            Error::StreamTruncated { .. } => true,
             Error::Provider { retryable, .. } => *retryable,
             Error::FileResolver { retryable, .. } => *retryable,
             Error::Auth { .. }

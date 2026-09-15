@@ -63,7 +63,7 @@ async fn main() -> Result<(), Error> {
 
     println!("🏁 Processed {event_count} events");
 
-    let complete_response = accumulator.finalize()?;
+    let complete_response = accumulator.finalize();
     let text = complete_response.text();
 
     println!("📄 Response content: '{text}'");

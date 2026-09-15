@@ -216,7 +216,7 @@ async fn main() -> Result<(), Error> {
         let function_calls = accumulator.completed_function_calls();
 
         // Get the complete response
-        let complete_response = accumulator.finalize()?;
+        let complete_response = accumulator.finalize();
 
         // Add the AI response to conversation
         conversation = conversation.with_response(&complete_response);

@@ -72,7 +72,7 @@ async fn run_function_calling_test<T: ProviderTestSetup>() -> Result<(), Box<dyn
 
     // Fold the model's tool emission back into the conversation, append
     // the tool result, and send the follow-up.
-    let complete_response = accumulator.finalize()?;
+    let complete_response = accumulator.finalize();
 
     // OpenAI's `response.completed` carries an `id` which the lib
     // surfaces as a `ProviderContinuation::OpenAI`. This was silently

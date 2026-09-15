@@ -111,7 +111,7 @@ async fn store_false_response_id_is_not_chained_on_followup() {
         .completed_function_calls()
         .first()
         .map(|c| c.call_id.clone());
-    let complete = accumulator.finalize().expect("finalize turn 1");
+    let complete = accumulator.finalize();
 
     // The captured response carried a response id even though it was
     // `store: false` — but because it wasn't retained, the lib must NOT

@@ -1421,12 +1421,43 @@ fn is_google_context_exceeded(body: &str) -> bool {
             || lower.contains("context length"))
 }
 
+/// Classify a mid-stream error envelope the way the HTTP status path
+/// classifies a failed response, so where a failure surfaced doesn't
+/// change how a caller retries it.
+///
+/// `code` is absent often enough that the gRPC `status` name carries the
+/// classification on its own; anything unrecognised stays a plain
+/// provider error rather than guessing at retryability.
+fn error_from_google_envelope(error: &GoogleApiError) -> Error {
+    let status = error.status.as_deref().unwrap_or("UNKNOWN");
+    let message = error.message.as_deref().unwrap_or("no message supplied");
+    let text = format!("Google stream error ({status}): {message}");
+
+    match (error.code, status) {
+        (Some(code @ (401 | 403)), _) => Error::auth_with_status(code, text),
+        (Some(404), _) => Error::ModelNotAvailable(text),
+        (Some(429), _) | (None, "RESOURCE_EXHAUSTED") => Error::rate_limit(None, text),
+        (Some(code), _) => Error::provider_with_status("Google", code, text),
+        (None, "UNAVAILABLE" | "INTERNAL" | "DEADLINE_EXCEEDED" | "ABORTED") => {
+            Error::provider_retryable("Google", text)
+        }
+        (None, _) => Error::provider("Google", text),
+    }
+}
+
 /// Stateful per-chunk conversion. `pub(crate)` so unit tests can drive
 /// synthetic `GoogleResponse` values directly.
 pub(crate) fn convert_response_stateful(
     response: GoogleResponse,
     state: &mut GoogleStreamState,
 ) -> Result<Vec<StreamEvent>, Error> {
+    // An error envelope ends the turn wherever it appears, so it is read
+    // before the candidates: partial content is not an answer once the
+    // upstream has said why it stopped.
+    if let Some(error) = &response.error {
+        return Err(error_from_google_envelope(error));
+    }
+
     let mut events = Vec::new();
 
     if let Some(candidate) = response.candidates.first() {
@@ -1874,6 +1905,69 @@ mod tests {
         ));
         assert!(matches!(events[1], StreamEvent::Delta { .. }));
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    }
+
+    /// Vertex can stop sending chunks mid-generation: a candidate
+    /// arrives, no chunk ever carries a `finishReason`, and the body
+    /// then ends. No `Done` is emitted, so the accumulator must call
+    /// that a truncation — the alternative is handing back the partial
+    /// text as though the model had finished.
+    #[test]
+    fn stream_ending_without_a_finish_reason_is_a_truncation() {
+        let chunk = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}]}"#;
+        let mut state = GoogleStreamState::default();
+        let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let events = convert_response_stateful(response, &mut state).unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+            "a chunk without finishReason must not terminate the stream",
+        );
+
+        let mut acc = crate::accumulator::ResponseAccumulator::new();
+        for event in events {
+            acc.process_event(event).unwrap();
+        }
+        assert!(!acc.saw_terminator());
+    }
+
+    /// Vertex reports a mid-generation failure as a chunk on a stream
+    /// that already answered 200. Every `GoogleResponse` field is
+    /// optional, so an unread `error` parses as an empty response,
+    /// emits nothing, and leaves the caller with an unexplained
+    /// truncation in place of the reason.
+    #[test]
+    fn mid_stream_error_envelope_surfaces_as_the_error_it_reports() {
+        let chunk = r#"{"error":{"code":429,"message":"Quota exceeded for quota metric 'Generate requests'","status":"RESOURCE_EXHAUSTED"}}"#;
+        let mut state = GoogleStreamState::default();
+        let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let err = convert_response_stateful(response, &mut state)
+            .expect_err("a reported failure must not be swallowed");
+        assert!(matches!(err, Error::RateLimit { .. }), "{err:?}");
+        assert!(err.to_string().contains("Quota exceeded"), "{err}");
+    }
+
+    /// Classification falls back to the gRPC status name when no
+    /// numeric code is supplied, so a retryable backend blip stays
+    /// retryable.
+    #[test]
+    fn mid_stream_error_without_a_code_classifies_on_status() {
+        let chunk = r#"{"error":{"message":"backend unavailable","status":"UNAVAILABLE"}}"#;
+        let mut state = GoogleStreamState::default();
+        let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let err = convert_response_stateful(response, &mut state).expect_err("must error");
+        assert!(err.is_retryable(), "{err}");
+    }
+
+    /// An envelope in a shape we didn't predict must still parse and
+    /// still raise: degrading to a generic provider error beats a
+    /// deserialize failure that loses the report entirely.
+    #[test]
+    fn mid_stream_error_of_unknown_shape_still_raises() {
+        let chunk = r#"{"error":{"something":"we have never seen"}}"#;
+        let mut state = GoogleStreamState::default();
+        let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let err = convert_response_stateful(response, &mut state).expect_err("must error");
+        assert!(err.to_string().contains("UNKNOWN"), "{err}");
     }
 
     fn provider() -> GoogleProvider {
@@ -2649,7 +2743,7 @@ mod tests {
         for ev in events {
             acc.process_event(ev).unwrap();
         }
-        let resp = acc.finalize().unwrap();
+        let resp = acc.finalize();
         let call = resp
             .content
             .iter()

@@ -798,6 +798,17 @@ fn find_latest_openai_continuation(
     (None, 0)
 }
 
+/// The `type` tag of a frame that matched no known variant, for the
+/// warning that reports it. Best-effort: a frame malformed enough to
+/// have no readable tag is worth logging anyway, without its name.
+fn unknown_event_type(data: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()?
+        .get("type")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
 /// Whether an OpenAI error `type`/`code` string marks a transient
 /// server-side condition. These are the strings OpenAI attaches to
 /// conditions that surface as a retryable 5xx before the stream opens,
@@ -1210,13 +1221,9 @@ impl OpenAIStreamState {
             | OpenAIStreamEvent::WebSearchCallSearching
             | OpenAIStreamEvent::WebSearchCallCompleted => Ok(vec![]),
 
-            OpenAIStreamEvent::Unknown => {
-                tracing::warn!(
-                    "received an OpenAI stream event with an unrecognised `type` — \
-                     ignoring. Inspect the captured `.response.sse` for the wire shape."
-                );
-                Ok(vec![])
-            }
+            // Warned about at the parse site, which still holds the
+            // frame the tag came from.
+            OpenAIStreamEvent::Unknown => Ok(vec![]),
         }
     }
 
@@ -1535,6 +1542,15 @@ impl Provider for OpenAIProvider {
                 let sse_event = sse_result?;
                 trace!(event = ?sse_event, "received OpenAI SSE event");
                 let stream_event = serde_json::from_str::<OpenAIStreamEvent>(&sse_event.data)?;
+                // `#[serde(other)]` discards the tag it matched, so the
+                // name is only recoverable from the raw frame — and only
+                // an unrecognised frame pays for the second parse.
+                if matches!(stream_event, OpenAIStreamEvent::Unknown) {
+                    tracing::warn!(
+                        event_type = unknown_event_type(&sse_event.data).as_deref(),
+                        "received an OpenAI stream event with an unrecognised `type` — ignoring",
+                    );
+                }
                 // A poisoned lock means `process` panicked on a prior
                 // event; surface it as a stream error instead of
                 // panicking this task too.
@@ -1983,6 +1999,18 @@ mod tests {
             ),
             other => panic!("expected Provider, got {other:?}"),
         }
+    }
+
+    /// An unrecognised frame is still ignored, but the warning has to
+    /// name the tag — `#[serde(other)]` discards it, so the name is
+    /// recoverable only from the raw frame.
+    #[test]
+    fn unknown_event_type_is_recovered_for_the_warning() {
+        assert_eq!(
+            unknown_event_type(r#"{"type":"response.something_new","x":1}"#).as_deref(),
+            Some("response.something_new"),
+        );
+        assert_eq!(unknown_event_type("not json at all"), None);
     }
 
     /// A `response.failed` carrying no error details anywhere is

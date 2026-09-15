@@ -228,6 +228,25 @@ pub struct GoogleResponse {
     pub usage_metadata: Option<GoogleUsageMetadata>,
     #[serde(default, rename = "promptFeedback")]
     pub prompt_feedback: Option<GooglePromptFeedback>,
+    #[serde(default)]
+    pub error: Option<GoogleApiError>,
+}
+
+/// Google's standard error envelope. It arrives as a chunk on a stream
+/// that already answered 200 — a quota or backend failure that hits
+/// mid-generation — so the HTTP status alone never reveals it.
+///
+/// Every field is optional: an envelope whose shape we don't predict
+/// must still parse, because the alternative is a deserialize failure
+/// that reads as a truncated stream and loses the error entirely.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GoogleApiError {
+    #[serde(default)]
+    pub code: Option<u16>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// Returned in place of (or alongside) candidates when the prompt itself was

@@ -66,7 +66,7 @@ async fn main() -> Result<(), Error> {
             accumulator.process_event(event)?;
         }
         println!("🏁 {event_count} total events");
-        Ok(accumulator.finalize()?.text())
+        Ok(accumulator.finalize().text())
     })
     .await?;
 
