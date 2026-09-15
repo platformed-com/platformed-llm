@@ -110,6 +110,12 @@ impl Response {
 
     /// Drain the stream and return the buffered [`CompleteResponse`].
     ///
+    /// Draining to exhaustion without reaching a terminal `Done` is
+    /// [`Error::StreamTruncated`]: this loop is the only place that can
+    /// tell a stream which ran out from a caller which stopped reading,
+    /// so it is the one that decides. A provider that reported a failure
+    /// of its own has already surfaced it as that error.
+    ///
     /// Unlike [`Self::collect`] this does not build (and clone every
     /// event into) an event log it would only discard — it feeds the
     /// accumulator by value. This is the common path behind
@@ -126,7 +132,12 @@ impl Response {
                 break;
             }
         }
-        accumulator.finalize()
+        if !accumulator.saw_terminator() {
+            return Err(Error::StreamTruncated {
+                parts_received: accumulator.parts_received(),
+            });
+        }
+        Ok(accumulator.finalize())
     }
 
     /// Drain the stream and return the concatenated text of all text parts.
@@ -164,8 +175,12 @@ impl Response {
             }
         }
 
-        let response = accumulator.finalize()?;
-        Ok((events, response))
+        if !accumulator.saw_terminator() {
+            return Err(Error::StreamTruncated {
+                parts_received: accumulator.parts_received(),
+            });
+        }
+        Ok((events, accumulator.finalize()))
     }
 
     /// Unwrap to the raw event stream for direct consumption.
@@ -199,6 +214,62 @@ mod tests {
         let stream = futures_util::stream::iter(events);
         let text = Response::from_stream(stream).text().await.unwrap();
         assert_eq!(text, "Test response");
+    }
+
+    /// `collect` makes the same judgement as `buffer` — a stream that
+    /// ran out is not a response, however much of one arrived.
+    #[tokio::test]
+    async fn collect_rejects_a_stream_that_ends_without_done() {
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::Text,
+            }),
+            Ok(StreamEvent::Delta {
+                index: 0,
+                delta: "half an ans".to_string(),
+            }),
+        ];
+        let stream = futures_util::stream::iter(events);
+        let err = Response::from_stream(stream)
+            .collect()
+            .await
+            .map(|_| ())
+            .expect_err("a truncated stream is not a response");
+        assert!(
+            matches!(err, Error::StreamTruncated { parts_received: 1 }),
+            "must name the condition and what arrived, got {err:?}",
+        );
+        assert!(err.is_retryable(), "{err}");
+    }
+
+    /// A stream whose events simply run out mid-response — the
+    /// transport closed cleanly, so no `Err` was ever yielded — is a
+    /// truncation. `buffer` must refuse it rather than hand back the
+    /// partial text, so the caller's retry policy re-requests instead
+    /// of treating a fragment as the answer.
+    #[tokio::test]
+    async fn buffer_rejects_a_stream_that_ends_without_done() {
+        let events: Vec<Result<StreamEvent, Error>> = vec![
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::Text,
+            }),
+            Ok(StreamEvent::Delta {
+                index: 0,
+                delta: "half an ans".to_string(),
+            }),
+        ];
+        let stream = futures_util::stream::iter(events);
+        let err = Response::from_stream(stream)
+            .buffer()
+            .await
+            .expect_err("a truncated stream is not a response");
+        assert!(
+            matches!(err, Error::StreamTruncated { parts_received: 1 }),
+            "must name the condition and what arrived, got {err:?}",
+        );
+        assert!(err.is_retryable(), "{err}");
     }
 
     /// A mid-stream `Err` must propagate out of `buffer` and discard

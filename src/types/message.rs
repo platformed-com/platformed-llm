@@ -399,10 +399,16 @@ pub enum FinishReason {
     ToolCalls,
     /// The provider's content filter blocked or truncated the response.
     ContentFilter,
-    /// The stream ended without a terminal `Done`/stop signal — the
-    /// response is *incomplete* (connection dropped, task cancelled,
-    /// or a local engine cut off mid-emit). Distinct from [`Self::Stop`]
-    /// so callers driving tool-call loops or billing don't mistake a
-    /// truncated turn for a clean finish.
+    /// No clean terminator was reported: either the provider named a
+    /// reason none of the variants above cover, or the turn was
+    /// assembled from a stream that stopped before saying. The content
+    /// may be partial, so callers driving tool-call loops or billing
+    /// must not treat it as a clean [`Self::Stop`].
+    ///
+    /// Whether an early stop was a fault is not decidable from the
+    /// reason alone — the stream's driver decides. Reaching a drain
+    /// site as this means a terminator did arrive naming a reason no
+    /// variant here covers; a stream that stopped without one at all
+    /// raises [`Error::StreamTruncated`](crate::Error::StreamTruncated).
     Incomplete,
 }

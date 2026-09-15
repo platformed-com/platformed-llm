@@ -966,14 +966,14 @@ impl Provider for GoogleProvider {
             });
         }
 
-        // Success path: defer the limiter observation to stream-end
-        // — see `rate_limit::observe_stream`. We do this even though
-        // Vertex Gemini doesn't have a known mid-stream rate-limit
-        // signal yet, so transport drops mid-response are reported as
+        // Success path: defer the limiter observation to stream-end —
+        // see `rate_limit::observe_stream`. A quota failure can land
+        // mid-generation, and a transport drop mid-response reports as
         // `OtherFailure` rather than `Success`.
 
         // Create SSE stream from response (Gemini supports ?alt=sse)
         let sse_stream = SseStream::new("Google", response.body);
+        let unframed = sse_stream.unframed();
 
         // Create a stateful processor for tracking output items
         let mut state = GoogleStreamState::default();
@@ -1014,7 +1014,18 @@ impl Provider for GoogleProvider {
                 }
             })
             .map(|events| futures_util::stream::iter(events.into_iter()))
-            .flatten();
+            .flatten()
+            // Google can report a mid-generation failure by writing its
+            // error envelope into the body with no SSE framing, which
+            // leaves the parser no field to attach it to, so it sets
+            // those lines aside. They are whole only once the stream
+            // has ended.
+            .chain(
+                futures_util::stream::once(async move {
+                    futures_util::stream::iter(error_from_unframed_body(&unframed.take()).map(Err))
+                })
+                .flatten(),
+            );
 
         let observed = crate::rate_limit::observe_response_stream(
             event_stream,
@@ -1421,12 +1432,67 @@ fn is_google_context_exceeded(body: &str) -> bool {
             || lower.contains("context length"))
 }
 
+/// Classify a mid-stream error envelope the way the HTTP status path
+/// classifies a failed response, so where a failure surfaced doesn't
+/// change how a caller retries it.
+///
+/// `code` is absent often enough that the gRPC `status` name carries the
+/// classification on its own; anything unrecognised stays a plain
+/// provider error rather than guessing at retryability.
+fn error_from_google_envelope(error: &GoogleApiError) -> Error {
+    let status = error.status.as_deref().unwrap_or("UNKNOWN");
+    let message = error.message.as_deref().unwrap_or("no message supplied");
+    let text = format!("Google stream error ({status}): {message}");
+
+    match (error.code, status) {
+        (Some(code @ (401 | 403)), _) => Error::auth_with_status(code, text),
+        (Some(404), _) => Error::ModelNotAvailable(text),
+        (Some(429), _) | (None, "RESOURCE_EXHAUSTED") => Error::rate_limit(None, text),
+        (Some(code), _) => Error::provider_with_status("Google", code, text),
+        (None, "UNAVAILABLE" | "INTERNAL" | "DEADLINE_EXCEEDED" | "ABORTED") => {
+            Error::provider_retryable("Google", text)
+        }
+        (None, _) => Error::provider("Google", text),
+    }
+}
+
+/// Recover a failure Google wrote into the stream body with no SSE
+/// framing, leaving the parser no field to attach it to. The framed
+/// form of the same envelope is read by `convert_response_stateful`.
+///
+/// Anything that isn't the standard error envelope is left alone: an
+/// unrecognised line is no grounds to invent a failure, and a stream
+/// that ended having reported nothing is already described by
+/// [`Error::StreamTruncated`].
+fn error_from_unframed_body(text: &str) -> Option<Error> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let envelope = serde_json::from_str::<GoogleResponse>(text)
+        .ok()
+        .and_then(|response| response.error);
+    let Some(envelope) = envelope else {
+        tracing::warn!(body = %text, "Google: unframed stream lines carried no error envelope");
+        return None;
+    };
+    tracing::warn!(body = %text, "Google: stream error reported without SSE framing");
+    Some(error_from_google_envelope(&envelope))
+}
+
 /// Stateful per-chunk conversion. `pub(crate)` so unit tests can drive
 /// synthetic `GoogleResponse` values directly.
 pub(crate) fn convert_response_stateful(
     response: GoogleResponse,
     state: &mut GoogleStreamState,
 ) -> Result<Vec<StreamEvent>, Error> {
+    // An error envelope ends the turn wherever it appears, so it is read
+    // before the candidates: partial content is not an answer once the
+    // upstream has said why it stopped.
+    if let Some(error) = &response.error {
+        return Err(error_from_google_envelope(error));
+    }
+
     let mut events = Vec::new();
 
     if let Some(candidate) = response.candidates.first() {
@@ -1874,6 +1940,221 @@ mod tests {
         ));
         assert!(matches!(events[1], StreamEvent::Delta { .. }));
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    }
+
+    /// Vertex can stop sending chunks mid-generation: a candidate
+    /// arrives, no chunk ever carries a `finishReason`, and the body
+    /// then ends. No `Done` is emitted, so the accumulator must call
+    /// that a truncation — the alternative is handing back the partial
+    /// text as though the model had finished.
+    #[test]
+    fn stream_ending_without_a_finish_reason_is_a_truncation() {
+        let chunk = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}]}"#;
+        let mut state = GoogleStreamState::default();
+        let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let events = convert_response_stateful(response, &mut state).unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+            "a chunk without finishReason must not terminate the stream",
+        );
+
+        let mut acc = crate::accumulator::ResponseAccumulator::new();
+        for event in events {
+            acc.process_event(event).unwrap();
+        }
+        assert!(!acc.saw_terminator());
+    }
+
+    /// Vertex reports a mid-generation failure as a chunk on a stream
+    /// that already answered 200. Every `GoogleResponse` field is
+    /// optional, so an unread `error` parses as an empty response,
+    /// emits nothing, and leaves the caller with an unexplained
+    /// truncation in place of the reason.
+    #[test]
+    fn mid_stream_error_envelope_surfaces_as_the_error_it_reports() {
+        let chunk = r#"{"error":{"code":429,"message":"Quota exceeded for quota metric 'Generate requests'","status":"RESOURCE_EXHAUSTED"}}"#;
+        let mut state = GoogleStreamState::default();
+        let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let err = convert_response_stateful(response, &mut state)
+            .expect_err("a reported failure must not be swallowed");
+        assert!(matches!(err, Error::RateLimit { .. }), "{err:?}");
+        assert!(err.to_string().contains("Quota exceeded"), "{err}");
+    }
+
+    /// Pins every arm of the envelope classifier, including the
+    /// code-less ones: Google supplies `code` inconsistently, and a
+    /// quota envelope that arrives with only its gRPC status name still
+    /// has to reach the caller as a rate limit for the limiter to slow
+    /// down rather than as an opaque provider error.
+    #[test]
+    fn envelope_classification_table() {
+        fn label(err: &Error) -> &'static str {
+            match err {
+                Error::Auth { .. } => "auth",
+                Error::ModelNotAvailable(_) => "model-not-available",
+                Error::RateLimit { .. } => "rate-limit",
+                Error::Provider { .. } => "provider",
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+
+        let cases: &[(Option<u16>, Option<&str>, &str, bool)] = &[
+            (Some(401), None, "auth", false),
+            (Some(403), Some("PERMISSION_DENIED"), "auth", false),
+            (Some(404), Some("NOT_FOUND"), "model-not-available", false),
+            (Some(429), Some("RESOURCE_EXHAUSTED"), "rate-limit", true),
+            (None, Some("RESOURCE_EXHAUSTED"), "rate-limit", true),
+            (Some(500), Some("INTERNAL"), "provider", true),
+            (Some(400), Some("INVALID_ARGUMENT"), "provider", false),
+            (None, Some("UNAVAILABLE"), "provider", true),
+            (None, Some("INTERNAL"), "provider", true),
+            (None, Some("DEADLINE_EXCEEDED"), "provider", true),
+            (None, Some("ABORTED"), "provider", true),
+            (None, Some("INVALID_ARGUMENT"), "provider", false),
+            (None, None, "provider", false),
+        ];
+
+        for (code, status, want_label, want_retryable) in cases {
+            let envelope = GoogleApiError {
+                code: *code,
+                message: Some("boom".to_string()),
+                status: status.map(str::to_string),
+            };
+            let err = error_from_google_envelope(&envelope);
+            assert_eq!(label(&err), *want_label, "for {code:?}/{status:?}");
+            assert_eq!(
+                err.is_retryable(),
+                *want_retryable,
+                "retryability for {code:?}/{status:?}: {err}",
+            );
+        }
+    }
+
+    /// Classification falls back to the gRPC status name when no
+    /// numeric code is supplied, so a retryable backend blip stays
+    /// retryable.
+    #[test]
+    fn mid_stream_error_without_a_code_classifies_on_status() {
+        let chunk = r#"{"error":{"message":"backend unavailable","status":"UNAVAILABLE"}}"#;
+        let mut state = GoogleStreamState::default();
+        let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let err = convert_response_stateful(response, &mut state).expect_err("must error");
+        assert!(err.is_retryable(), "{err}");
+    }
+
+    /// An envelope in a shape we didn't predict must still parse and
+    /// still raise: degrading to a generic provider error beats a
+    /// deserialize failure that loses the report entirely.
+    #[test]
+    fn mid_stream_error_of_unknown_shape_still_raises() {
+        let chunk = r#"{"error":{"something":"we have never seen"}}"#;
+        let mut state = GoogleStreamState::default();
+        let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let err = convert_response_stateful(response, &mut state).expect_err("must error");
+        assert!(err.to_string().contains("UNKNOWN"), "{err}");
+    }
+
+    /// Google writes its error envelope into the body over several
+    /// lines with no `data:` on any of them, so the SSE parser sets the
+    /// lot aside and the envelope is whole only once rejoined.
+    #[test]
+    fn unframed_error_body_classifies_across_lines() {
+        let body = "{\n  \"error\": {\n    \"code\": 429,\n    \
+                    \"message\": \"Resource exhausted.\",\n    \
+                    \"status\": \"RESOURCE_EXHAUSTED\"\n  }\n}";
+        let err = error_from_unframed_body(body).expect("an envelope must be read");
+        assert!(matches!(err, Error::RateLimit { .. }), "{err:?}");
+        assert!(err.to_string().contains("Resource exhausted"), "{err}");
+    }
+
+    /// Lines that aren't an envelope are not a failure to report. The
+    /// stream ending with nothing said is `StreamTruncated`'s to
+    /// describe, and inventing an error here would blame the upstream
+    /// for something it never claimed.
+    #[test]
+    fn unframed_body_that_is_not_an_envelope_reports_nothing() {
+        assert!(error_from_unframed_body("").is_none());
+        assert!(error_from_unframed_body("   \n  ").is_none());
+        assert!(error_from_unframed_body("not json at all").is_none());
+        assert!(error_from_unframed_body(r#"{"candidates":[]}"#).is_none());
+    }
+
+    /// The whole path: a 200 that streams one framed candidate chunk and
+    /// then an unframed 429. The envelope has to survive a parser that
+    /// is right to ignore it and reach the caller as the rate limit it
+    /// is, or the limiter reads the turn as a plain truncation and skips
+    /// the backpressure.
+    #[tokio::test]
+    async fn unframed_mid_stream_429_surfaces_as_a_rate_limit() {
+        let body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",",
+            "\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+            "{\"error\": {\"code\": 429, \"message\": \"Resource exhausted.\", ",
+            "\"status\": \"RESOURCE_EXHAUSTED\"}}\n",
+        );
+
+        let endpoint = VertexEndpoint::with_access_token(
+            "proj".to_string(),
+            "us-east1".to_string(),
+            "tok".to_string(),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let provider = GoogleProvider::with_transport(
+            endpoint,
+            Transport::new(StaticBody(body.as_bytes().to_vec())),
+        )
+        .with_rate_limiter(Arc::new(RecordingLimiter(outcomes.clone())));
+        let cfg = Config::builder("gemini-2.5-flash").build();
+
+        let err = crate::generate(&provider, &crate::Prompt::user("hi"), &cfg)
+            .await
+            .expect("the 200 itself is fine")
+            .buffer()
+            .await
+            .expect_err("an unframed 429 must not read as a clean stop");
+
+        assert!(matches!(err, Error::RateLimit { .. }), "{err:?}");
+        assert!(err.to_string().contains("Resource exhausted"), "{err}");
+        assert_eq!(outcomes.lock().unwrap().as_slice(), &["rate-limited"]);
+    }
+
+    /// Records the outcome each permit is released with.
+    struct RecordingLimiter(Arc<Mutex<Vec<&'static str>>>);
+
+    #[async_trait]
+    impl crate::rate_limit::RateLimiter for RecordingLimiter {
+        async fn acquire(
+            &self,
+            _scope: &crate::rate_limit::RateScope,
+        ) -> Result<crate::rate_limit::RatePermit, Error> {
+            let seen = self.0.clone();
+            Ok(crate::rate_limit::RatePermit::new(move |outcome| {
+                seen.lock().unwrap().push(match outcome {
+                    crate::rate_limit::RateOutcome::Success { .. } => "success",
+                    crate::rate_limit::RateOutcome::RateLimited { .. } => "rate-limited",
+                    crate::rate_limit::RateOutcome::OtherFailure => "other-failure",
+                    crate::rate_limit::RateOutcome::Cancelled => "cancelled",
+                });
+            }))
+        }
+    }
+
+    /// Replays a fixed 200 body as the response stream.
+    struct StaticBody(Vec<u8>);
+
+    #[async_trait]
+    impl crate::transport::TransportImpl for StaticBody {
+        async fn send(
+            &self,
+            _req: TransportRequest,
+        ) -> Result<crate::transport::TransportResponse, Error> {
+            let body = Bytes::from(self.0.clone());
+            Ok(crate::transport::TransportResponse {
+                status: 200,
+                headers: vec![],
+                body: Box::pin(futures_util::stream::once(async move { Ok(body) })),
+            })
+        }
     }
 
     fn provider() -> GoogleProvider {
@@ -2649,7 +2930,7 @@ mod tests {
         for ev in events {
             acc.process_event(ev).unwrap();
         }
-        let resp = acc.finalize().unwrap();
+        let resp = acc.finalize();
         let call = resp
             .content
             .iter()

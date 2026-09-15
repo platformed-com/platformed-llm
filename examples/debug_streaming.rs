@@ -66,7 +66,15 @@ async fn main() -> Result<(), Error> {
             accumulator.process_event(event)?;
         }
         println!("🏁 {event_count} total events");
-        Ok(accumulator.finalize()?.text())
+        // A stream that ran out mid-answer yields no `Err` of its own,
+        // so without this the retry above never fires and the partial
+        // text is returned as the response.
+        if !accumulator.saw_terminator() {
+            return Err(Error::StreamTruncated {
+                parts_received: accumulator.parts_received(),
+            });
+        }
+        Ok(accumulator.finalize().text())
     })
     .await?;
 

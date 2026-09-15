@@ -647,13 +647,14 @@ async fn unified_event_snapshots_match() {
         if accumulator_failed {
             continue;
         }
-        let complete = match accumulator.finalize() {
-            Ok(c) => c,
-            Err(e) => {
-                failures.push(format!("{label}: accumulator.finalize: {e}"));
-                continue;
-            }
-        };
+        if !accumulator.saw_terminator() {
+            failures.push(format!(
+                "{label}: stream ended without a terminator after {} part(s)",
+                accumulator.parts_received()
+            ));
+            continue;
+        }
+        let complete = accumulator.finalize();
 
         if let Err(msg) = validate_complete_response(
             &complete,

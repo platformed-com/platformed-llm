@@ -78,6 +78,21 @@ pub enum Error {
     #[error("model not available: {0}")]
     ModelNotAvailable(String),
 
+    /// The response stream ended before the provider reported how the
+    /// turn finished, and without raising an error of its own — the
+    /// body simply stopped. What arrived is a fragment of an answer.
+    ///
+    /// Distinct from [`Self::Provider`] because nothing was reported:
+    /// an upstream that fails mid-stream and says so surfaces as the
+    /// error it named, and reaching this variant means the loss went
+    /// unexplained. Retryable, since a fresh request can complete.
+    #[error("response stream ended without a terminator after {parts_received} part(s)")]
+    StreamTruncated {
+        /// Parts accumulated before the stream stopped. Zero means it
+        /// ended before any content arrived.
+        parts_received: usize,
+    },
+
     /// Request rejected because the prompt exceeded the model's
     /// context window. Distinct from a generic
     /// [`Self::Provider`] error so callers running long-lived
@@ -280,11 +295,13 @@ impl Error {
     /// re-issuing the same request is likely to behave differently
     /// next time.
     ///
-    /// Returns `true` for [`Self::RateLimit`]; for [`Self::Transport`]
-    /// when the wrapped `reqwest::Error` is a connect, timeout,
-    /// request-send, or body failure, or a decode failure whose
-    /// source chain carries a transport-level cause (a connection
-    /// lost mid-body surfaces as a decode error wrapping a
+    /// Returns `true` for [`Self::RateLimit`]; for
+    /// [`Self::StreamTruncated`], since a body that stopped without
+    /// saying why may well reach the end next time; for
+    /// [`Self::Transport`] when the wrapped `reqwest::Error` is a
+    /// connect, timeout, request-send, or body failure, or a decode
+    /// failure whose source chain carries a transport-level cause (a
+    /// connection lost mid-body surfaces as a decode error wrapping a
     /// `hyper`/IO error — decode failures caused by the payload
     /// itself stay terminal); and for [`Self::Provider`] when its
     /// `retryable` flag is set (5xx / 429, mid-stream
@@ -351,6 +368,7 @@ impl Error {
                     || (e.is_decode() && has_transport_source(e))
             }
             Error::RateLimit { .. } => true,
+            Error::StreamTruncated { .. } => true,
             Error::Provider { retryable, .. } => *retryable,
             Error::FileResolver { retryable, .. } => *retryable,
             Error::Auth { .. }

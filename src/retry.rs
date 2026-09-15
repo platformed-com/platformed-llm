@@ -29,6 +29,9 @@
 //! returns `true`:
 //!
 //! - [`Error::RateLimit`] — 429s.
+//! - [`Error::StreamTruncated`] — the body stopped before the
+//!   provider reported how the turn finished and without raising an
+//!   error of its own.
 //! - [`Error::Provider`] with `retryable: true` — typically 5xx
 //!   responses; each hosted provider also marks specific mid-stream
 //!   transient codes retryable (e.g. OpenAI's mid-stream

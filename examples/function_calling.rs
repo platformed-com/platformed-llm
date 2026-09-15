@@ -215,8 +215,15 @@ async fn main() -> Result<(), Error> {
         // Get function calls before finalizing
         let function_calls = accumulator.completed_function_calls();
 
+        // A stream that ran out mid-answer yields no `Err` of its own.
+        if !accumulator.saw_terminator() {
+            return Err(Error::StreamTruncated {
+                parts_received: accumulator.parts_received(),
+            });
+        }
+
         // Get the complete response
-        let complete_response = accumulator.finalize()?;
+        let complete_response = accumulator.finalize();
 
         // Add the AI response to conversation
         conversation = conversation.with_response(&complete_response);

@@ -80,17 +80,34 @@ impl ResponseAccumulator {
         })
     }
 
-    /// Consume the accumulator and produce the final response. If a
-    /// `Done` event was never observed (truncated / cancelled stream),
-    /// the finish reason is [`FinishReason::Incomplete`] — *not*
-    /// `Stop` — so callers can distinguish a clean finish from a cut
-    /// off one; usage falls back to zeros.
-    pub fn finalize(self) -> Result<CompleteResponse, Error> {
-        Ok(CompleteResponse {
+    /// Whether a terminal `Done` has been observed.
+    ///
+    /// Without one the turn has no reported ending, which is either a
+    /// stream that stopped early or a caller that stopped reading. Only
+    /// whoever drives the stream can tell those apart, so the verdict is
+    /// theirs to make — see [`crate::Response::buffer`] for how the
+    /// library's own drain sites make it.
+    pub fn saw_terminator(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+
+    /// How many parts have been opened so far.
+    pub fn parts_received(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Consume the accumulator and produce the response as accumulated.
+    ///
+    /// With no terminal `Done` the finish reason is
+    /// [`FinishReason::Incomplete`] and usage falls back to zeros. That
+    /// is a statement about what arrived, not a verdict on why — check
+    /// [`Self::saw_terminator`] to make one.
+    pub fn finalize(self) -> CompleteResponse {
+        CompleteResponse {
             content: self.parts,
             finish_reason: self.finish_reason.unwrap_or(FinishReason::Incomplete),
             usage: self.usage.unwrap_or_default(),
-        })
+        }
     }
 
     /// Concatenation of all accumulated text-part content so far. Intended
@@ -267,8 +284,13 @@ mod tests {
         .unwrap();
         acc.process_event(StreamEvent::PartEnd { index: 0 })
             .unwrap();
+        acc.process_event(StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        })
+        .unwrap();
 
-        let response = acc.finalize().unwrap();
+        let response = acc.finalize();
         match &response.content[0] {
             AssistantPart::Reasoning { signature, content } => {
                 assert_eq!(content, "Thinking...");
@@ -345,8 +367,13 @@ mod tests {
         .unwrap();
         acc.process_event(StreamEvent::PartEnd { index: 0 })
             .unwrap();
+        acc.process_event(StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        })
+        .unwrap();
 
-        let response = acc.finalize().unwrap();
+        let response = acc.finalize();
         match &response.content[0] {
             AssistantPart::RedactedReasoning { data } => assert_eq!(data, "opaque-blob"),
             _ => panic!("wrong"),
@@ -354,9 +381,11 @@ mod tests {
     }
 
     #[test]
-    fn finalize_without_done_is_incomplete_not_stop() {
-        // A stream that ends without a terminal `Done` (truncated /
-        // cancelled) must NOT be reported as a clean Stop.
+    fn no_done_reports_no_terminator_and_keeps_the_partial_content() {
+        // The accumulator states what arrived and nothing more: the
+        // partial text, and that no terminator was seen. Whether that
+        // is a truncation or a deliberate stop is the stream driver's
+        // call.
         let mut acc = ResponseAccumulator::new();
         acc.process_event(StreamEvent::PartStart {
             index: 0,
@@ -365,12 +394,22 @@ mod tests {
         .unwrap();
         acc.process_event(StreamEvent::Delta {
             index: 0,
-            delta: "partial".into(),
+            delta: "as far as it got".into(),
         })
         .unwrap();
-        // No PartEnd, no Done — stream just stopped.
-        let response = acc.finalize().unwrap();
+
+        assert!(!acc.saw_terminator());
+        assert_eq!(acc.parts_received(), 1);
+        let response = acc.finalize();
         assert_eq!(response.finish_reason, FinishReason::Incomplete);
+        assert_eq!(response.text(), "as far as it got");
+    }
+
+    #[test]
+    fn an_empty_stream_reports_no_terminator_and_no_parts() {
+        let acc = ResponseAccumulator::new();
+        assert!(!acc.saw_terminator());
+        assert_eq!(acc.parts_received(), 0);
     }
 
     #[test]
@@ -381,6 +420,7 @@ mod tests {
             usage: Usage::default(),
         })
         .unwrap();
-        assert_eq!(acc.finalize().unwrap().finish_reason, FinishReason::Length);
+        assert!(acc.saw_terminator());
+        assert_eq!(acc.finalize().finish_reason, FinishReason::Length);
     }
 }

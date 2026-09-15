@@ -6,6 +6,7 @@ use memchr::memchr2;
 use std::collections::VecDeque;
 use std::mem;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{ready, Context, Poll};
 
 /// A Server-Sent Events (SSE) event.
@@ -47,12 +48,53 @@ pub struct SseStream<S> {
     events: EventBuffer,
 }
 
+/// Text of the lines an [`SseStream`] found no SSE field on, in arrival
+/// order, shared with whoever built the stream.
+///
+/// The spec has a conforming parser ignore such a line, which is right
+/// for every field an event stream may legitimately carry and wrong for
+/// an upstream that writes a bare body where the fields belong: the
+/// stream then ends having reported nothing. Retaining the text costs a
+/// well-formed stream nothing and leaves it to the provider, which knows
+/// the shape of its own upstream, to say what it means.
+#[derive(Clone, Default)]
+pub struct UnframedLines(Arc<Mutex<String>>);
+
+/// Ceiling on retained unframed text. An error envelope is far smaller;
+/// the bound is what stops a stream of unrecognised lines growing
+/// without one.
+const UNFRAMED_LIMIT: usize = 64 * 1024;
+
+impl UnframedLines {
+    fn buf(&self) -> std::sync::MutexGuard<'_, String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn push(&self, line: &str) {
+        let mut buf = self.buf();
+        if buf.len() + line.len() > UNFRAMED_LIMIT {
+            return;
+        }
+        if !buf.is_empty() {
+            buf.push('\n');
+        }
+        buf.push_str(line);
+    }
+
+    /// Take the retained text, leaving the buffer empty.
+    pub fn take(&self) -> String {
+        mem::take(&mut *self.buf())
+    }
+}
+
 struct EventBuffer {
     current_event: SseEvent,
     events: VecDeque<SseEvent>,
     /// Provider name forwarded from the owning `SseStream` so the
     /// UTF-8 error site can attribute the failure correctly.
     provider: &'static str,
+    /// Lines the parser had no field for; see [`UnframedLines`].
+    unframed: UnframedLines,
 }
 
 impl EventBuffer {
@@ -62,6 +104,7 @@ impl EventBuffer {
             current_event: SseEvent::default(),
             events: VecDeque::new(),
             provider,
+            unframed: UnframedLines::default(),
         }
     }
 
@@ -131,7 +174,7 @@ impl EventBuffer {
                     self.current_event.retry = Some(retry);
                 }
             }
-            _ => {} // Ignore unknown fields
+            _ => self.unframed.push(line),
         }
         Ok(())
     }
@@ -148,6 +191,14 @@ impl<S> SseStream<S> {
             last_seen_cr: false,
             events: EventBuffer::new(provider),
         }
+    }
+
+    /// Handle on the lines this stream found no SSE field on. Take it
+    /// before the stream is moved into a combinator chain, and read it
+    /// once the stream has ended — a body written across several lines
+    /// is only whole then.
+    pub fn unframed(&self) -> UnframedLines {
+        self.events.unframed.clone()
     }
 
     /// Process the buffer using a state machine to detect line endings robustly.
@@ -247,6 +298,39 @@ impl<S: Stream> SseStreamExt for S {}
 mod tests {
     use super::*;
     use futures_util::stream;
+
+    /// A conforming parser has no field to attach a bare JSON line to,
+    /// so it ignores it. The text is retained instead, across as many
+    /// lines as the body was written over, with comments and known
+    /// fields left out of it.
+    #[tokio::test]
+    async fn lines_with_no_sse_field_are_retained() {
+        let chunks: Vec<Result<bytes::Bytes, Error>> = vec![Ok(bytes::Bytes::from(
+            "data: {\"candidates\":[]}\n\n: heartbeat\n{\"error\": {\n  \"code\": 429\n}}\n",
+        ))];
+        let sse_stream = stream::iter(chunks).sse_events("Google");
+        let unframed = sse_stream.unframed();
+
+        let events: Vec<_> = sse_stream.collect().await;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(unframed.take(), "{\"error\": {\n  \"code\": 429\n}}");
+    }
+
+    /// The retained text is bounded, so an upstream emitting nothing
+    /// the parser recognises can't grow it without limit.
+    #[tokio::test]
+    async fn retained_text_stops_at_the_limit() {
+        let line = "x".repeat(4096);
+        let body = format!("{line}\n").repeat(32);
+        let chunks: Vec<Result<bytes::Bytes, Error>> = vec![Ok(bytes::Bytes::from(body))];
+        let sse_stream = stream::iter(chunks).sse_events("Google");
+        let unframed = sse_stream.unframed();
+
+        let _ = sse_stream.collect::<Vec<_>>().await;
+
+        assert!(unframed.take().len() <= UNFRAMED_LIMIT);
+    }
 
     #[tokio::test]
     async fn test_sse_stream_complete_events() {
