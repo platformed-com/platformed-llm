@@ -1180,7 +1180,17 @@ impl OpenAIStreamState {
                 {
                     Some("max_output_tokens") => crate::types::FinishReason::Length,
                     Some("content_filter") => crate::types::FinishReason::ContentFilter,
-                    _ => crate::types::FinishReason::Stop,
+                    Some(other) => {
+                        tracing::warn!(
+                            incomplete_reason = other,
+                            "unrecognised OpenAI incomplete_details.reason; treating as Incomplete",
+                        );
+                        crate::types::FinishReason::Incomplete
+                    }
+                    None => {
+                        tracing::warn!("OpenAI response.incomplete carried no incomplete_details");
+                        crate::types::FinishReason::Incomplete
+                    }
                 };
                 out.push(StreamEvent::Done {
                     finish_reason,
@@ -1584,7 +1594,36 @@ impl Provider for OpenAIProvider {
 mod tests {
     use super::super::types::ResponseItem;
     use super::*;
-    use crate::types::{Config, Prompt};
+    use crate::types::{Config, FinishReason, Prompt};
+
+    /// A `response.incomplete` is by definition not a clean stop, so
+    /// neither an unrecognised reason nor a missing one may report as
+    /// `Stop` — that hands back a turn the model abandoned as its
+    /// answer, and the caller has no way to tell.
+    #[test]
+    fn an_incomplete_response_never_reports_stop() {
+        fn finish_reason_for(incomplete_details: &str) -> FinishReason {
+            let event: OpenAIStreamEvent = serde_json::from_str(&format!(
+                r#"{{"type":"response.incomplete","response":{{"id":"resp_1","output":[]{incomplete_details}}}}}"#
+            ))
+            .unwrap();
+            let events = OpenAIStreamState::new().process(event).unwrap();
+            let Some(StreamEvent::Done { finish_reason, .. }) = events.last() else {
+                panic!("response.incomplete must terminate the stream");
+            };
+            finish_reason.clone()
+        }
+
+        assert_eq!(
+            finish_reason_for(r#","incomplete_details":{"reason":"max_output_tokens"}"#),
+            FinishReason::Length
+        );
+        assert_eq!(
+            finish_reason_for(r#","incomplete_details":{"reason":"some_new_reason"}"#),
+            FinishReason::Incomplete
+        );
+        assert_eq!(finish_reason_for(""), FinishReason::Incomplete);
+    }
 
     #[test]
     fn test_provider_creation() {

@@ -308,8 +308,9 @@ pub struct ErrorDetails {
 
 /// `response.incomplete_details` payload — the model didn't run to
 /// completion. `reason` is `"max_output_tokens"`, `"content_filter"`, or
-/// (rarely) something else; treat unknown values as `Stop` so the
-/// terminal event still fires.
+/// (rarely) something else, which reaches the caller as
+/// [`FinishReason::Incomplete`](crate::FinishReason::Incomplete) with the
+/// reason logged.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IncompleteDetails {
     pub reason: String,
