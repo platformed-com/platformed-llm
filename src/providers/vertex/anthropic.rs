@@ -781,6 +781,10 @@ fn is_anthropic_context_exceeded(body: &str) -> bool {
 ///
 /// Until [`FinishReason`] is extended (Phase 5), `stop_sequence` and
 /// `pause_turn` collapse to `Stop` — the closest existing variant.
+///
+/// Anthropic sends the final `stop_reason` on the `message_delta`
+/// preceding `message_stop`, so `None` is a message that ended saying
+/// nothing.
 pub(crate) fn map_anthropic_stop_reason(reason: Option<&str>) -> FinishReason {
     match reason {
         Some("end_turn") => FinishReason::Stop,
@@ -790,10 +794,16 @@ pub(crate) fn map_anthropic_stop_reason(reason: Option<&str>) -> FinishReason {
         Some("pause_turn") => FinishReason::Stop,
         Some("refusal") => FinishReason::ContentFilter,
         Some(other) => {
-            tracing::warn!(stop_reason = other, "unknown Anthropic stop_reason");
-            FinishReason::Stop
+            tracing::warn!(
+                stop_reason = other,
+                "unrecognised Anthropic stop_reason; treating as Incomplete",
+            );
+            FinishReason::Incomplete
         }
-        None => FinishReason::Stop,
+        None => {
+            tracing::warn!("Anthropic message ended without a stop_reason");
+            FinishReason::Incomplete
+        }
     }
 }
 
@@ -1247,7 +1257,15 @@ mod tests {
             map_anthropic_stop_reason(Some("refusal")),
             FinishReason::ContentFilter
         );
-        assert_eq!(map_anthropic_stop_reason(None), FinishReason::Stop);
+    }
+
+    #[test]
+    fn map_anthropic_stop_reason_does_not_claim_stop_when_it_does_not_know() {
+        assert_eq!(
+            map_anthropic_stop_reason(Some("some_new_reason")),
+            FinishReason::Incomplete
+        );
+        assert_eq!(map_anthropic_stop_reason(None), FinishReason::Incomplete);
     }
 
     #[test]
