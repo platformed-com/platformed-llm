@@ -1480,6 +1480,10 @@ fn error_from_unframed_body(text: &str) -> Option<Error> {
     Some(error_from_google_envelope(&envelope))
 }
 
+/// A `MALFORMED_FUNCTION_CALL` finish message echoes the whole call,
+/// which can run to megabytes; Sentry drops events past its size limit.
+const MAX_LOGGED_FINISH_MESSAGE_BYTES: usize = 4096;
+
 /// Stateful per-chunk conversion. `pub(crate)` so unit tests can drive
 /// synthetic `GoogleResponse` values directly.
 pub(crate) fn convert_response_stateful(
@@ -1496,7 +1500,7 @@ pub(crate) fn convert_response_stateful(
     let mut events = Vec::new();
 
     if let Some(candidate) = response.candidates.first() {
-        for part in &candidate.content.parts {
+        for part in candidate.content.iter().flat_map(|c| &c.parts) {
             match part {
                 GooglePart::Text { text } => {
                     if text.is_empty() {
@@ -1600,6 +1604,10 @@ pub(crate) fn convert_response_stateful(
             state.close_text(&mut events);
             state.close_code_execution(&mut events);
 
+            let finish_message = candidate
+                .finish_message
+                .as_deref()
+                .map(|m| &m[..m.floor_char_boundary(MAX_LOGGED_FINISH_MESSAGE_BYTES)]);
             let finish_reason = match finish_reason_str.as_str() {
                 "STOP" => FinishReason::Stop,
                 "MAX_TOKENS" => FinishReason::Length,
@@ -1608,10 +1616,18 @@ pub(crate) fn convert_response_stateful(
                 // Stop would let callers treat a censored or truncated
                 // answer as complete.
                 "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII"
-                | "IMAGE_SAFETY" => FinishReason::ContentFilter,
+                | "IMAGE_SAFETY" => {
+                    tracing::warn!(
+                        finish_reason = finish_reason_str.as_str(),
+                        finish_message,
+                        "Gemini: candidate suppressed by content filter",
+                    );
+                    FinishReason::ContentFilter
+                }
                 other => {
                     tracing::warn!(
                         finish_reason = other,
+                        finish_message,
                         "Gemini: unknown candidate finishReason; treating as Incomplete",
                     );
                     FinishReason::Incomplete
@@ -1963,6 +1979,21 @@ mod tests {
             acc.process_event(event).unwrap();
         }
         assert!(!acc.saw_terminator());
+    }
+
+    #[test]
+    fn candidate_without_content_finishes_incomplete() {
+        let chunk = r#"{"candidates":[{"finishReason":"MALFORMED_FUNCTION_CALL","finishMessage":"Malformed function call: print(default_api.search(query=))"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}}"#;
+        let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let events =
+            convert_response_stateful(response, &mut GoogleStreamState::default()).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Done {
+                finish_reason: FinishReason::Incomplete,
+                ..
+            }]
+        ));
     }
 
     /// Vertex reports a mid-generation failure as a chunk on a stream
