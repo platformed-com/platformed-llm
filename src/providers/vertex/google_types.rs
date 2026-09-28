@@ -263,10 +263,13 @@ pub struct GooglePromptFeedback {
 /// Google response candidate.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GoogleCandidate {
-    pub content: GoogleContent,
+    #[serde(default)]
+    pub content: Option<GoogleContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "finishReason")]
     pub finish_reason: Option<String>,
+    #[serde(default, rename = "finishMessage")]
+    pub finish_message: Option<String>,
     /// Grounding metadata attached when `googleSearch` (or other
     /// retrieval) builtin tools fire. Maps to per-span URL citations
     /// on the unified surface.
