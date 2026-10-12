@@ -228,14 +228,10 @@ impl AnthropicViaVertexProvider {
         // Map our unified ReasoningConfig onto Anthropic's `thinking` field.
         // We derive budget_tokens from `effort` with sensible defaults;
         // callers needing precise control can construct providers directly.
-        let thinking = config.reasoning.as_ref().map(|cfg| {
-            let budget_tokens = match cfg.effort.unwrap_or(ReasoningEffort::Medium) {
-                ReasoningEffort::Low => 2048,
-                ReasoningEffort::Medium => 8192,
-                ReasoningEffort::High => 16384,
-            };
-            AnthropicThinking::Enabled { budget_tokens }
-        });
+        let thinking = match config.reasoning.as_ref() {
+            Some(cfg) => convert_thinking(cfg)?,
+            None => None,
+        };
 
         // Anthropic requires temperature == 1 when thinking is enabled.
         // Override with a warning rather than erroring; better DX.
@@ -1014,6 +1010,28 @@ pub(crate) fn convert_stream_event_stateful(
     }
 
     Ok(events)
+}
+
+fn convert_thinking(
+    cfg: &crate::types::ReasoningConfig,
+) -> Result<Option<AnthropicThinking>, Error> {
+    let budget_tokens = match (
+        cfg.budget_tokens,
+        cfg.effort.unwrap_or(ReasoningEffort::Medium),
+    ) {
+        (Some(budget), _) => budget,
+        (None, ReasoningEffort::None) => return Ok(None),
+        (None, ReasoningEffort::Minimal) => 1024,
+        (None, ReasoningEffort::Low) => 2048,
+        (None, ReasoningEffort::Medium) => 8192,
+        (None, ReasoningEffort::High) => 16384,
+        (None, effort @ (ReasoningEffort::XHigh | ReasoningEffort::Max)) => {
+            return Err(Error::Config(format!(
+                "Anthropic has no thinking budget mapped for {effort:?}"
+            )));
+        }
+    };
+    Ok(Some(AnthropicThinking::Enabled { budget_tokens }))
 }
 
 #[cfg(test)]

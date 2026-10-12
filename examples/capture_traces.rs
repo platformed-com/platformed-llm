@@ -673,7 +673,11 @@ fn parse_reasoning(v: &Value) -> Result<ReasoningConfig, String> {
         Some(other) => return Err(format!("unknown reasoning.summary: {other}")),
         None => None,
     };
-    Ok(ReasoningConfig { effort, summary })
+    Ok(ReasoningConfig {
+        effort,
+        budget_tokens: None,
+        summary,
+    })
 }
 
 // ---------------------------------------------------------------------------

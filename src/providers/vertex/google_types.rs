@@ -157,8 +157,6 @@ pub struct GoogleGenerationConfig {
     pub presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f32>,
-    /// Gemini 2.5 thinking budget. Mirrors `ReasoningConfig.effort` via
-    /// rough mapping (Low → 2048, Medium → 8192, High → 16384).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<GoogleThinkingConfig>,
     /// MIME type the model should constrain its response to. The
@@ -171,11 +169,15 @@ pub struct GoogleGenerationConfig {
     pub response_schema: Option<Cow<'static, RawValue>>,
 }
 
-/// Gemini thinking config.
+/// Gemini 2.5 takes `thinking_budget`, Gemini 3 and later `thinking_level`;
+/// sending both is rejected.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoogleThinkingConfig {
-    pub thinking_budget: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<&'static str>,
 }
 
 /// Google tool entry in the `tools` array.

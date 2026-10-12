@@ -60,25 +60,36 @@ impl Usage {
 /// each provider's `convert_request` translates it.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReasoningConfig {
-    /// How much effort to spend reasoning. Maps to OpenAI's `effort` and
-    /// to Anthropic / Gemini's `budget_tokens` (rough mapping).
+    /// OpenAI's `reasoning.effort` and Gemini 3's `thinkingLevel`; mapped
+    /// roughly onto Anthropic's `budget_tokens`.
     pub effort: Option<ReasoningEffort>,
+    /// Gemini 2.5's `thinkingBudget` and Anthropic's `budget_tokens`. Wins
+    /// over `effort` where both apply; OpenAI rejects it.
+    pub budget_tokens: Option<u32>,
     /// Whether (and how) to surface reasoning summaries (OpenAI). Anthropic
     /// returns thinking content unconditionally when enabled; Gemini's
     /// thinking is not exposed to clients.
     pub summary: Option<ReasoningSummary>,
 }
 
-/// Coarse "how hard to think" knob. Each provider maps it onto its own
-/// budget / effort parameter.
+/// Each model accepts a subset; a provider rejects a value it has no
+/// wire form for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
-    /// Minimal reasoning, optimized for latency.
+    /// OpenAI; disables thinking on Anthropic.
+    None,
+    /// OpenAI and Gemini; the smallest budget Anthropic accepts.
+    Minimal,
+    /// All providers.
     Low,
-    /// Balanced reasoning budget — the typical default.
+    /// All providers.
     Medium,
-    /// Maximum reasoning budget; useful for hard problems.
+    /// All providers.
     High,
+    /// OpenAI only.
+    XHigh,
+    /// OpenAI only.
+    Max,
 }
 
 /// Verbosity level for reasoning summaries that are surfaced to the
