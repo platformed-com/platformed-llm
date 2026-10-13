@@ -644,7 +644,7 @@ impl Provider for AnthropicViaVertexProvider {
                     Err(e) => vec![Err(e)],
                 }
             })
-            .map(|events| futures_util::stream::iter(events.into_iter()))
+            .map(futures_util::stream::iter)
             .flatten();
 
         let observed = crate::rate_limit::observe_response_stream(

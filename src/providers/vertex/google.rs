@@ -1008,7 +1008,7 @@ impl Provider for GoogleProvider {
                     Err(e) => vec![Err(e)],
                 }
             })
-            .map(|events| futures_util::stream::iter(events.into_iter()))
+            .map(futures_util::stream::iter)
             .flatten()
             // Google can report a mid-generation failure by writing its
             // error envelope into the body with no SSE framing, which
