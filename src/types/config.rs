@@ -92,6 +92,7 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
+    #[cfg(any(feature = "openai", feature = "google"))]
     pub(crate) fn from_budget(budget: u32) -> Self {
         match budget {
             0 => Self::None,
@@ -104,6 +105,7 @@ impl ReasoningEffort {
         }
     }
 
+    #[cfg(any(feature = "google", feature = "anthropic-vertex"))]
     pub(crate) fn budget(self) -> u32 {
         match self {
             Self::None => 0,
@@ -118,12 +120,14 @@ impl ReasoningEffort {
 }
 
 impl ReasoningConfig {
+    #[cfg(any(feature = "openai", feature = "google"))]
     pub(crate) fn resolved_effort(&self) -> Option<ReasoningEffort> {
         self.budget_tokens
             .map(ReasoningEffort::from_budget)
             .or(self.effort)
     }
 
+    #[cfg(any(feature = "google", feature = "anthropic-vertex"))]
     pub(crate) fn resolved_budget(&self) -> Option<u32> {
         self.budget_tokens
             .or(self.effort.map(ReasoningEffort::budget))
