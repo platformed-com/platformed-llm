@@ -306,6 +306,10 @@ impl std::fmt::Debug for RatePermit {
 ///
 /// Implementations should be cheap to clone via `Arc` and
 /// thread-safe.
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait already marks the futures it generates #[must_use]"
+)]
 #[async_trait::async_trait]
 pub trait RateLimiter: Send + Sync + 'static {
     /// Block until the limiter believes the request can proceed.

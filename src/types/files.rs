@@ -353,6 +353,10 @@ impl From<FileResolverError> for Error {
 /// [`FileResolverError::terminal`] to opt out of the retryable default) rather
 /// than reaching for a [`crate::Error`] variant, which is the library's own
 /// taxonomy.
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait already marks the futures it generates #[must_use]"
+)]
 #[async_trait]
 pub trait FileResolver: Send + Sync {
     /// Return a cached provider handle for `(id, scope)` if the caller has

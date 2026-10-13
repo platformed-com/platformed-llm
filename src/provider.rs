@@ -16,6 +16,10 @@ use crate::{Capabilities, Error, Prompt, RawConfig, Response};
 ///
 /// All responses are internally streamed — use `response.stream()` for
 /// streaming or `response.text().await` for buffered text.
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait already marks the futures it generates #[must_use]"
+)]
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync + 'static {
     /// Generate a chat completion from `prompt` and `config`.
