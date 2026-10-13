@@ -60,11 +60,10 @@ impl Usage {
 /// each provider's `convert_request` translates it.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReasoningConfig {
-    /// OpenAI's `reasoning.effort` and Gemini 3's `thinkingLevel`; mapped
-    /// roughly onto Anthropic's `budget_tokens`.
+    /// How hard to think. Ignored when `budget_tokens` is set.
     pub effort: Option<ReasoningEffort>,
-    /// Gemini 2.5's `thinkingBudget` and Anthropic's `budget_tokens`. Wins
-    /// over `effort` where both apply; OpenAI rejects it.
+    /// Thinking budget in tokens. Providers that take an effort use the
+    /// nearest one.
     pub budget_tokens: Option<u32>,
     /// Whether (and how) to surface reasoning summaries (OpenAI). Anthropic
     /// returns thinking content unconditionally when enabled; Gemini's
@@ -72,24 +71,63 @@ pub struct ReasoningConfig {
     pub summary: Option<ReasoningSummary>,
 }
 
-/// Each model accepts a subset; a provider rejects a value it has no
-/// wire form for.
+/// How hard to think. Each provider uses the nearest setting it supports,
+/// or a token budget for providers that take one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
-    /// OpenAI; disables thinking on Anthropic.
+    /// No reasoning, or the least a provider allows.
     None,
-    /// OpenAI and Gemini; the smallest budget Anthropic accepts.
+    /// Less than `Low`.
     Minimal,
-    /// All providers.
+    /// Brief reasoning.
     Low,
-    /// All providers.
+    /// Balanced reasoning.
     Medium,
-    /// All providers.
+    /// Extended reasoning.
     High,
-    /// OpenAI only.
+    /// More than `High`.
     XHigh,
-    /// OpenAI only.
+    /// The most a provider offers.
     Max,
+}
+
+impl ReasoningEffort {
+    pub(crate) fn from_budget(budget: u32) -> Self {
+        match budget {
+            0 => Self::None,
+            1..=1024 => Self::Minimal,
+            1025..=4096 => Self::Low,
+            4097..=12288 => Self::Medium,
+            12289..=20480 => Self::High,
+            20481..=32768 => Self::XHigh,
+            _ => Self::Max,
+        }
+    }
+
+    pub(crate) fn budget(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Minimal => 1024,
+            Self::Low => 2048,
+            Self::Medium => 8192,
+            Self::High => 16384,
+            Self::XHigh => 24576,
+            Self::Max => 32768,
+        }
+    }
+}
+
+impl ReasoningConfig {
+    pub(crate) fn resolved_effort(&self) -> Option<ReasoningEffort> {
+        self.budget_tokens
+            .map(ReasoningEffort::from_budget)
+            .or(self.effort)
+    }
+
+    pub(crate) fn resolved_budget(&self) -> Option<u32> {
+        self.budget_tokens
+            .or(self.effort.map(ReasoningEffort::budget))
+    }
 }
 
 /// Verbosity level for reasoning summaries that are surfaced to the

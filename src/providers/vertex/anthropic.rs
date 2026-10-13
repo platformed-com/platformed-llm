@@ -225,13 +225,7 @@ impl AnthropicViaVertexProvider {
             }
         });
 
-        // Map our unified ReasoningConfig onto Anthropic's `thinking` field.
-        // We derive budget_tokens from `effort` with sensible defaults;
-        // callers needing precise control can construct providers directly.
-        let thinking = match config.reasoning.as_ref() {
-            Some(cfg) => convert_thinking(cfg)?,
-            None => None,
-        };
+        let thinking = config.reasoning.as_ref().and_then(convert_thinking);
 
         // Anthropic requires temperature == 1 when thinking is enabled.
         // Override with a warning rather than erroring; better DX.
@@ -1012,26 +1006,13 @@ pub(crate) fn convert_stream_event_stateful(
     Ok(events)
 }
 
-fn convert_thinking(
-    cfg: &crate::types::ReasoningConfig,
-) -> Result<Option<AnthropicThinking>, Error> {
-    let budget_tokens = match (
-        cfg.budget_tokens,
-        cfg.effort.unwrap_or(ReasoningEffort::Medium),
-    ) {
-        (Some(budget), _) => budget,
-        (None, ReasoningEffort::None) => return Ok(None),
-        (None, ReasoningEffort::Minimal) => 1024,
-        (None, ReasoningEffort::Low) => 2048,
-        (None, ReasoningEffort::Medium) => 8192,
-        (None, ReasoningEffort::High) => 16384,
-        (None, effort @ (ReasoningEffort::XHigh | ReasoningEffort::Max)) => {
-            return Err(Error::Config(format!(
-                "Anthropic has no thinking budget mapped for {effort:?}"
-            )));
-        }
-    };
-    Ok(Some(AnthropicThinking::Enabled { budget_tokens }))
+fn convert_thinking(cfg: &crate::types::ReasoningConfig) -> Option<AnthropicThinking> {
+    let budget_tokens = cfg
+        .resolved_budget()
+        .unwrap_or(ReasoningEffort::Medium.budget());
+    (budget_tokens > 0).then(|| AnthropicThinking::Enabled {
+        budget_tokens: budget_tokens.max(1024),
+    })
 }
 
 #[cfg(test)]

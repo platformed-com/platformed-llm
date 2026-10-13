@@ -149,7 +149,7 @@ impl OpenAIProvider {
         prompt: &crate::Prompt,
         config: &RawConfig,
         resolved: &HashMap<String, ResolvedRef>,
-    ) -> Result<ResponsesRequest, Error> {
+    ) -> ResponsesRequest {
         let messages = prompt.items();
 
         // Scan history for the latest InputItem::Continuation carrying an
@@ -168,7 +168,7 @@ impl OpenAIProvider {
             Self::flatten_input_item(item, &mut input, resolved);
         }
 
-        Ok(ResponsesRequest {
+        ResponsesRequest {
             model: config.model.clone(),
             input,
             instructions: None,
@@ -184,11 +184,7 @@ impl OpenAIProvider {
             previous_response_id,
             stream: None,
             store: Some(config.store.unwrap_or(false)),
-            reasoning: config
-                .reasoning
-                .as_ref()
-                .map(convert_reasoning)
-                .transpose()?,
+            reasoning: config.reasoning.as_ref().map(convert_reasoning),
             stop: config.stop.clone(),
             presence_penalty: config.presence_penalty,
             frequency_penalty: config.frequency_penalty,
@@ -197,7 +193,7 @@ impl OpenAIProvider {
                 .response_format
                 .as_ref()
                 .and_then(convert_response_format),
-        })
+        }
     }
 
     /// Flatten one canonical `InputItem` into one or more OpenAI input
@@ -761,14 +757,9 @@ fn convert_response_format(
     Some(OpenAITextConfig { format })
 }
 
-fn convert_reasoning(cfg: &ReasoningConfig) -> Result<OpenAIReasoning, Error> {
-    if cfg.budget_tokens.is_some() {
-        return Err(Error::Config(
-            "OpenAI takes a reasoning effort, not a token budget".into(),
-        ));
-    }
-    Ok(OpenAIReasoning {
-        effort: cfg.effort.map(|e| match e {
+fn convert_reasoning(cfg: &ReasoningConfig) -> OpenAIReasoning {
+    OpenAIReasoning {
+        effort: cfg.resolved_effort().map(|e| match e {
             ReasoningEffort::None => "none",
             ReasoningEffort::Minimal => "minimal",
             ReasoningEffort::Low => "low",
@@ -782,7 +773,7 @@ fn convert_reasoning(cfg: &ReasoningConfig) -> Result<OpenAIReasoning, Error> {
             ReasoningSummary::Concise => "concise",
             ReasoningSummary::Detailed => "detailed",
         }),
-    })
+    }
 }
 
 /// Walk the history right-to-left for the most recent
@@ -1460,7 +1451,7 @@ impl Provider for OpenAIProvider {
             self,
         )
         .await?;
-        let mut openai_request = self.convert_request(prompt, config, &resolved)?;
+        let mut openai_request = self.convert_request(prompt, config, &resolved);
         openai_request.stream = Some(true);
 
         debug!(
@@ -2161,9 +2152,8 @@ mod tests {
             (ToolChoice::Required, serde_json::json!("required")),
         ] {
             let cfg = Config::builder("gpt-4").tool_choice(choice.clone()).build();
-            let req = provider()
-                .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-                .unwrap();
+            let req =
+                provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
             let json = serde_json::to_value(&req).unwrap();
             assert_eq!(
                 json["tool_choice"], expected,
@@ -2180,9 +2170,7 @@ mod tests {
                 name: "get_weather".to_string(),
             })
             .build();
-        let req = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let req = provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
             json["tool_choice"],
@@ -2203,9 +2191,7 @@ mod tests {
                 summary: Some(ReasoningSummary::Auto),
             })
             .build();
-        let req = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let req = provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
             json["reasoning"],
@@ -2214,50 +2200,22 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_values_reach_the_wire() {
-        use crate::types::{ReasoningConfig, ReasoningEffort};
-        for (effort, wire) in [
-            (ReasoningEffort::None, "none"),
-            (ReasoningEffort::XHigh, "xhigh"),
-            (ReasoningEffort::Max, "max"),
-        ] {
-            let cfg = Config::builder("gpt-5.6-terra")
-                .reasoning(ReasoningConfig {
-                    effort: Some(effort),
-                    budget_tokens: None,
-                    summary: None,
-                })
-                .build();
-            let req = provider()
-                .convert_request(
-                    &Prompt::user("hi"),
-                    cfg.raw(),
-                    &std::collections::HashMap::new(),
-                )
-                .unwrap();
-            assert_eq!(
-                serde_json::to_value(&req).unwrap()["reasoning"]["effort"],
-                wire
-            );
-        }
-    }
-
-    #[test]
-    fn reasoning_budget_is_rejected() {
+    fn reasoning_budget_becomes_the_nearest_effort() {
         use crate::types::ReasoningConfig;
         let cfg = Config::builder("gpt-5.6-terra")
             .reasoning(ReasoningConfig {
                 effort: None,
-                budget_tokens: Some(1024),
+                budget_tokens: Some(16384),
                 summary: None,
             })
             .build();
-        let result = provider().convert_request(
+        let req = provider().convert_request(
             &Prompt::user("hi"),
             cfg.raw(),
             &std::collections::HashMap::new(),
         );
-        assert!(matches!(result, Err(Error::Config(_))));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["reasoning"]["effort"], "high");
     }
 
     /// OpenAI's reasoning streaming should open one Reasoning part per
@@ -2315,9 +2273,7 @@ mod tests {
             .parallel_tool_calls(false)
             .store(true)
             .build();
-        let req = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let req = provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["parallel_tool_calls"], false);
         assert_eq!(json["store"], true);
@@ -2396,9 +2352,8 @@ mod tests {
         // (see `continuation_events`), so its presence in history means the id
         // is chainable regardless of this request's own `store`.
         let cfg = Config::builder("gpt-5").build();
-        let body = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_1"));
         // Only the items after the assistant turn carrying the
         // continuation reach the wire.
@@ -2456,9 +2411,8 @@ mod tests {
             .with_response(&prior)
             .with_user("follow-up");
         let cfg = Config::builder("gpt-5").build();
-        let body = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_prior"));
         // Only the follow-up reaches the wire — everything else is
         // covered by the server-side response state.
@@ -2484,9 +2438,8 @@ mod tests {
             ))
             .with_user("c");
         let cfg = Config::builder("gpt-5").build();
-        let body = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert_eq!(body.previous_response_id.as_deref(), Some("resp_new"));
         // Only items strictly after the latest matching assistant turn.
         assert_eq!(body.input.len(), 1);
@@ -2506,9 +2459,8 @@ mod tests {
             ))
             .with_user("b");
         let cfg = Config::builder("gpt-5").build();
-        let body = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert!(body.previous_response_id.is_none());
         // Both user items still on the wire (continuation part drops out).
         assert_eq!(body.input.len(), 2);
@@ -2527,9 +2479,8 @@ mod tests {
                 },
             ))])
             .build();
-        let body = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["tools"][0]["type"], "computer_use_preview");
         assert_eq!(json["tools"][0]["display_width"], 1280);
@@ -2544,9 +2495,8 @@ mod tests {
         let cfg = Config::builder("gpt-5")
             .response_format(ResponseFormat::JsonObject)
             .build();
-        let body = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["text"]["format"]["type"], "json_object");
     }
@@ -2565,9 +2515,8 @@ mod tests {
                 strict: true,
             })
             .build();
-        let body = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let body =
+            provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["text"]["format"]["type"], "json_schema");
         assert_eq!(json["text"]["format"]["name"], "Point");
@@ -2594,12 +2543,10 @@ mod tests {
         let prompt1 = make_prompt();
         let prompt2 = make_prompt();
         let cfg = Config::builder("gpt-5").build();
-        let req1 = provider()
-            .convert_request(&prompt1, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
-        let req2 = provider()
-            .convert_request(&prompt2, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let req1 =
+            provider().convert_request(&prompt1, cfg.raw(), &std::collections::HashMap::new());
+        let req2 =
+            provider().convert_request(&prompt2, cfg.raw(), &std::collections::HashMap::new());
         assert!(req1.prompt_cache_key.is_some());
         assert_eq!(req1.prompt_cache_key, req2.prompt_cache_key);
     }
@@ -2608,9 +2555,7 @@ mod tests {
     fn no_cache_breakpoint_means_no_prompt_cache_key() {
         let prompt = Prompt::user("hi");
         let cfg = Config::builder("gpt-5").build();
-        let req = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let req = provider().convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert!(req.prompt_cache_key.is_none());
     }
 
@@ -2629,11 +2574,9 @@ mod tests {
         let p2 = make_prompt("system two");
         let k1 = provider()
             .convert_request(&p1, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap()
             .prompt_cache_key;
         let k2 = provider()
             .convert_request(&p2, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap()
             .prompt_cache_key;
         assert!(k1.is_some());
         assert_ne!(k1, k2);
@@ -2647,9 +2590,8 @@ mod tests {
             .temperature(0.7)
             .max_tokens(100)
             .build();
-        let openai_request = provider
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap();
+        let openai_request =
+            provider.convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new());
         assert_eq!(openai_request.model, "gpt-4");
         assert_eq!(openai_request.temperature, Some(0.7));
         assert_eq!(openai_request.max_output_tokens, Some(100));
@@ -2662,7 +2604,6 @@ mod tests {
         let cfg = Config::builder("gpt-5").build();
         let k = provider()
             .convert_request(&p, cfg.raw(), &std::collections::HashMap::new())
-            .unwrap()
             .prompt_cache_key;
         assert_eq!(k, None);
     }
@@ -2696,9 +2637,7 @@ mod tests {
             },
         );
         let cfg = Config::builder("gpt-5").build();
-        let req = provider()
-            .convert_request(&prompt, cfg.raw(), &resolved)
-            .unwrap();
+        let req = provider().convert_request(&prompt, cfg.raw(), &resolved);
         let json = serde_json::to_value(&req).unwrap();
         let parts = &json["input"][0]["content"];
         assert_eq!(parts[0]["type"], "input_file");
@@ -2726,9 +2665,7 @@ mod tests {
             },
         );
         let cfg = Config::builder("gpt-5").build();
-        let req = provider()
-            .convert_request(&prompt, cfg.raw(), &resolved)
-            .unwrap();
+        let req = provider().convert_request(&prompt, cfg.raw(), &resolved);
         let json = serde_json::to_value(&req).unwrap();
         let part = &json["input"][0]["content"][0];
         assert_eq!(part["type"], "input_file");

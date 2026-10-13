@@ -424,10 +424,10 @@ impl GoogleProvider {
             }
         }
 
-        let thinking_config = match config.reasoning.as_ref() {
-            Some(cfg) => convert_thinking(cfg)?,
-            None => None,
-        };
+        let thinking_config = config
+            .reasoning
+            .as_ref()
+            .and_then(|cfg| convert_thinking(cfg, &config.model));
 
         let (response_mime_type, response_schema) = match &config.response_format {
             Some(crate::types::ResponseFormat::JsonObject) => {
@@ -1675,33 +1675,41 @@ pub(crate) fn convert_response_stateful(
 
 fn convert_thinking(
     cfg: &crate::types::ReasoningConfig,
-) -> Result<Option<GoogleThinkingConfig>, Error> {
+    model: &str,
+) -> Option<GoogleThinkingConfig> {
     use crate::types::ReasoningEffort;
 
-    if let Some(budget) = cfg.budget_tokens {
-        return Ok(Some(GoogleThinkingConfig {
-            thinking_budget: Some(budget),
+    if let Some((min, max)) = thinking_budget_range(model) {
+        let budget = cfg.resolved_budget()?;
+        return Some(GoogleThinkingConfig {
+            thinking_budget: Some(budget.clamp(min, max)),
             thinking_level: None,
-        }));
+        });
     }
-    let Some(effort) = cfg.effort else {
-        return Ok(None);
-    };
-    let level = match effort {
-        ReasoningEffort::Minimal => "MINIMAL",
+    let level = match cfg.resolved_effort()? {
+        ReasoningEffort::None | ReasoningEffort::Minimal => "MINIMAL",
         ReasoningEffort::Low => "LOW",
         ReasoningEffort::Medium => "MEDIUM",
-        ReasoningEffort::High => "HIGH",
-        ReasoningEffort::None | ReasoningEffort::XHigh | ReasoningEffort::Max => {
-            return Err(Error::Config(format!(
-                "Gemini has no thinking level for {effort:?}"
-            )));
-        }
+        ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => "HIGH",
     };
-    Ok(Some(GoogleThinkingConfig {
+    Some(GoogleThinkingConfig {
         thinking_budget: None,
         thinking_level: Some(level),
-    }))
+    })
+}
+
+/// Gemini 2.5 and earlier take a token budget; Pro cannot turn thinking off.
+fn thinking_budget_range(model: &str) -> Option<(u32, u32)> {
+    ["gemini-1", "gemini-2"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+        .then(|| {
+            if model.contains("-pro") {
+                (128, 32768)
+            } else {
+                (0, 24576)
+            }
+        })
 }
 
 #[cfg(test)]
@@ -2307,52 +2315,55 @@ mod tests {
     }
 
     fn thinking_config_for(
-        reasoning: crate::types::ReasoningConfig,
-    ) -> Result<serde_json::Value, Error> {
-        let cfg = Config::builder("gemini-3.5-flash")
-            .reasoning(reasoning)
+        model: &str,
+        effort: Option<crate::types::ReasoningEffort>,
+        budget_tokens: Option<u32>,
+    ) -> serde_json::Value {
+        let cfg = Config::builder(model)
+            .reasoning(crate::types::ReasoningConfig {
+                effort,
+                budget_tokens,
+                summary: None,
+            })
             .build();
-        let body = provider().convert_request(
-            &crate::Prompt::user("hi"),
-            cfg.raw(),
-            &std::collections::HashMap::new(),
-        )?;
-        Ok(serde_json::to_value(&body).unwrap()["generationConfig"]["thinkingConfig"].clone())
+        let body = provider()
+            .convert_request(
+                &crate::Prompt::user("hi"),
+                cfg.raw(),
+                &std::collections::HashMap::new(),
+            )
+            .unwrap();
+        serde_json::to_value(&body).unwrap()["generationConfig"]["thinkingConfig"].clone()
     }
 
     #[test]
-    fn budget_emits_thinking_budget_only() {
-        use crate::types::{ReasoningConfig, ReasoningEffort};
-        let thinking = thinking_config_for(ReasoningConfig {
-            effort: Some(ReasoningEffort::High),
-            budget_tokens: Some(4096),
-            summary: None,
-        })
-        .unwrap();
-        assert_eq!(thinking, serde_json::json!({"thinkingBudget": 4096}));
+    fn gemini_3_takes_the_nearest_level() {
+        use crate::types::ReasoningEffort;
+        assert_eq!(
+            thinking_config_for("gemini-3.5-flash", Some(ReasoningEffort::XHigh), None),
+            serde_json::json!({"thinkingLevel": "HIGH"})
+        );
+        assert_eq!(
+            thinking_config_for("gemini-3.5-flash", None, Some(4096)),
+            serde_json::json!({"thinkingLevel": "LOW"})
+        );
     }
 
     #[test]
-    fn effort_emits_thinking_level() {
-        use crate::types::{ReasoningConfig, ReasoningEffort};
-        let thinking = thinking_config_for(ReasoningConfig {
-            effort: Some(ReasoningEffort::Minimal),
-            budget_tokens: None,
-            summary: None,
-        })
-        .unwrap();
-        assert_eq!(thinking, serde_json::json!({"thinkingLevel": "MINIMAL"}));
-    }
-
-    #[test]
-    fn effort_without_gemini_level_is_rejected() {
-        use crate::types::{ReasoningConfig, ReasoningEffort};
-        let result = thinking_config_for(ReasoningConfig {
-            effort: Some(ReasoningEffort::XHigh),
-            budget_tokens: None,
-            summary: None,
-        });
-        assert!(matches!(result, Err(Error::Config(_))));
+    fn gemini_2_5_takes_a_budget_within_the_model_range() {
+        use crate::types::ReasoningEffort;
+        assert_eq!(
+            thinking_config_for("gemini-2.5-flash", Some(ReasoningEffort::High), None),
+            serde_json::json!({"thinkingBudget": 16384})
+        );
+        assert_eq!(
+            thinking_config_for("gemini-2.5-pro", Some(ReasoningEffort::None), None),
+            serde_json::json!({"thinkingBudget": 128})
+        );
+        assert_eq!(
+            thinking_config_for("gemini-2.5-flash", None, Some(100000)),
+            serde_json::json!({"thinkingBudget": 24576})
+        );
     }
 
     #[test]
