@@ -235,6 +235,10 @@ impl TransportResponse {
 /// `TransportResponse.body` must terminate any in-flight network read
 /// (the default `ReqwestTransport` does this because `reqwest`'s
 /// `bytes_stream` carries the underlying connection in its drop).
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait already marks the futures it generates #[must_use]"
+)]
 #[async_trait]
 pub trait TransportImpl: Send + Sync + 'static {
     /// Issue an HTTP request and return a streaming response. Implementations

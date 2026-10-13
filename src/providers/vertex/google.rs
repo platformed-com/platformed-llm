@@ -12,6 +12,7 @@ use bytes::Bytes;
 
 use super::endpoint::VertexEndpoint;
 use super::google_types::*;
+use crate::capabilities::{Capabilities, ResolvedThinking};
 use crate::factory::{ProviderType, VertexRequestType};
 use crate::provider::Provider;
 use crate::providers::file_resolve::{
@@ -424,15 +425,10 @@ impl GoogleProvider {
             }
         }
 
-        let thinking_config = config.reasoning.as_ref().map(|cfg| {
-            let thinking_budget = match cfg.effort.unwrap_or(crate::types::ReasoningEffort::Medium)
-            {
-                crate::types::ReasoningEffort::Low => 2048,
-                crate::types::ReasoningEffort::Medium => 8192,
-                crate::types::ReasoningEffort::High => 16384,
-            };
-            GoogleThinkingConfig { thinking_budget }
-        });
+        let thinking_config = config
+            .reasoning
+            .as_ref()
+            .and_then(|cfg| convert_thinking(cfg, &config.model));
 
         let (response_mime_type, response_schema) = match &config.response_format {
             Some(crate::types::ResponseFormat::JsonObject) => {
@@ -1013,7 +1009,7 @@ impl Provider for GoogleProvider {
                     Err(e) => vec![Err(e)],
                 }
             })
-            .map(|events| futures_util::stream::iter(events.into_iter()))
+            .map(futures_util::stream::iter)
             .flatten()
             // Google can report a mid-generation failure by writing its
             // error envelope into the body with no SSE framing, which
@@ -1678,6 +1674,29 @@ pub(crate) fn convert_response_stateful(
     Ok(events)
 }
 
+fn convert_thinking(
+    cfg: &crate::types::ReasoningConfig,
+    model: &str,
+) -> Option<GoogleThinkingConfig> {
+    use crate::types::ReasoningEffort;
+
+    Some(match Capabilities::google(model).thinking.resolve(cfg)? {
+        ResolvedThinking::Budget(budget) => GoogleThinkingConfig {
+            thinking_budget: Some(budget),
+            thinking_level: None,
+        },
+        ResolvedThinking::Effort(effort) => GoogleThinkingConfig {
+            thinking_budget: None,
+            thinking_level: Some(match effort {
+                ReasoningEffort::None | ReasoningEffort::Minimal => "MINIMAL",
+                ReasoningEffort::Low => "LOW",
+                ReasoningEffort::Medium => "MEDIUM",
+                ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => "HIGH",
+            }),
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2280,23 +2299,80 @@ mod tests {
         assert_eq!(json["generationConfig"]["frequencyPenalty"], 0.25);
     }
 
-    #[test]
-    fn reasoning_config_emits_thinking_budget() {
-        use crate::types::{ReasoningConfig, ReasoningEffort};
-        let prompt = crate::Prompt::user("hi");
-        let cfg = Config::builder("gemini-2.5-flash")
-            .reasoning(ReasoningConfig {
-                effort: Some(ReasoningEffort::High),
+    fn thinking_config_for(
+        model: &str,
+        effort: Option<crate::types::ReasoningEffort>,
+        budget_tokens: Option<u32>,
+    ) -> serde_json::Value {
+        let cfg = Config::builder(model)
+            .reasoning(crate::types::ReasoningConfig {
+                effort,
+                budget_tokens,
                 summary: None,
             })
             .build();
         let body = provider()
-            .convert_request(&prompt, cfg.raw(), &std::collections::HashMap::new())
+            .convert_request(
+                &crate::Prompt::user("hi"),
+                cfg.raw(),
+                &std::collections::HashMap::new(),
+            )
             .unwrap();
-        let json = serde_json::to_value(&body).unwrap();
+        serde_json::to_value(&body).unwrap()["generationConfig"]["thinkingConfig"].clone()
+    }
+
+    #[test]
+    fn gemini_3_takes_the_nearest_level() {
+        use crate::types::ReasoningEffort;
         assert_eq!(
-            json["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            16384,
+            thinking_config_for("gemini-3.5-flash", Some(ReasoningEffort::XHigh), None),
+            serde_json::json!({"thinkingLevel": "HIGH"})
+        );
+        assert_eq!(
+            thinking_config_for("gemini-3.5-flash", None, Some(4096)),
+            serde_json::json!({"thinkingLevel": "LOW"})
+        );
+    }
+
+    #[test]
+    fn gemini_3_takes_only_levels_the_model_accepts() {
+        use crate::types::ReasoningEffort;
+        assert_eq!(
+            thinking_config_for("gemini-3-pro-preview", Some(ReasoningEffort::Medium), None),
+            serde_json::json!({"thinkingLevel": "HIGH"})
+        );
+        assert_eq!(
+            thinking_config_for("gemini-3.8-flash", Some(ReasoningEffort::Minimal), None),
+            serde_json::json!({"thinkingLevel": "LOW"})
+        );
+    }
+
+    #[test]
+    fn unknown_gemini_models_get_no_thinking_config() {
+        use crate::types::ReasoningEffort;
+        assert!(
+            thinking_config_for("gemini-flash-latest", Some(ReasoningEffort::High), None).is_null()
+        );
+    }
+
+    #[test]
+    fn gemini_2_5_takes_a_budget_within_the_model_range() {
+        use crate::types::ReasoningEffort;
+        assert_eq!(
+            thinking_config_for("gemini-2.5-flash", Some(ReasoningEffort::High), None),
+            serde_json::json!({"thinkingBudget": 16384})
+        );
+        assert_eq!(
+            thinking_config_for("gemini-2.5-pro", Some(ReasoningEffort::None), None),
+            serde_json::json!({"thinkingBudget": 128})
+        );
+        assert_eq!(
+            thinking_config_for("gemini-2.5-flash", None, Some(100000)),
+            serde_json::json!({"thinkingBudget": 24576})
+        );
+        assert_eq!(
+            thinking_config_for("gemini-2.5-flash-lite", None, Some(100)),
+            serde_json::json!({"thinkingBudget": 512})
         );
     }
 
