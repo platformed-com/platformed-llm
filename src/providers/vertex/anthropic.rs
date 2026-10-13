@@ -5,6 +5,7 @@ use futures_util::StreamExt;
 
 use super::anthropic_types::*;
 use super::endpoint::VertexEndpoint;
+use crate::capabilities::{Capabilities, ResolvedThinking};
 use crate::factory::ProviderType;
 use crate::provider::Provider;
 use crate::providers::file_resolve::{resolve_refs, NoLibraryUpload, ResolvedRef};
@@ -225,7 +226,7 @@ impl AnthropicViaVertexProvider {
             }
         });
 
-        let thinking = config.reasoning.as_ref().and_then(convert_thinking);
+        let (thinking, output_config, max_tokens) = convert_thinking(config);
 
         // Anthropic requires temperature == 1 when thinking is enabled.
         // Override with a warning rather than erroring; better DX.
@@ -233,8 +234,7 @@ impl AnthropicViaVertexProvider {
             if matches!(config.temperature, Some(t) if (t - 1.0).abs() > f32::EPSILON) {
                 tracing::warn!(
                     requested = ?config.temperature,
-                    "Anthropic requires temperature=1 when extended thinking is enabled; \
-                     overriding"
+                    "Anthropic requires temperature=1 when thinking is enabled; overriding"
                 );
             }
             Some(1.0)
@@ -253,7 +253,7 @@ impl AnthropicViaVertexProvider {
 
         let anthropic_request = AnthropicRequest {
             messages,
-            max_tokens: config.max_tokens.unwrap_or(1024),
+            max_tokens,
             anthropic_version: "vertex-2023-10-16",
             system: system_message,
             temperature,
@@ -261,6 +261,7 @@ impl AnthropicViaVertexProvider {
             tools,
             stream: Some(true), // Enable streaming for SSE responses
             thinking,
+            output_config,
             stop_sequences: config.stop.clone(),
             tool_choice,
         };
@@ -1006,19 +1007,139 @@ pub(crate) fn convert_stream_event_stateful(
     Ok(events)
 }
 
-fn convert_thinking(cfg: &crate::types::ReasoningConfig) -> Option<AnthropicThinking> {
-    let budget_tokens = cfg
-        .resolved_budget()
-        .unwrap_or(ReasoningEffort::Medium.budget());
-    (budget_tokens > 0).then(|| AnthropicThinking::Enabled {
-        budget_tokens: budget_tokens.max(1024),
-    })
+/// Default room for the response itself when a thinking budget sets
+/// `max_tokens`.
+const RESPONSE_TOKENS: u32 = 1024;
+
+/// The thinking, effort and `max_tokens` for a request. Anthropic requires
+/// a thinking budget below `max_tokens`.
+fn convert_thinking(
+    config: &RawConfig,
+) -> (
+    Option<AnthropicThinking>,
+    Option<AnthropicOutputConfig>,
+    u32,
+) {
+    let caps = Capabilities::anthropic(&config.model);
+    let default_max_tokens = config.max_tokens.unwrap_or(1024);
+    let resolved = config
+        .reasoning
+        .as_ref()
+        .and_then(|cfg| caps.thinking.resolve(cfg));
+    match resolved {
+        None | Some(ResolvedThinking::Budget(0)) => (None, None, default_max_tokens),
+        Some(ResolvedThinking::Effort(effort)) => (
+            Some(AnthropicThinking::Adaptive),
+            Some(AnthropicOutputConfig {
+                effort: match effort {
+                    ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::Low => {
+                        "low"
+                    }
+                    ReasoningEffort::Medium => "medium",
+                    ReasoningEffort::High => "high",
+                    ReasoningEffort::XHigh => "xhigh",
+                    ReasoningEffort::Max => "max",
+                },
+            }),
+            default_max_tokens,
+        ),
+        Some(ResolvedThinking::Budget(budget)) => match config.max_tokens {
+            Some(max_tokens) if budget < max_tokens => (
+                Some(AnthropicThinking::Enabled {
+                    budget_tokens: budget,
+                }),
+                None,
+                max_tokens,
+            ),
+            Some(max_tokens) if max_tokens > 1024 => (
+                Some(AnthropicThinking::Enabled {
+                    budget_tokens: max_tokens - 1,
+                }),
+                None,
+                max_tokens,
+            ),
+            Some(max_tokens) => (None, None, max_tokens),
+            None => (
+                Some(AnthropicThinking::Enabled {
+                    budget_tokens: budget,
+                }),
+                None,
+                (budget + RESPONSE_TOKENS).min(caps.max_output_tokens),
+            ),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Config, Prompt};
+
+    fn thinking_request(
+        model: &str,
+        effort: Option<ReasoningEffort>,
+        budget_tokens: Option<u32>,
+        max_tokens: Option<u32>,
+    ) -> serde_json::Value {
+        let mut builder = Config::builder(model).reasoning(crate::types::ReasoningConfig {
+            effort,
+            budget_tokens,
+            summary: None,
+        });
+        if let Some(max_tokens) = max_tokens {
+            builder = builder.max_tokens(max_tokens);
+        }
+        let body = provider()
+            .convert_request(
+                &crate::Prompt::user("hi"),
+                builder.build().raw(),
+                &std::collections::HashMap::new(),
+            )
+            .unwrap();
+        serde_json::to_value(&body).unwrap()
+    }
+
+    #[test]
+    fn adaptive_models_take_an_effort() {
+        let json = thinking_request("claude-opus-4-7", Some(ReasoningEffort::Medium), None, None);
+        assert_eq!(json["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(
+            json["output_config"],
+            serde_json::json!({"effort": "medium"})
+        );
+        let json = thinking_request(
+            "claude-sonnet-4-6",
+            Some(ReasoningEffort::XHigh),
+            None,
+            None,
+        );
+        assert_eq!(json["output_config"]["effort"], "max");
+    }
+
+    #[test]
+    fn budget_models_keep_the_budget_below_max_tokens() {
+        let json = thinking_request("claude-sonnet-4-5", None, Some(5000), None);
+        assert_eq!(json["thinking"]["budget_tokens"], 5000);
+        assert_eq!(json["max_tokens"], 6024);
+
+        let json = thinking_request("claude-sonnet-4-5", None, Some(5000), Some(2000));
+        assert_eq!(json["thinking"]["budget_tokens"], 1999);
+
+        let json = thinking_request("claude-sonnet-4-5", None, Some(5000), Some(1000));
+        assert!(json["thinking"].is_null());
+
+        let json = thinking_request("claude-sonnet-4-5", None, Some(100), None);
+        assert_eq!(json["thinking"]["budget_tokens"], 1024);
+    }
+
+    #[test]
+    fn no_effort_or_budget_and_effort_none_send_no_thinking() {
+        let json = thinking_request("claude-sonnet-4-5", None, None, None);
+        assert!(json["thinking"].is_null());
+        let json = thinking_request("claude-sonnet-4-5", Some(ReasoningEffort::None), None, None);
+        assert!(json["thinking"].is_null());
+        assert_eq!(json["max_tokens"], 1024);
+    }
 
     fn provider() -> AnthropicViaVertexProvider {
         AnthropicViaVertexProvider::new("p".to_string(), "us-east5".to_string(), "tok".to_string())

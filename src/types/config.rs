@@ -92,20 +92,23 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    #[cfg(any(feature = "openai", feature = "google"))]
+    const ALL: [Self; 7] = [
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
+
     pub(crate) fn from_budget(budget: u32) -> Self {
-        match budget {
-            0 => Self::None,
-            1..=1024 => Self::Minimal,
-            1025..=4096 => Self::Low,
-            4097..=12288 => Self::Medium,
-            12289..=20480 => Self::High,
-            20481..=32768 => Self::XHigh,
-            _ => Self::Max,
-        }
+        Self::ALL
+            .into_iter()
+            .min_by_key(|effort| effort.budget().abs_diff(budget))
+            .expect("ALL is not empty")
     }
 
-    #[cfg(any(feature = "google", feature = "anthropic-vertex"))]
     pub(crate) fn budget(self) -> u32 {
         match self {
             Self::None => 0,
@@ -120,14 +123,12 @@ impl ReasoningEffort {
 }
 
 impl ReasoningConfig {
-    #[cfg(any(feature = "openai", feature = "google"))]
     pub(crate) fn resolved_effort(&self) -> Option<ReasoningEffort> {
         self.budget_tokens
             .map(ReasoningEffort::from_budget)
             .or(self.effort)
     }
 
-    #[cfg(any(feature = "google", feature = "anthropic-vertex"))]
     pub(crate) fn resolved_budget(&self) -> Option<u32> {
         self.budget_tokens
             .or(self.effort.map(ReasoningEffort::budget))

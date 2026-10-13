@@ -660,9 +660,13 @@ fn scenario_to_llm_request(
 fn parse_reasoning(v: &Value) -> Result<ReasoningConfig, String> {
     let obj = v.as_object().ok_or("reasoning must be an object")?;
     let effort = match obj.get("effort").and_then(|x| x.as_str()) {
+        Some("none") => Some(ReasoningEffort::None),
+        Some("minimal") => Some(ReasoningEffort::Minimal),
         Some("low") => Some(ReasoningEffort::Low),
         Some("medium") => Some(ReasoningEffort::Medium),
         Some("high") => Some(ReasoningEffort::High),
+        Some("xhigh") => Some(ReasoningEffort::XHigh),
+        Some("max") => Some(ReasoningEffort::Max),
         Some(other) => return Err(format!("unknown reasoning.effort: {other}")),
         None => None,
     };
@@ -673,9 +677,18 @@ fn parse_reasoning(v: &Value) -> Result<ReasoningConfig, String> {
         Some(other) => return Err(format!("unknown reasoning.summary: {other}")),
         None => None,
     };
+    let budget_tokens = match obj.get("budget_tokens") {
+        Some(budget) => Some(
+            budget
+                .as_u64()
+                .and_then(|b| u32::try_from(b).ok())
+                .ok_or("reasoning.budget_tokens must be a u32")?,
+        ),
+        None => None,
+    };
     Ok(ReasoningConfig {
         effort,
-        budget_tokens: None,
+        budget_tokens,
         summary,
     })
 }

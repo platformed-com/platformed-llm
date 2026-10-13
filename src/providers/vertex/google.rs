@@ -12,6 +12,7 @@ use bytes::Bytes;
 
 use super::endpoint::VertexEndpoint;
 use super::google_types::*;
+use crate::capabilities::{Capabilities, ResolvedThinking};
 use crate::factory::{ProviderType, VertexRequestType};
 use crate::provider::Provider;
 use crate::providers::file_resolve::{
@@ -1679,37 +1680,21 @@ fn convert_thinking(
 ) -> Option<GoogleThinkingConfig> {
     use crate::types::ReasoningEffort;
 
-    if let Some((min, max)) = thinking_budget_range(model) {
-        let budget = cfg.resolved_budget()?;
-        return Some(GoogleThinkingConfig {
-            thinking_budget: Some(budget.clamp(min, max)),
+    Some(match Capabilities::google(model).thinking.resolve(cfg)? {
+        ResolvedThinking::Budget(budget) => GoogleThinkingConfig {
+            thinking_budget: Some(budget),
             thinking_level: None,
-        });
-    }
-    let level = match cfg.resolved_effort()? {
-        ReasoningEffort::None | ReasoningEffort::Minimal => "MINIMAL",
-        ReasoningEffort::Low => "LOW",
-        ReasoningEffort::Medium => "MEDIUM",
-        ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => "HIGH",
-    };
-    Some(GoogleThinkingConfig {
-        thinking_budget: None,
-        thinking_level: Some(level),
+        },
+        ResolvedThinking::Effort(effort) => GoogleThinkingConfig {
+            thinking_budget: None,
+            thinking_level: Some(match effort {
+                ReasoningEffort::None | ReasoningEffort::Minimal => "MINIMAL",
+                ReasoningEffort::Low => "LOW",
+                ReasoningEffort::Medium => "MEDIUM",
+                ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => "HIGH",
+            }),
+        },
     })
-}
-
-/// Gemini 2.5 and earlier take a token budget; Pro cannot turn thinking off.
-fn thinking_budget_range(model: &str) -> Option<(u32, u32)> {
-    ["gemini-1", "gemini-2"]
-        .iter()
-        .any(|prefix| model.starts_with(prefix))
-        .then(|| {
-            if model.contains("-pro") {
-                (128, 32768)
-            } else {
-                (0, 24576)
-            }
-        })
 }
 
 #[cfg(test)]
@@ -2350,6 +2335,27 @@ mod tests {
     }
 
     #[test]
+    fn gemini_3_takes_only_levels_the_model_accepts() {
+        use crate::types::ReasoningEffort;
+        assert_eq!(
+            thinking_config_for("gemini-3-pro-preview", Some(ReasoningEffort::Medium), None),
+            serde_json::json!({"thinkingLevel": "HIGH"})
+        );
+        assert_eq!(
+            thinking_config_for("gemini-3.8-flash", Some(ReasoningEffort::Minimal), None),
+            serde_json::json!({"thinkingLevel": "LOW"})
+        );
+    }
+
+    #[test]
+    fn unknown_gemini_models_get_no_thinking_config() {
+        use crate::types::ReasoningEffort;
+        assert!(
+            thinking_config_for("gemini-flash-latest", Some(ReasoningEffort::High), None).is_null()
+        );
+    }
+
+    #[test]
     fn gemini_2_5_takes_a_budget_within_the_model_range() {
         use crate::types::ReasoningEffort;
         assert_eq!(
@@ -2363,6 +2369,10 @@ mod tests {
         assert_eq!(
             thinking_config_for("gemini-2.5-flash", None, Some(100000)),
             serde_json::json!({"thinkingBudget": 24576})
+        );
+        assert_eq!(
+            thinking_config_for("gemini-2.5-flash-lite", None, Some(100)),
+            serde_json::json!({"thinkingBudget": 512})
         );
     }
 
