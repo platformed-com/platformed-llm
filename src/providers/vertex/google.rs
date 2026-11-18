@@ -1624,6 +1624,19 @@ pub(crate) fn convert_response_stateful(
                     );
                     FinishReason::ContentFilter
                 }
+                // Gemini discarded a tool call or structured output it
+                // could not parse; a fresh sample usually parses.
+                "MALFORMED_FUNCTION_CALL" | "MALFORMED_RESPONSE" => {
+                    tracing::warn!(
+                        finish_reason = finish_reason_str.as_str(),
+                        finish_message,
+                        "Gemini: candidate discarded as malformed",
+                    );
+                    return Err(Error::provider_retryable(
+                        "Google",
+                        format!("candidate finished with {finish_reason_str}"),
+                    ));
+                }
                 other => {
                     tracing::warn!(
                         finish_reason = other,
@@ -1983,7 +1996,7 @@ mod tests {
 
     #[test]
     fn candidate_without_content_finishes_incomplete() {
-        let chunk = r#"{"candidates":[{"finishReason":"MALFORMED_FUNCTION_CALL","finishMessage":"Malformed function call: print(default_api.search(query=))"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}}"#;
+        let chunk = r#"{"candidates":[{"finishReason":"OTHER","finishMessage":"unspecified"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}}"#;
         let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
         let events =
             convert_response_stateful(response, &mut GoogleStreamState::default()).unwrap();
@@ -1994,6 +2007,20 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn malformed_candidate_is_a_retryable_failure() {
+        for chunk in [
+            r#"{"candidates":[{"finishReason":"MALFORMED_FUNCTION_CALL","finishMessage":"Malformed function call: print(default_api.search(query=))"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}}"#,
+            r#"{"candidates":[{"finishReason":"MALFORMED_RESPONSE"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":0,"totalTokenCount":1}}"#,
+        ] {
+            let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
+            let err = convert_response_stateful(response, &mut GoogleStreamState::default())
+                .expect_err("a malformed candidate must not finish the turn");
+            assert!(err.is_retryable(), "{err}");
+            assert!(err.to_string().contains("MALFORMED_"), "{err}");
+        }
     }
 
     /// Vertex reports a mid-generation failure as a chunk on a stream
