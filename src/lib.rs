@@ -30,9 +30,9 @@ pub mod providers;
 /// and AIMD capacity tracking.
 pub mod rate_limit;
 /// Retry helpers for transient provider failures — [`RetryPolicy`]
-/// centralises backoff / `Retry-After` arithmetic, [`retry()`] wraps an
-/// async operation in the loop. See the module docs for the buffered
-/// vs streaming patterns.
+/// centralises backoff / `Retry-After` arithmetic,
+/// [`generate_with_retry`] streams a response across attempts, and
+/// [`retry()`] wraps an async operation in the loop.
 pub mod retry;
 /// Server-Sent Events parser used by the default streaming response
 /// path. Exposed for callers plugging a custom [`transport`] into a
@@ -79,7 +79,9 @@ pub use rate_limit::{
     RatePermit, RateScope, SharedRateLimiter,
 };
 pub use response::{CompleteResponse, Response};
-pub use retry::{retry, RetryPolicy};
+pub use retry::{
+    generate_with_retry, retry, RetryAttempt, RetryEvent, RetryPolicy, RetryingResponse,
+};
 pub use types::{
     Annotation, AnnotationKind, AssistantPart, ComputerUseConfig, Config, ConfigBuilder,
     FileResolver, FileResolverError, FileSource, FinishReason, Function, FunctionCall, InputItem,
