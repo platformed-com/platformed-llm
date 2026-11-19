@@ -18,7 +18,9 @@ use std::pin::Pin;
 
 use futures_util::stream::{Stream, StreamExt};
 
-use crate::types::{FinishReason, Function, PartKind, RawConfig, ResponseFormat, Tool, ToolChoice};
+use crate::types::{
+    FinishReason, Function, InputItem, PartKind, RawConfig, ResponseFormat, Tool, ToolChoice,
+};
 use crate::{Capabilities, Error, Prompt, Response, StreamEvent};
 
 use super::{Middleware, ResponseTransform};
@@ -44,6 +46,9 @@ use super::{Middleware, ResponseTransform};
 ///    rewritten as a text part — the caller sees the JSON arguments
 ///    as the assistant's text output, never knows a tool was involved.
 ///    Other tool calls pass through unchanged.
+/// 6. Tells the model in the system prompt to give its final answer by
+///    calling the synth tool: a caller's prompt typically asks for a final
+///    answer with no tool call, which `tool_choice` forbids.
 ///
 /// No-ops when `response_format` is `None` / `Text`, or when caps say
 /// the model already supports the requested format natively.
@@ -64,7 +69,7 @@ impl Middleware for JsonCoercionMiddleware {
 
     fn apply<'a>(
         &self,
-        _prompt: &mut Cow<'a, Prompt>,
+        prompt: &mut Cow<'a, Prompt>,
         config: &mut Cow<'a, RawConfig>,
         caps: &Capabilities,
     ) -> Result<Option<ResponseTransform>, Error> {
@@ -133,14 +138,10 @@ impl Middleware for JsonCoercionMiddleware {
         let synth_tool_name = unique_tool_name("respond_with_json", config.tools.as_deref());
         let synth_tool = Tool::Function(Function {
             name: synth_tool_name.clone(),
-            description: Some(
-                "Respond to the user's request by invoking this tool. The arguments object \
-                 IS the answer — there is no further reasoning step. Do not emit any other \
-                 output."
-                    .to_string(),
-            ),
+            description: Some(SYNTH_TOOL_DESCRIPTION.to_string()),
             parameters,
         });
+        add_final_answer_note(prompt, &synth_tool_name);
 
         // First mutation — clones config exactly once if it was borrowed.
         let cfg = config.to_mut();
@@ -169,6 +170,46 @@ impl Middleware for JsonCoercionMiddleware {
         });
         Ok(Some(transform))
     }
+}
+
+const SYNTH_TOOL_DESCRIPTION: &str = "Give your final answer by calling this tool: its \
+     arguments are the answer. Call it on its own, once you have finished with the other \
+     tools. An instruction not to call tools alongside your final answer refers to those \
+     other tools, not to this one.";
+
+fn final_answer_note(synth_tool_name: &str) -> String {
+    format!(
+        "Give your structured final answer by calling the `{synth_tool_name}` tool, on its \
+         own, once you have finished with the other tools. Its arguments are your answer."
+    )
+}
+
+/// Appends the note to the caller's last `System` item, adding one only when
+/// there is none: Gemini and Anthropic keep only the last, so a second item
+/// would replace the caller's.
+fn add_final_answer_note(prompt: &mut Cow<'_, Prompt>, synth_tool_name: &str) {
+    let note = final_answer_note(synth_tool_name);
+    let last_system = prompt
+        .items()
+        .iter()
+        .rposition(|item| matches!(item, InputItem::System(_)));
+    if let Some(index) = last_system {
+        if matches!(&prompt.items()[index], InputItem::System(text) if text.contains(&note)) {
+            return;
+        }
+    }
+    let prompt = prompt.to_mut();
+    let mut items = std::mem::take(prompt).into_items();
+    match last_system {
+        Some(index) => {
+            if let InputItem::System(text) = &mut items[index] {
+                text.push_str("\n\n");
+                text.push_str(&note);
+            }
+        }
+        None => items.insert(0, InputItem::System(note)),
+    }
+    *prompt = Prompt::new().with_items(items);
 }
 
 /// Find a tool name that doesn't collide with any caller-supplied
@@ -1088,6 +1129,154 @@ mod tests {
                 .expect("non-Stop miss should propagate, not error");
             assert_eq!(response.finish_reason, reason);
             assert!(response.content.is_empty());
+        }
+    }
+
+    fn gemini_config_with_tool(tool_name: &str) -> Config {
+        ConfigBuilder::new("gemini-2.5-flash")
+            .response_format(json_schema_rf("X", r#"{"type":"object"}"#))
+            .tools(vec![Tool::Function(Function {
+                name: tool_name.to_string(),
+                description: None,
+                parameters: std::borrow::Cow::Owned(
+                    serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                ),
+            })])
+            .build()
+    }
+
+    fn apply_to(prompt: &Prompt, cfg: &Config) -> (Prompt, RawConfig) {
+        let mut prompt_cow: Cow<'_, Prompt> = Cow::Borrowed(prompt);
+        let mut raw_cow: Cow<'_, RawConfig> = Cow::Borrowed(cfg.raw());
+        JsonCoercionMiddleware
+            .apply(
+                &mut prompt_cow,
+                &mut raw_cow,
+                &Capabilities::for_model(&cfg.raw().model),
+            )
+            .unwrap();
+        (prompt_cow.into_owned(), raw_cow.into_owned())
+    }
+
+    fn system_texts(prompt: &Prompt) -> Vec<&str> {
+        prompt
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                InputItem::System(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn synth_tool_describes_itself_as_the_final_answer() {
+        let (_, raw) = apply_to(&Prompt::user("hi"), &gemini_config_with_tool("get_weather"));
+        let synth = raw
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find_map(|t| match t {
+                Tool::Function(f) if f.name == "respond_with_json" => Some(f),
+                _ => None,
+            })
+            .expect("synth tool added");
+        assert_eq!(synth.description.as_deref(), Some(SYNTH_TOOL_DESCRIPTION));
+    }
+
+    #[test]
+    fn final_answer_note_is_added_only_when_coercing() {
+        let prompt = Prompt::system("Be terse.").with_user("hi");
+        let not_coerced = [
+            Config::builder("gemini-2.5-flash").build(),
+            Config::builder("gpt-5")
+                .response_format(json_schema_rf("X", r#"{"type":"object"}"#))
+                .build(),
+        ];
+        for cfg in &not_coerced {
+            let mut prompt_cow: Cow<'_, Prompt> = Cow::Borrowed(&prompt);
+            let mut raw_cow: Cow<'_, RawConfig> = Cow::Borrowed(cfg.raw());
+            JsonCoercionMiddleware
+                .apply(
+                    &mut prompt_cow,
+                    &mut raw_cow,
+                    &Capabilities::for_model(&cfg.raw().model),
+                )
+                .unwrap();
+            assert!(matches!(prompt_cow, Cow::Borrowed(_)));
+        }
+
+        let (coerced, _) = apply_to(&prompt, &gemini_config_with_tool("get_weather"));
+        assert_eq!(
+            system_texts(&coerced),
+            [format!(
+                "Be terse.\n\n{}",
+                final_answer_note("respond_with_json")
+            )]
+        );
+    }
+
+    #[test]
+    fn final_answer_note_names_the_unique_synth_tool() {
+        let (prompt, raw) = apply_to(
+            &Prompt::system("Be terse.").with_user("hi"),
+            &gemini_config_with_tool("respond_with_json"),
+        );
+        assert!(raw
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|t| matches!(t, Tool::Function(f) if f.name == "respond_with_json_2")));
+        assert_eq!(
+            system_texts(&prompt),
+            [format!(
+                "Be terse.\n\n{}",
+                final_answer_note("respond_with_json_2")
+            )]
+        );
+        assert!(system_texts(&prompt)[0].contains("`respond_with_json_2`"));
+    }
+
+    #[test]
+    fn final_answer_note_is_appended_to_the_last_system_item() {
+        let prompt = Prompt::system("First.")
+            .with_user("hi")
+            .with_system("Second.");
+        let (coerced, _) = apply_to(&prompt, &gemini_config_with_tool("get_weather"));
+        assert_eq!(coerced.items().len(), 3);
+        assert_eq!(
+            system_texts(&coerced),
+            [
+                "First.".to_string(),
+                format!("Second.\n\n{}", final_answer_note("respond_with_json")),
+            ]
+        );
+    }
+
+    #[test]
+    fn final_answer_note_is_inserted_when_the_prompt_has_no_system_item() {
+        let (coerced, _) = apply_to(&Prompt::user("hi"), &gemini_config_with_tool("get_weather"));
+        let items = coerced.items();
+        assert_eq!(items.len(), 2);
+        assert!(
+            matches!(&items[0], InputItem::System(text) if *text == final_answer_note("respond_with_json"))
+        );
+        assert!(matches!(&items[1], InputItem::User { .. }));
+    }
+
+    #[test]
+    fn final_answer_note_is_not_repeated_on_a_coerced_prompt() {
+        let cfg = gemini_config_with_tool("get_weather");
+        for prompt in [
+            Prompt::user("hi"),
+            Prompt::system("Be terse.").with_user("hi"),
+        ] {
+            let (once, _) = apply_to(&prompt, &cfg);
+            let (twice, _) = apply_to(&once, &cfg);
+            assert_eq!(system_texts(&twice), system_texts(&once));
+            assert_eq!(twice.items().len(), once.items().len());
         }
     }
 }
