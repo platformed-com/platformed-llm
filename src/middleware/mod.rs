@@ -40,8 +40,10 @@ use crate::types::{RawConfig, ResponseFormat, Tool};
 use crate::{Capabilities, Error, Prompt, Response};
 
 pub mod json_coercion;
+pub mod tool_turn;
 
 pub use json_coercion::JsonCoercionMiddleware;
+pub use tool_turn::TextAfterToolCallsMiddleware;
 
 /// A response-stream wrapper produced by a middleware during request
 /// rewriting. Captures any per-request state (e.g. the synthetic tool
@@ -96,6 +98,7 @@ pub fn default_middleware(caps: &Capabilities) -> Vec<Arc<dyn Middleware>> {
     if !caps.response_schema || !caps.response_schema_with_tools || !caps.native_json_mode {
         out.push(Arc::new(JsonCoercionMiddleware));
     }
+    out.push(Arc::new(TextAfterToolCallsMiddleware));
     out
 }
 
