@@ -458,8 +458,14 @@ mod tests {
     }
 
     #[test]
-    fn google_three_series_supports_schema_with_tools() {
-        for m in ["gemini-3-pro", "gemini-3-flash"] {
+    fn google_three_and_four_series_support_schema_with_tools() {
+        for m in [
+            "gemini-3-pro",
+            "gemini-3-flash",
+            "gemini-4-carbon",
+            "gemini-4-argon",
+            "gemini-4-hydrogen",
+        ] {
             let c = Capabilities::google(m);
             assert!(c.response_schema_with_tools, "{m}");
         }
