@@ -23,6 +23,8 @@ pub struct AnthropicRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<AnthropicThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<AnthropicOutputConfig>,
     /// Stop sequences. Anthropic does not expose presence/frequency
     /// penalties, only stops.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,11 +44,18 @@ pub enum AnthropicToolChoice {
     None,
 }
 
-/// Anthropic extended-thinking config.
+/// `Enabled` is extended thinking with a fixed budget; `Adaptive` lets the
+/// model decide, steered by [`AnthropicOutputConfig::effort`].
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicThinking {
     Enabled { budget_tokens: u32 },
+    Adaptive,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnthropicOutputConfig {
+    pub effort: &'static str,
 }
 
 /// Anthropic message format.

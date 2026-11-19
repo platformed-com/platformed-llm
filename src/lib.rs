@@ -68,7 +68,7 @@ mod types;
 // and are reachable via the fully-qualified path. No globs — adding a
 // `pub` item to an internal module must not leak it.
 
-pub use capabilities::Capabilities;
+pub use capabilities::{Capabilities, ResolvedThinking, ThinkingSupport};
 pub use compaction::Compactor;
 pub use error::Error;
 pub use factory::{ProviderConfig, ProviderFactory, ProviderType, VertexRequestType};

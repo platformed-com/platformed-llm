@@ -22,6 +22,8 @@
 //! family-shaped names the table doesn't know about. Adding a new
 //! model = appending one row.
 
+use crate::types::{ReasoningConfig, ReasoningEffort};
+
 /// How a `ModelEntry` matches a model name.
 ///
 /// Lookups are case-insensitive — names are lowercased before
@@ -127,6 +129,71 @@ pub struct Capabilities {
     /// `max_tokens` higher than this is a caller error that will
     /// surface server-side.
     pub max_output_tokens: u32,
+    /// How the model's reasoning depth is set.
+    pub thinking: ThinkingSupport,
+}
+
+/// How a model takes a reasoning setting. A [`ReasoningConfig`] is
+/// resolved to the nearest value the model accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingSupport {
+    /// Not known. A provider with a single form for the setting sends it
+    /// as given; one with several omits it rather than guess.
+    Unknown,
+    /// The model takes no reasoning setting.
+    None,
+    /// A token budget in `min..=max`; 0 turns thinking off only when
+    /// `can_disable`.
+    Budget {
+        /// Smallest non-zero budget the model accepts.
+        min: u32,
+        /// Largest budget the model accepts.
+        max: u32,
+        /// Whether a budget of 0 turns thinking off.
+        can_disable: bool,
+    },
+    /// One of these efforts, in increasing order.
+    Efforts(&'static [ReasoningEffort]),
+}
+
+/// A reasoning setting the model accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedThinking {
+    /// Send this effort.
+    Effort(ReasoningEffort),
+    /// Send this token budget; 0 turns thinking off.
+    Budget(u32),
+}
+
+impl ThinkingSupport {
+    /// `None` when nothing should be sent: no setting was asked for, the
+    /// model takes none, or its form is unknown.
+    pub fn resolve(self, config: &ReasoningConfig) -> Option<ResolvedThinking> {
+        match self {
+            ThinkingSupport::Unknown | ThinkingSupport::None => None,
+            ThinkingSupport::Budget {
+                min,
+                max,
+                can_disable,
+            } => {
+                let budget = config.resolved_budget()?;
+                Some(ResolvedThinking::Budget(match budget {
+                    0 if can_disable => 0,
+                    _ => budget.clamp(min, max),
+                }))
+            }
+            ThinkingSupport::Efforts(efforts) => {
+                let requested = config.resolved_effort()?;
+                efforts
+                    .iter()
+                    .min_by_key(|effort| {
+                        // Ties go to the higher effort.
+                        ((**effort as i8 - requested as i8).abs(), -(**effort as i8))
+                    })
+                    .map(|effort| ResolvedThinking::Effort(*effort))
+            }
+        }
+    }
 }
 
 impl Default for Capabilities {
@@ -144,6 +211,7 @@ impl Default for Capabilities {
             response_schema_with_tools: false,
             context_window_tokens: 4096,
             max_output_tokens: 1024,
+            thinking: ThinkingSupport::Unknown,
         }
     }
 }

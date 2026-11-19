@@ -58,6 +58,10 @@ pub(crate) enum ResolvedRef {
 /// is configured. Providers with no library-owned store (Anthropic, or Gemini
 /// without a bucket) return an error directing the caller to supply a durable
 /// handle/URL instead.
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait already marks the futures it generates #[must_use]"
+)]
 #[async_trait]
 pub(crate) trait ProviderUploader: Sync {
     /// Upload `body` and return a provider handle referencing it.

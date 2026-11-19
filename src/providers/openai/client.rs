@@ -1,6 +1,7 @@
 use super::types::{
     OpenAIAnnotation, OpenAIReasoning, OpenAIStreamEvent, OpenAIToolChoice, ResponsesRequest,
 };
+use crate::capabilities::{Capabilities, ResolvedThinking, ThinkingSupport};
 use crate::factory::ProviderType;
 use crate::provider::Provider;
 use crate::providers::file_resolve::{
@@ -184,7 +185,10 @@ impl OpenAIProvider {
             previous_response_id,
             stream: None,
             store: Some(config.store.unwrap_or(false)),
-            reasoning: config.reasoning.as_ref().map(convert_reasoning),
+            reasoning: config
+                .reasoning
+                .as_ref()
+                .and_then(|cfg| convert_reasoning(cfg, &config.model)),
             stop: config.stop.clone(),
             presence_penalty: config.presence_penalty,
             frequency_penalty: config.frequency_penalty,
@@ -757,19 +761,31 @@ fn convert_response_format(
     Some(OpenAITextConfig { format })
 }
 
-fn convert_reasoning(cfg: &ReasoningConfig) -> OpenAIReasoning {
-    OpenAIReasoning {
-        effort: cfg.effort.map(|e| match e {
+fn convert_reasoning(cfg: &ReasoningConfig, model: &str) -> Option<OpenAIReasoning> {
+    let effort = match Capabilities::openai(model).thinking {
+        ThinkingSupport::None => return None,
+        ThinkingSupport::Unknown => cfg.resolved_effort(),
+        support => match support.resolve(cfg) {
+            Some(ResolvedThinking::Effort(effort)) => Some(effort),
+            Some(ResolvedThinking::Budget(_)) | None => None,
+        },
+    };
+    Some(OpenAIReasoning {
+        effort: effort.map(|e| match e {
+            ReasoningEffort::None => "none",
+            ReasoningEffort::Minimal => "minimal",
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
         }),
         summary: cfg.summary.map(|s| match s {
             ReasoningSummary::Auto => "auto",
             ReasoningSummary::Concise => "concise",
             ReasoningSummary::Detailed => "detailed",
         }),
-    }
+    })
 }
 
 /// Walk the history right-to-left for the most recent
@@ -2183,6 +2199,7 @@ mod tests {
         let cfg = Config::builder("gpt-5")
             .reasoning(ReasoningConfig {
                 effort: Some(ReasoningEffort::High),
+                budget_tokens: None,
                 summary: Some(ReasoningSummary::Auto),
             })
             .build();
@@ -2192,6 +2209,68 @@ mod tests {
             json["reasoning"],
             serde_json::json!({"effort": "high", "summary": "auto"}),
         );
+    }
+
+    #[test]
+    fn reasoning_budget_becomes_the_nearest_effort() {
+        use crate::types::ReasoningConfig;
+        let cfg = Config::builder("gpt-5.6-terra")
+            .reasoning(ReasoningConfig {
+                effort: None,
+                budget_tokens: Some(16384),
+                summary: None,
+            })
+            .build();
+        let req = provider().convert_request(
+            &Prompt::user("hi"),
+            cfg.raw(),
+            &std::collections::HashMap::new(),
+        );
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["reasoning"]["effort"], "high");
+    }
+
+    fn reasoning_for(model: &str, effort: crate::types::ReasoningEffort) -> serde_json::Value {
+        let cfg = Config::builder(model)
+            .reasoning(crate::types::ReasoningConfig {
+                effort: Some(effort),
+                budget_tokens: None,
+                summary: None,
+            })
+            .build();
+        let req = provider().convert_request(
+            &Prompt::user("hi"),
+            cfg.raw(),
+            &std::collections::HashMap::new(),
+        );
+        serde_json::to_value(&req).unwrap()["reasoning"].clone()
+    }
+
+    #[test]
+    fn reasoning_effort_is_the_nearest_the_model_accepts() {
+        use crate::types::ReasoningEffort;
+        assert_eq!(
+            reasoning_for("gpt-5", ReasoningEffort::None)["effort"],
+            "minimal"
+        );
+        assert_eq!(
+            reasoning_for("gpt-5.5", ReasoningEffort::Max)["effort"],
+            "xhigh"
+        );
+        assert_eq!(
+            reasoning_for("o3", ReasoningEffort::XHigh)["effort"],
+            "high"
+        );
+        assert_eq!(
+            reasoning_for("gpt-5.6-sol", ReasoningEffort::Max)["effort"],
+            "max"
+        );
+    }
+
+    #[test]
+    fn reasoning_is_omitted_for_a_model_that_does_not_reason() {
+        use crate::types::ReasoningEffort;
+        assert!(reasoning_for("gpt-4o", ReasoningEffort::High).is_null());
     }
 
     /// OpenAI's reasoning streaming should open one Reasoning part per
