@@ -72,7 +72,7 @@ pub use capabilities::Capabilities;
 pub use compaction::Compactor;
 pub use error::Error;
 pub use factory::{ProviderConfig, ProviderFactory, ProviderType, VertexRequestType};
-pub use middleware::{generate, JsonCoercionMiddleware, Middleware};
+pub use middleware::{generate, JsonCoercionMiddleware, Middleware, TextAfterToolCallsMiddleware};
 pub use provider::Provider;
 pub use rate_limit::{
     InMemoryRateLimiter, NoOpRateLimiter, Priority, ProviderRateInfo, RateLimiter, RateOutcome,

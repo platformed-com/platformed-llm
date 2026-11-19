@@ -14,13 +14,16 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::pin::Pin;
+use std::hash::{Hash, Hasher};
 
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::stream::StreamExt;
 
-use crate::types::{FinishReason, Function, PartKind, RawConfig, ResponseFormat, Tool, ToolChoice};
+use crate::types::{
+    FinishReason, Function, PartKind, PartUpdate, RawConfig, ResponseFormat, Tool, ToolChoice,
+};
 use crate::{Capabilities, Error, Prompt, Response, StreamEvent};
 
+use super::tool_turn::reindex;
 use super::{Middleware, ResponseTransform};
 
 /// When the caller set `response_format` but the model has no native
@@ -161,11 +164,20 @@ impl Middleware for JsonCoercionMiddleware {
             })
         };
 
+        let model = cfg.model.clone();
+        let mut rewriter = SynthRewriter::new(synth_tool_name, model);
         let transform: ResponseTransform = Box::new(move |response| {
-            Response::from_stream(rewrite_synth_tool_stream(
-                response.stream(),
-                synth_tool_name,
-            ))
+            Response::from_stream(
+                response
+                    .stream()
+                    .map(
+                        move |event| match event.and_then(|event| rewriter.on_event(event)) {
+                            Ok(events) => events.into_iter().map(Ok).collect(),
+                            Err(error) => vec![Err(error)],
+                        },
+                    )
+                    .flat_map(futures_util::stream::iter),
+            )
         });
         Ok(Some(transform))
     }
@@ -195,11 +207,13 @@ fn unique_tool_name(base: &str, existing: Option<&[Tool]>) -> String {
     }
 }
 
-/// Stream adapter that turns the coerced provider stream back into
-/// what a caller who asked for structured output expects to see.
+/// Turns the coerced provider stream back into what a caller who asked
+/// for structured output expects to see.
 ///
 /// - The synthetic tool call's events are relabeled from `ToolCall` to
-///   `Text`, so its JSON arguments surface as the assistant's text.
+///   `Text`, so its JSON arguments surface as the assistant's text. A
+///   synthetic call after a real one in the turn is dropped, as
+///   `drop_text_after_tool_calls` drops text.
 /// - **Genuine** visible `Text` parts are suppressed entirely. The
 ///   provider can emit free text before / around the forced tool call
 ///   (`tool_choice: Required` is Gemini ANY mode, which doesn't gag
@@ -210,147 +224,176 @@ fn unique_tool_name(base: &str, existing: Option<&[Tool]>) -> String {
 ///   `text()` is exactly the synth JSON.
 /// - Other (real) tool calls pass through unchanged.
 ///
-/// Because suppressing a part would leave a hole in the otherwise
-/// contiguous `PartStart` index sequence the accumulator requires, the
-/// kept parts are **renumbered** to stay 0,1,2,…
-///
-/// Terminal handling once `Done` arrives:
-/// - synth tool fired and was the *only* tool → rewrite
-///   `FinishReason::ToolCalls` to `Stop` (looks like a plain text turn).
-/// - synth tool fired alongside real tools → leave the finish reason
-///   as-is (multi-turn tool use in progress).
-/// - synth tool didn't fire but real tools did → legitimate
-///   intermediate turn (model is gathering info); pass through.
-/// - neither fired on a `Stop` turn → the model free-texted instead of
-///   producing the structured answer. Surface a retryable error rather
-///   than returning the silently-suppressed text as an empty response;
-///   a fresh sample can comply.
-/// - neither fired on any other finish reason → that reason (`Length`,
-///   `ContentFilter`, …) already explains why nothing arrived, so pass
-///   `Done` through and let the caller act on it.
-fn rewrite_synth_tool_stream(
-    inner: Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>>,
+/// Suppressing a part would leave a hole in the contiguous `PartStart`
+/// index sequence the accumulator requires, so the kept parts are
+/// renumbered 0,1,2,…
+struct SynthRewriter {
     synth_tool_name: String,
-) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>> {
-    let mut synth_seen = false;
-    let mut other_tool_seen = false;
-    // Original part index -> remapped index (`Some`) or suppressed (`None`).
-    let mut index_map: HashMap<u32, Option<u32>> = HashMap::new();
-    let mut next_index: u32 = 0;
-    Box::pin(
-        inner
-            .map(move |ev_result| -> Option<Result<StreamEvent, Error>> {
-                let ev = match ev_result {
-                    Ok(ev) => ev,
-                    Err(e) => return Some(Err(e)),
-                };
-                match ev {
-                    StreamEvent::PartStart { index, kind } => match kind {
-                        // Synthetic tool call -> relabel to a text part.
-                        PartKind::ToolCall { ref name, .. } if name == &synth_tool_name => {
-                            synth_seen = true;
-                            let mapped = next_index;
-                            next_index += 1;
-                            index_map.insert(index, Some(mapped));
-                            Some(Ok(StreamEvent::PartStart {
-                                index: mapped,
-                                kind: PartKind::Text,
-                            }))
-                        }
-                        // Genuine visible text -> suppress (see fn docs).
-                        PartKind::Text => {
-                            index_map.insert(index, None);
-                            None
-                        }
-                        // Real tool call -> keep, but renumber.
-                        PartKind::ToolCall { .. } => {
-                            other_tool_seen = true;
-                            let mapped = next_index;
-                            next_index += 1;
-                            index_map.insert(index, Some(mapped));
-                            Some(Ok(StreamEvent::PartStart {
-                                index: mapped,
-                                kind,
-                            }))
-                        }
-                        // Reasoning / refusal / builtin / continuation ->
-                        // keep, renumber.
-                        _ => {
-                            let mapped = next_index;
-                            next_index += 1;
-                            index_map.insert(index, Some(mapped));
-                            Some(Ok(StreamEvent::PartStart {
-                                index: mapped,
-                                kind,
-                            }))
-                        }
-                    },
-                    StreamEvent::Delta { index, delta } => match index_map.get(&index) {
-                        Some(Some(mapped)) => Some(Ok(StreamEvent::Delta {
-                            index: *mapped,
-                            delta,
-                        })),
-                        _ => None,
-                    },
-                    StreamEvent::PartUpdate { index, update } => match index_map.get(&index) {
-                        Some(Some(mapped)) => Some(Ok(StreamEvent::PartUpdate {
-                            index: *mapped,
-                            update,
-                        })),
-                        _ => None,
-                    },
-                    StreamEvent::PartEnd { index } => match index_map.get(&index) {
-                        Some(Some(mapped)) => Some(Ok(StreamEvent::PartEnd { index: *mapped })),
-                        _ => None,
-                    },
-                    StreamEvent::Done {
-                        finish_reason,
-                        usage,
-                    } => {
-                        if synth_seen {
-                            let finish_reason = if matches!(finish_reason, FinishReason::ToolCalls)
-                                && !other_tool_seen
-                            {
-                                FinishReason::Stop
-                            } else {
-                                finish_reason
-                            };
-                            Some(Ok(StreamEvent::Done {
-                                finish_reason,
-                                usage,
-                            }))
-                        } else if other_tool_seen {
-                            // Intermediate multi-turn turn: the model
-                            // called a real tool and hasn't emitted the
-                            // structured answer yet. Pass through.
-                            Some(Ok(StreamEvent::Done {
-                                finish_reason,
-                                usage,
-                            }))
-                        } else if matches!(finish_reason, FinishReason::Stop) {
-                            // Clean finish with nothing structured: the
-                            // model didn't comply with our coercion
-                            // polyfill. Retryable — a fresh sample can.
-                            Some(Err(Error::provider_retryable(
-                                "Library",
-                                "json_coercion: model did not invoke the structured-response \
-                                 tool and made no other tool call — the request asked for \
-                                 structured output but the model returned free-form text",
-                            )))
-                        } else {
-                            // Every other reason is self-describing;
-                            // wrapping it in a middleware error would
-                            // hide it from the caller.
-                            Some(Ok(StreamEvent::Done {
-                                finish_reason,
-                                usage,
-                            }))
-                        }
-                    }
+    model: String,
+    slots: HashMap<u32, Slot>,
+    next_index: u32,
+    /// The synthetic call's arguments, once it has streamed as text.
+    answer: Option<String>,
+    /// Index of the first real call, and whether it has a signature.
+    first_call: Option<(u32, bool)>,
+    /// The synthetic call's signature, for the first real call when it
+    /// has none: Gemini signs only the first call of a parallel batch.
+    synth_signature: Option<String>,
+}
+
+enum Slot {
+    Kept(u32),
+    Answer(u32),
+    LateAnswer { bytes: usize },
+    Suppressed,
+}
+
+impl SynthRewriter {
+    fn new(synth_tool_name: String, model: String) -> Self {
+        Self {
+            synth_tool_name,
+            model,
+            slots: HashMap::new(),
+            next_index: 0,
+            answer: None,
+            first_call: None,
+            synth_signature: None,
+        }
+    }
+
+    fn on_event(&mut self, event: StreamEvent) -> Result<Vec<StreamEvent>, Error> {
+        match event {
+            StreamEvent::PartStart { index, kind } => Ok(self.on_part_start(index, kind)),
+            StreamEvent::Done {
+                finish_reason,
+                usage,
+            } => Ok(vec![StreamEvent::Done {
+                finish_reason: self.on_done(finish_reason)?,
+                usage,
+            }]),
+            event @ (StreamEvent::Delta { index, .. }
+            | StreamEvent::PartUpdate { index, .. }
+            | StreamEvent::PartEnd { index }) => Ok(self.on_part_event(index, event)),
+        }
+    }
+
+    fn on_part_start(&mut self, index: u32, kind: PartKind) -> Vec<StreamEvent> {
+        let (slot, kind) = match kind {
+            PartKind::ToolCall { name, .. } if name == self.synth_tool_name => {
+                if self.first_call.is_some() {
+                    self.slots.insert(index, Slot::LateAnswer { bytes: 0 });
+                    return Vec::new();
                 }
-            })
-            .filter_map(futures_util::future::ready),
-    )
+                self.answer = Some(String::new());
+                (Slot::Answer(self.next_index), PartKind::Text)
+            }
+            PartKind::Text => {
+                self.slots.insert(index, Slot::Suppressed);
+                return Vec::new();
+            }
+            kind => {
+                if matches!(kind, PartKind::ToolCall { .. }) && self.first_call.is_none() {
+                    self.first_call = Some((self.next_index, false));
+                    self.warn_if_answered();
+                }
+                (Slot::Kept(self.next_index), kind)
+            }
+        };
+        let out = self.next_index;
+        self.next_index += 1;
+        self.slots.insert(index, slot);
+        vec![StreamEvent::PartStart { index: out, kind }]
+    }
+
+    /// An answer that streamed before a real call in its turn has reached
+    /// the caller and can't be taken back.
+    fn warn_if_answered(&self) {
+        let Some(answer) = &self.answer else {
+            return;
+        };
+        let mut hasher = std::hash::DefaultHasher::new();
+        answer.hash(&mut hasher);
+        tracing::warn!(
+            model = %self.model,
+            answer_bytes = answer.len(),
+            answer_hash = format_args!("{:016x}", hasher.finish()),
+            "json_coercion: a final answer streamed before a tool call in its turn",
+        );
+    }
+
+    fn on_part_event(&mut self, index: u32, event: StreamEvent) -> Vec<StreamEvent> {
+        let (out, is_answer) = match self.slots.get_mut(&index) {
+            Some(Slot::Kept(out)) => (*out, false),
+            Some(Slot::Answer(out)) => (*out, true),
+            Some(Slot::LateAnswer { bytes }) => {
+                match &event {
+                    StreamEvent::Delta { delta, .. } => *bytes += delta.len(),
+                    StreamEvent::PartEnd { .. } => tracing::debug!(
+                        model = %self.model,
+                        bytes = *bytes,
+                        "json_coercion: dropping a final answer given after a tool call",
+                    ),
+                    _ => {}
+                }
+                return Vec::new();
+            }
+            Some(Slot::Suppressed) => return Vec::new(),
+            None => return vec![event],
+        };
+        let mut events = Vec::new();
+        match (&event, &mut self.first_call) {
+            (StreamEvent::Delta { delta, .. }, _) if is_answer => {
+                if let Some(answer) = &mut self.answer {
+                    answer.push_str(delta);
+                }
+            }
+            (
+                StreamEvent::PartUpdate {
+                    update: PartUpdate::Signature(signature),
+                    ..
+                },
+                _,
+            ) if is_answer => self.synth_signature = Some(signature.clone()),
+            (
+                StreamEvent::PartUpdate {
+                    update: PartUpdate::Signature(_),
+                    ..
+                },
+                Some((first, signed)),
+            ) if *first == out => *signed = true,
+            (StreamEvent::PartEnd { .. }, Some((first, signed @ false))) if *first == out => {
+                if let Some(signature) = &self.synth_signature {
+                    *signed = true;
+                    events.push(StreamEvent::PartUpdate {
+                        index: out,
+                        update: PartUpdate::Signature(signature.clone()),
+                    });
+                }
+            }
+            _ => {}
+        }
+        events.push(reindex(event, out));
+        events
+    }
+
+    /// The finish reason to report, or an error when the model answered
+    /// in free text alone.
+    fn on_done(&self, finish_reason: FinishReason) -> Result<FinishReason, Error> {
+        let answered = self.answer.is_some();
+        let called = self.first_call.is_some();
+        match (answered, called, finish_reason) {
+            (true, false, FinishReason::ToolCalls) => Ok(FinishReason::Stop),
+            (false, false, FinishReason::Stop) => Err(Error::provider_retryable(
+                "Library",
+                "json_coercion: model did not invoke the structured-response \
+                 tool and made no other tool call — the request asked for \
+                 structured output but the model returned free-form text",
+            )),
+            // `Length`, `ContentFilter` and the like explain an empty
+            // turn themselves.
+            (_, _, finish_reason) => Ok(finish_reason),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -549,42 +592,168 @@ mod tests {
         ));
     }
 
+    fn synth_and_real_calls(order: &[&str]) -> Vec<Result<StreamEvent, Error>> {
+        let mut events = Vec::new();
+        for (index, name) in order.iter().enumerate() {
+            let index = index as u32;
+            let arguments = if *name == "respond_with_json" {
+                r#"{"x":1}"#
+            } else {
+                r#"{"city":"NY"}"#
+            };
+            events.extend([
+                Ok(StreamEvent::PartStart {
+                    index,
+                    kind: PartKind::ToolCall {
+                        call_id: format!("c{index}"),
+                        name: name.to_string(),
+                    },
+                }),
+                Ok(StreamEvent::Delta {
+                    index,
+                    delta: arguments.to_string(),
+                }),
+                Ok(StreamEvent::PartEnd { index }),
+            ]);
+        }
+        events.push(Ok(StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+            usage: Usage::default(),
+        }));
+        events
+    }
+
+    fn weather_config(model: &str) -> crate::Config {
+        ConfigBuilder::new(model)
+            .response_format(json_schema_rf("Answer", r#"{"type":"object"}"#))
+            .tools(vec![Tool::Function(Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: std::borrow::Cow::Owned(
+                    serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                ),
+            })])
+            .build()
+    }
+
+    /// Everything logged at `warn` or above while the guard lives.
+    fn capture_warnings() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<u8>>>) {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logged = Arc::new(Mutex::new(Vec::new()));
+        let sink = Sink(logged.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        (tracing::subscriber::set_default(subscriber), logged)
+    }
+
+    /// A synth call after a real one in its turn was written before the
+    /// real call's result: the turn reaches the caller as the real call
+    /// alone.
     #[tokio::test]
-    async fn preserves_other_tool_calls() {
-        let synth_name = "respond_with_json".to_string();
-        let events: Vec<Result<StreamEvent, Error>> = vec![
-            Ok(StreamEvent::PartStart {
-                index: 0,
-                kind: PartKind::ToolCall {
-                    call_id: "c1".to_string(),
-                    name: synth_name.clone(),
-                },
-            }),
-            Ok(StreamEvent::Delta {
-                index: 0,
-                delta: r#"{"x":1}"#.to_string(),
-            }),
-            Ok(StreamEvent::PartEnd { index: 0 }),
-            Ok(StreamEvent::PartStart {
-                index: 1,
-                kind: PartKind::ToolCall {
-                    call_id: "c2".to_string(),
-                    name: "get_weather".to_string(),
-                },
-            }),
-            Ok(StreamEvent::Delta {
-                index: 1,
-                delta: r#"{"city":"NY"}"#.to_string(),
-            }),
-            Ok(StreamEvent::PartEnd { index: 1 }),
-            Ok(StreamEvent::Done {
-                finish_reason: FinishReason::ToolCalls,
-                usage: Usage::default(),
-            }),
-        ];
+    async fn an_answer_after_a_real_call_is_dropped() {
+        let provider =
+            MockProvider::new(synth_and_real_calls(&["get_weather", "respond_with_json"]));
+        let complete = generate(
+            &provider,
+            &Prompt::user("hi"),
+            &weather_config("claude-sonnet-4-5"),
+        )
+        .await
+        .unwrap()
+        .buffer()
+        .await
+        .unwrap();
+
+        let [AssistantPart::ToolCall(FunctionCall { name, .. })] = complete.content.as_slice()
+        else {
+            panic!("expected only the real call: {:?}", complete.content);
+        };
+        assert_eq!(name, "get_weather");
+        assert!(matches!(complete.finish_reason, FinishReason::ToolCalls));
+    }
+
+    /// A synth call before a real one has streamed by the time the real
+    /// call arrives; it stays, and the leak is logged without its content.
+    #[tokio::test]
+    async fn an_answer_before_a_real_call_is_kept_and_logged() {
+        let (_guard, logged) = capture_warnings();
+        let provider =
+            MockProvider::new(synth_and_real_calls(&["respond_with_json", "get_weather"]));
+        let complete = generate(
+            &provider,
+            &Prompt::user("hi"),
+            &weather_config("claude-sonnet-4-5"),
+        )
+        .await
+        .unwrap()
+        .buffer()
+        .await
+        .unwrap();
+
+        let [AssistantPart::Text { content, .. }, AssistantPart::ToolCall(FunctionCall { name, .. })] =
+            complete.content.as_slice()
+        else {
+            panic!("expected the answer then the call: {:?}", complete.content);
+        };
+        assert_eq!(
+            (content.as_str(), name.as_str()),
+            (r#"{"x":1}"#, "get_weather")
+        );
+        let logged = String::from_utf8(logged.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("answer_bytes=7"), "{logged}");
+        assert!(!logged.contains(r#"{"x":1}"#), "{logged}");
+    }
+
+    /// Gemini signs only the first call of a parallel batch. When that is
+    /// the synth call, the first real call takes its signature.
+    #[tokio::test]
+    async fn a_synth_call_passes_its_signature_to_the_first_real_call() {
+        let call = |index: u32, name: &str, signature: Option<&str>| {
+            let mut events = vec![
+                Ok(StreamEvent::PartStart {
+                    index,
+                    kind: PartKind::ToolCall {
+                        call_id: format!("c{index}"),
+                        name: name.to_string(),
+                    },
+                }),
+                Ok(StreamEvent::Delta {
+                    index,
+                    delta: r#"{"x":1}"#.to_string(),
+                }),
+            ];
+            events.extend(signature.map(|signature| {
+                Ok(StreamEvent::PartUpdate {
+                    index,
+                    update: crate::types::PartUpdate::Signature(signature.to_string()),
+                })
+            }));
+            events.push(Ok(StreamEvent::PartEnd { index }));
+            events
+        };
+        let mut events: Vec<Result<StreamEvent, Error>> = Vec::new();
+        events.extend(call(0, "respond_with_json", Some("sig")));
+        events.extend(call(1, "get_weather", None));
+        events.extend(call(2, "get_weather", None));
+        events.push(Ok(StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+            usage: Usage::default(),
+        }));
         let provider = MockProvider::new(events);
-        let prompt = Prompt::user("hi");
-        let config = ConfigBuilder::new("claude-sonnet-4-5")
+        let config = ConfigBuilder::new("gemini-2.5-flash")
             .response_format(json_schema_rf("Answer", r#"{"type":"object"}"#))
             .tools(vec![Tool::Function(Function {
                 name: "get_weather".to_string(),
@@ -595,25 +764,22 @@ mod tests {
             })])
             .build();
 
-        let response = generate(&provider, &prompt, &config).await.unwrap();
+        let response = generate(&provider, &Prompt::user("hi"), &config)
+            .await
+            .unwrap();
         let complete = response.buffer().await.unwrap();
 
-        let mut saw_text = false;
-        let mut saw_real_call = false;
-        for part in &complete.content {
-            if let AssistantPart::Text { content, .. } = part {
-                assert_eq!(content, r#"{"x":1}"#);
-                saw_text = true;
-            }
-            if let AssistantPart::ToolCall(FunctionCall { name, .. }) = part {
-                if name == "get_weather" {
-                    saw_real_call = true;
+        let signatures: Vec<(&str, Option<&str>)> = complete
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                AssistantPart::ToolCall(call) => {
+                    Some((call.call_id.as_str(), call.provider_signature.as_deref()))
                 }
-            }
-        }
-        assert!(saw_text);
-        assert!(saw_real_call);
-        assert!(matches!(complete.finish_reason, FinishReason::ToolCalls));
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signatures, [("c1", Some("sig")), ("c2", None)]);
     }
 
     #[test]
@@ -625,10 +791,19 @@ mod tests {
             response_schema_with_tools: true,
             ..Capabilities::default()
         };
-        assert!(default_middleware(&caps_full).is_empty());
+        let names = |caps: &Capabilities| -> Vec<String> {
+            default_middleware(caps)
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect()
+        };
+        assert_eq!(names(&caps_full), ["text_after_tool_calls"]);
 
         let caps_anthropic = Capabilities::anthropic("claude-sonnet-4-5");
-        assert_eq!(default_middleware(&caps_anthropic).len(), 1);
+        assert_eq!(
+            names(&caps_anthropic),
+            ["json_coercion", "text_after_tool_calls"]
+        );
     }
 
     /// On a model that supports schema natively but not schema+tools
