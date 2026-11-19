@@ -700,3 +700,52 @@ async fn unified_event_snapshots_match() {
         );
     }
 }
+
+/// Replayed with the scenario's own tools and schema, so `json_coercion`
+/// applies: the `respond_with_json` call Gemini 2.5 gave beside its
+/// `get_weather` calls is dropped from the turn.
+#[tokio::test]
+async fn an_answer_alongside_tool_calls_is_dropped_on_replay() {
+    use platformed_llm::{AssistantPart, FinishReason, ResponseFormat, Tool};
+    use std::borrow::Cow;
+
+    let raw =
+        |json: &str| Cow::Owned(serde_json::value::RawValue::from_string(json.into()).unwrap());
+    let body = fs::read(
+        PathBuf::from(TRACES_ROOT).join("google/answer_alongside_tool_calls.response.sse"),
+    )
+    .unwrap();
+    let transport = Transport::new(StaticTransport { status: 200, body });
+    let endpoint = VertexEndpoint::with_access_token("p".into(), "us-east1".into(), "tok".into());
+    let provider = GoogleProvider::with_transport(endpoint, transport);
+    let config = Config::builder("gemini-2.5-flash")
+        .tools(vec![Tool::function(
+            "get_weather",
+            None,
+            raw(r#"{"type":"object","properties":{"city":{"type":"string"}}}"#),
+        )])
+        .response_format(ResponseFormat::JsonSchema {
+            name: "weather_report".into(),
+            schema: raw(r#"{"type":"object"}"#),
+            strict: true,
+        })
+        .build();
+
+    let response = generate(&provider, &Prompt::user("replay"), &config)
+        .await
+        .unwrap()
+        .buffer()
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = response
+        .content
+        .iter()
+        .map(|part| match part {
+            AssistantPart::ToolCall(call) => call.name.as_str(),
+            part => panic!("expected only tool calls: {part:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["get_weather", "get_weather"]);
+    assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+}

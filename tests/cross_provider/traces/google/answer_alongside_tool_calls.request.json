@@ -1,0 +1,68 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Get the weather for Paris and Berlin and, at the same time, give me your final answer. Do everything in one step: call the weather tool for both cities and also give the final structured answer in the same response."
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 4096
+  },
+  "systemInstruction": {
+    "parts": [
+      {
+        "text": "You are a weather assistant. Always give your final answer in the same response as your tool calls, never in a separate turn."
+      }
+    ],
+    "role": "system"
+  },
+  "toolConfig": {
+    "functionCallingConfig": {
+      "mode": "ANY"
+    }
+  },
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "description": "Get the current weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "description": "Respond to the user's request by invoking this tool. The arguments object IS the answer — there is no further reasoning step. Do not emit any other output.",
+          "name": "respond_with_json",
+          "parameters": {
+            "properties": {
+              "done": {
+                "type": "boolean"
+              },
+              "summary": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "summary",
+              "done"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ]
+}

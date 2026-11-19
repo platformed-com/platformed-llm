@@ -1,0 +1,16 @@
+PartStart[0] tool_call call_id="<id-1>" name="get_weather"
+Delta[0] "{\"city\":\"Paris\"}"
+PartEnd[0]
+PartStart[1] tool_call call_id="<id-2>" name="get_weather"
+Delta[1] "{\"city\":\"Berlin\"}"
+PartEnd[1]
+PartStart[2] tool_call call_id="<id-3>" name="respond_with_json"
+Delta[2] "{\"done\":true,\"summary\":\"I have fetched the weather for Paris and Berlin. Please note that I cannot display the weather information here because the get_weather tool output is not available at this step. I have made the calls and am now providing the final response structure.\"}"
+PartEnd[2]
+Done finish=ToolCalls input=<n> output=<n>
+
+=== final ===
+finish=ToolCalls
+part[0] tool_call name="get_weather" arguments="{\"city\":\"Paris\"}"
+part[1] tool_call name="get_weather" arguments="{\"city\":\"Berlin\"}"
+part[2] tool_call name="respond_with_json" arguments="{\"done\":true,\"summary\":\"I have fetched the weather for Paris and Berlin. Please note that I cannot display the weather information here because the get_weather tool output is not available at this step. I have made the calls and am now providing the final response structure.\"}"
