@@ -238,7 +238,8 @@ impl GoogleProvider {
         // start a new content. Vertex rejects consecutive same-role contents,
         // and this also matches how function_call / function_response
         // sequences need to fold into the surrounding model/user turns.
-        fn push_part(contents: &mut Vec<GoogleContent>, role: &str, part: GooglePart) {
+        fn push_part(contents: &mut Vec<GoogleContent>, role: &str, part: impl Into<GooglePart>) {
+            let part = part.into();
             if let Some(last) = contents.last_mut() {
                 if last.role == role {
                     last.parts.push(part);
@@ -293,9 +294,10 @@ impl GoogleProvider {
                     // fresh capture proving it's required.
                     system_instruction = Some(GoogleContent {
                         role: "system".to_string(),
-                        parts: vec![GooglePart::Text {
+                        parts: vec![GooglePartData::Text {
                             text: content.clone(),
-                        }],
+                        }
+                        .into()],
                     });
                 }
                 InputItem::User { content } => {
@@ -305,7 +307,7 @@ impl GoogleProvider {
                                 push_part(
                                     &mut contents,
                                     "user",
-                                    GooglePart::Text { text: s.clone() },
+                                    GooglePartData::Text { text: s.clone() },
                                 );
                             }
                             UserPart::ToolResult { call_id, content } => {
@@ -331,7 +333,7 @@ impl GoogleProvider {
                                 push_part(
                                     &mut contents,
                                     "user",
-                                    GooglePart::FunctionResponse {
+                                    GooglePartData::FunctionResponse {
                                         function_response: GoogleFunctionResponse {
                                             name: function_name,
                                             response: encode_function_output(&output_text),
@@ -378,7 +380,7 @@ impl GoogleProvider {
                                 push_part(
                                     &mut contents,
                                     "model",
-                                    GooglePart::Text {
+                                    GooglePartData::Text {
                                         text: content.clone(),
                                     },
                                 );
@@ -387,7 +389,7 @@ impl GoogleProvider {
                                 push_part(
                                     &mut contents,
                                     "model",
-                                    GooglePart::Text { text: s.clone() },
+                                    GooglePartData::Text { text: s.clone() },
                                 );
                             }
                             AssistantPart::ToolCall(call) => {
@@ -400,12 +402,14 @@ impl GoogleProvider {
                                 push_part(
                                     &mut contents,
                                     "model",
-                                    GooglePart::FunctionCall {
-                                        function_call: GoogleFunctionCall {
-                                            name: call.name.clone(),
-                                            args,
-                                            thought_signature: call.provider_signature.clone(),
+                                    GooglePart {
+                                        data: GooglePartData::FunctionCall {
+                                            function_call: GoogleFunctionCall {
+                                                name: call.name.clone(),
+                                                args,
+                                            },
                                         },
+                                        thought_signature: call.provider_signature.clone(),
                                     },
                                 );
                             }
@@ -1187,15 +1191,15 @@ fn file_source_to_part(
     src: &FileSource,
     fallback_mime: &str,
     resolved: &HashMap<String, ResolvedRef>,
-) -> Option<GooglePart> {
+) -> Option<GooglePartData> {
     match src {
-        FileSource::Base64 { data, media_type } => Some(GooglePart::InlineData {
+        FileSource::Base64 { data, media_type } => Some(GooglePartData::InlineData {
             inline_data: GoogleInlineData {
                 mime_type: media_type.clone(),
                 data: data.clone(),
             },
         }),
-        FileSource::Url(u) => Some(GooglePart::FileData {
+        FileSource::Url(u) => Some(GooglePartData::FileData {
             file_data: GoogleFileData {
                 mime_type: fallback_mime.to_string(),
                 file_uri: u.clone(),
@@ -1212,7 +1216,7 @@ fn ref_to_file_data(
     resolved: &HashMap<String, ResolvedRef>,
     id: &str,
     fallback_mime: &str,
-) -> Option<GooglePart> {
+) -> Option<GooglePartData> {
     match resolved.get(id) {
         Some(ResolvedRef::Handle { uri, media_type })
         | Some(ResolvedRef::Url { uri, media_type }) => {
@@ -1221,7 +1225,7 @@ fn ref_to_file_data(
             } else {
                 media_type.clone()
             };
-            Some(GooglePart::FileData {
+            Some(GooglePartData::FileData {
                 file_data: GoogleFileData {
                     mime_type: mime,
                     file_uri: uri.clone(),
@@ -1501,8 +1505,8 @@ pub(crate) fn convert_response_stateful(
 
     if let Some(candidate) = response.candidates.first() {
         for part in candidate.content.iter().flat_map(|c| &c.parts) {
-            match part {
-                GooglePart::Text { text } => {
+            match &part.data {
+                GooglePartData::Text { text } => {
                     if text.is_empty() {
                         continue;
                     }
@@ -1515,7 +1519,7 @@ pub(crate) fn convert_response_stateful(
                         delta: text.clone(),
                     });
                 }
-                GooglePart::FunctionCall { function_call } => {
+                GooglePartData::FunctionCall { function_call } => {
                     // Close any open text part before starting a tool call.
                     state.close_text(&mut events);
                     state.close_code_execution(&mut events);
@@ -1529,10 +1533,10 @@ pub(crate) fn convert_response_stateful(
                         call_id,
                         function_call.name.clone(),
                         arguments,
-                        function_call.thought_signature.clone(),
+                        part.thought_signature.clone(),
                     );
                 }
-                GooglePart::ExecutableCode { executable_code } => {
+                GooglePartData::ExecutableCode { executable_code } => {
                     // `executableCode` opens a CodeExecution
                     // BuiltinToolCall; the matching
                     // `codeExecutionResult` (if any) populates its
@@ -1550,7 +1554,7 @@ pub(crate) fn convert_response_stateful(
                         delta: arguments,
                     });
                 }
-                GooglePart::CodeExecutionResult {
+                GooglePartData::CodeExecutionResult {
                     code_execution_result,
                 } => {
                     let result = serde_json::json!({
@@ -1570,9 +1574,9 @@ pub(crate) fn convert_response_stateful(
                     });
                     state.close_code_execution(&mut events);
                 }
-                GooglePart::FunctionResponse { .. }
-                | GooglePart::InlineData { .. }
-                | GooglePart::FileData { .. } => {
+                GooglePartData::FunctionResponse { .. }
+                | GooglePartData::InlineData { .. }
+                | GooglePartData::FileData { .. } => {
                     // Request-side parts; not expected on response stream.
                 }
             }
@@ -2660,7 +2664,7 @@ mod tests {
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["cachedContent"], "cached/prior");
         assert_eq!(body.contents.len(), 1);
-        if let GooglePart::Text { text } = &body.contents[0].parts[0] {
+        if let GooglePartData::Text { text } = &body.contents[0].parts[0].data {
             assert_eq!(text, "follow-up");
         } else {
             panic!("expected text part, got {:?}", body.contents[0].parts[0]);
@@ -2695,7 +2699,7 @@ mod tests {
         assert_eq!(json["cachedContent"], "cached/new");
         // Only the items after `cached/new` are sent.
         assert_eq!(body.contents[0].parts.len(), 1);
-        if let GooglePart::Text { text } = &body.contents[0].parts[0] {
+        if let GooglePartData::Text { text } = &body.contents[0].parts[0].data {
             assert_eq!(text, "c");
         } else {
             panic!("expected text part, got {:?}", body.contents[0].parts[0]);
@@ -2949,10 +2953,10 @@ mod tests {
             .is_ok());
     }
 
-    /// #4 (request side): a tool call carrying a `provider_signature` is
-    /// echoed back as Gemini's `thoughtSignature` on the wire.
+    /// A tool call's `provider_signature` goes back as the
+    /// `thoughtSignature` of its part, beside `functionCall`.
     #[test]
-    fn provider_signature_echoed_as_thought_signature() {
+    fn provider_signature_echoed_as_part_thought_signature() {
         use crate::types::FunctionCall;
         let prompt = crate::Prompt::user("hi")
             .with_assistant_tool_call(FunctionCall {
@@ -2969,17 +2973,19 @@ mod tests {
         let json = serde_json::to_value(&body).unwrap();
         // contents: [user "hi", model [functionCall], user [functionResponse]]
         assert_eq!(
-            json["contents"][1]["parts"][0]["functionCall"]["thoughtSignature"],
-            "sig_xyz",
+            json["contents"][1]["parts"][0],
+            serde_json::json!({
+                "functionCall": {"name": "f", "args": {}},
+                "thoughtSignature": "sig_xyz",
+            }),
         );
     }
 
-    /// #4 (response side): Gemini's `thoughtSignature` on a `functionCall`
-    /// part is captured and surfaced via a `PartUpdate::Signature`, which
-    /// the accumulator lands on `FunctionCall::provider_signature`.
+    /// A parallel batch, signed beside the first `functionCall` as in the
+    /// recorded traces; the second call carries no signature.
     #[test]
-    fn thought_signature_parsed_into_provider_signature() {
-        let chunk = r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Paris"},"thoughtSignature":"sig_abc"}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}}"#;
+    fn part_thought_signature_lands_on_its_tool_call() {
+        let chunk = r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Paris"}},"thoughtSignature":"sig_abc"},{"functionCall":{"name":"get_weather","args":{"city":"Rome"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}}"#;
         let mut state = GoogleStreamState::default();
         let r: GoogleResponse = serde_json::from_str(chunk).unwrap();
         let events = convert_response_stateful(r, &mut state).unwrap();
@@ -2988,15 +2994,26 @@ mod tests {
         for ev in events {
             acc.process_event(ev).unwrap();
         }
-        let resp = acc.finalize();
-        let call = resp
+        let signatures: Vec<_> = acc
+            .finalize()
             .content
-            .iter()
-            .find_map(|p| match p {
-                AssistantPart::ToolCall(c) => Some(c),
+            .into_iter()
+            .filter_map(|p| match p {
+                AssistantPart::ToolCall(c) => Some(c.provider_signature),
                 _ => None,
             })
-            .expect("expected a tool call");
-        assert_eq!(call.provider_signature.as_deref(), Some("sig_abc"));
+            .collect();
+        assert_eq!(signatures, [Some("sig_abc".to_string()), None]);
+    }
+
+    /// A signed text part, as Gemini sends at the end of a turn, still
+    /// parses as text.
+    #[test]
+    fn signed_text_part_parses_as_text() {
+        let chunk = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Sunny.","thoughtSignature":"sig_abc"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}}"#;
+        let r: GoogleResponse = serde_json::from_str(chunk).unwrap();
+        let part = &r.candidates[0].content.as_ref().unwrap().parts[0];
+        assert!(matches!(&part.data, GooglePartData::Text { text } if text == "Sunny."));
+        assert_eq!(part.thought_signature.as_deref(), Some("sig_abc"));
     }
 }

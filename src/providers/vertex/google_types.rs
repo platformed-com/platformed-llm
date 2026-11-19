@@ -56,8 +56,30 @@ pub struct GoogleContent {
 
 /// Part of a Google content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GooglePart {
+    #[serde(flatten)]
+    pub data: GooglePartData,
+    /// Opaque signature a thinking model attaches to a part, echoed back
+    /// on the same part. In a parallel batch only the first
+    /// `functionCall` carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
+}
+
+impl From<GooglePartData> for GooglePart {
+    fn from(data: GooglePartData) -> Self {
+        Self {
+            data,
+            thought_signature: None,
+        }
+    }
+}
+
+/// What a [`GooglePart`] holds; exactly one of these keys is set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum GooglePart {
+pub enum GooglePartData {
     Text {
         text: String,
     },
@@ -126,12 +148,6 @@ pub struct GoogleFileData {
 pub struct GoogleFunctionCall {
     pub name: String,
     pub args: IValue,
-    /// Gemini 2.5+ thinking models attach an opaque `thoughtSignature`
-    /// to each `functionCall`. Captured on parse and echoed back on the
-    /// request side to preserve thinking continuity. Absent for
-    /// non-thinking models.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thought_signature: Option<String>,
 }
 
 /// Google function response.
