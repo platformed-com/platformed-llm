@@ -1,5 +1,6 @@
 PartStart[0] tool_call call_id="<id-1>" name="get_weather"
 Delta[0] "{\"city\":\"Paris\"}"
+PartUpdate[0] signature len=624
 PartEnd[0]
 Done finish=Stop input=<n> output=<n>
 
