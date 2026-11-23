@@ -345,6 +345,44 @@
       "messages": [
         { "role": "user", "content": "What is 47 to the power of 5? Use code to compute it and give just the answer." }
       ]
+    },
+
+    {
+      "name": "answer_alongside_tool_calls",
+      "description": "Function tools plus a JSON schema on Gemini 2.5, which can't combine them natively, so json_coercion adds respond_with_json with tool_choice=Required. The prompt invites the final answer in the same turn as the calls, and Gemini 2.5 reliably pairs respond_with_json with real get_weather calls. Pins the turn the coercion stream drops the answer from. OpenAI and Anthropic skipped.",
+      "max_tokens": 4096,
+      "tools": [
+        {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"]
+          }
+        }
+      ],
+      "response_format": {
+        "type": "json_schema",
+        "name": "weather_report",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "summary": { "type": "string" },
+            "done": { "type": "boolean" }
+          },
+          "required": ["summary", "done"]
+        }
+      },
+      "providers": {
+        "openai":    { "skip": true },
+        "anthropic": { "skip": true }
+      },
+      "messages": [
+        { "role": "system", "content": "You are a weather assistant. Always give your final answer in the same response as your tool calls, never in a separate turn." },
+        { "role": "user", "content": "Get the weather for Paris and Berlin and, at the same time, give me your final answer. Do everything in one step: call the weather tool for both cities and also give the final structured answer in the same response." }
+      ]
     }
   ]
 }

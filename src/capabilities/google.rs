@@ -1,10 +1,10 @@
 //! Google / Gemini capability table.
 //!
-//! Sourced from Google Cloud / AI Studio docs as of 2026-06. Per
-//! Google's docs, the 3.x series supports combining `responseSchema`
-//! with function-calling tools (preview), while 2.5 / 2.0 / 1.5
-//! support schema-constrained output but **not** in combination with
-//! tools.
+//! Sourced from Google Cloud / AI Studio docs as of 2026-11. Per
+//! Google's docs, the 4.x and 3.x series support combining
+//! `responseSchema` with function-calling tools (preview), while 2.5 /
+//! 2.0 / 1.5 support schema-constrained output but **not** in
+//! combination with tools.
 
 use super::{Capabilities, ModelEntry, ModelMatch};
 use ModelMatch::Prefix;
@@ -23,6 +23,8 @@ const fn caps(schema_with_tools: bool, context: u32, output: u32) -> Capabilitie
 
 /// Google / Gemini model table, ordered most-specific first.
 pub(super) static MODELS: &[ModelEntry] = &[
+    // ----- Gemini 4.x — supports schema + tools (preview as of 2026-11) -----
+    (Prefix("gemini-4"), caps(true, 1_048_576, 65_536)),
     // ----- Gemini 3.x — supports schema + tools (preview as of 2026-06) -----
     (Prefix("gemini-3-flash"), caps(true, 200_000, 64_000)),
     (Prefix("gemini-3-pro"), caps(true, 1_000_000, 64_000)),

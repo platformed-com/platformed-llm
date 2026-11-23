@@ -14,13 +14,14 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::pin::Pin;
+use std::hash::{Hash, Hasher};
 
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::stream::StreamExt;
 
 use crate::types::{FinishReason, Function, PartKind, RawConfig, ResponseFormat, Tool, ToolChoice};
 use crate::{Capabilities, Error, Prompt, Response, StreamEvent};
 
+use super::tool_turn::reindex;
 use super::{Middleware, ResponseTransform};
 
 /// When the caller set `response_format` but the model has no native
@@ -43,7 +44,9 @@ use super::{Middleware, ResponseTransform};
 /// 5. Wraps the response stream so the synthetic tool-call events are
 ///    rewritten as a text part — the caller sees the JSON arguments
 ///    as the assistant's text output, never knows a tool was involved.
-///    Other tool calls pass through unchanged.
+///    A synthetic call that follows a real call in its turn is dropped,
+///    since it was written before the real call's result existed. Other
+///    tool calls pass through unchanged.
 ///
 /// No-ops when `response_format` is `None` / `Text`, or when caps say
 /// the model already supports the requested format natively.
@@ -161,11 +164,15 @@ impl Middleware for JsonCoercionMiddleware {
             })
         };
 
+        let model = cfg.model.clone();
+        let mut rewriter = SynthRewriter::new(synth_tool_name, model);
         let transform: ResponseTransform = Box::new(move |response| {
-            Response::from_stream(rewrite_synth_tool_stream(
-                response.stream(),
-                synth_tool_name,
-            ))
+            Response::from_stream(
+                response
+                    .stream()
+                    .map(move |event| event.and_then(|event| rewriter.on_event(event)))
+                    .filter_map(|event| async move { event.transpose() }),
+            )
         });
         Ok(Some(transform))
     }
@@ -195,11 +202,13 @@ fn unique_tool_name(base: &str, existing: Option<&[Tool]>) -> String {
     }
 }
 
-/// Stream adapter that turns the coerced provider stream back into
-/// what a caller who asked for structured output expects to see.
+/// Turns the coerced provider stream back into what a caller who asked
+/// for structured output expects to see.
 ///
 /// - The synthetic tool call's events are relabeled from `ToolCall` to
-///   `Text`, so its JSON arguments surface as the assistant's text.
+///   `Text`, so its JSON arguments surface as the assistant's text. A
+///   synthetic call after a real one in the turn is dropped, as
+///   `drop_text_after_tool_calls` drops text.
 /// - **Genuine** visible `Text` parts are suppressed entirely. The
 ///   provider can emit free text before / around the forced tool call
 ///   (`tool_choice: Required` is Gemini ANY mode, which doesn't gag
@@ -208,149 +217,147 @@ fn unique_tool_name(base: &str, existing: Option<&[Tool]>) -> String {
 ///   — which concatenates *all* text parts — would return
 ///   `preamble + json`, silently unparseable. Dropping them guarantees
 ///   `text()` is exactly the synth JSON.
-/// - Other (real) tool calls pass through unchanged.
+/// - Other (real) tool calls pass through unchanged. When the synthetic
+///   call carried a Gemini batch's only `thoughtSignature`, the
+///   signature is lost with the relabel; coercion only runs on Gemini
+///   models before 3, which accept an unsigned call.
 ///
-/// Because suppressing a part would leave a hole in the otherwise
-/// contiguous `PartStart` index sequence the accumulator requires, the
-/// kept parts are **renumbered** to stay 0,1,2,…
-///
-/// Terminal handling once `Done` arrives:
-/// - synth tool fired and was the *only* tool → rewrite
-///   `FinishReason::ToolCalls` to `Stop` (looks like a plain text turn).
-/// - synth tool fired alongside real tools → leave the finish reason
-///   as-is (multi-turn tool use in progress).
-/// - synth tool didn't fire but real tools did → legitimate
-///   intermediate turn (model is gathering info); pass through.
-/// - neither fired on a `Stop` turn → the model free-texted instead of
-///   producing the structured answer. Surface a retryable error rather
-///   than returning the silently-suppressed text as an empty response;
-///   a fresh sample can comply.
-/// - neither fired on any other finish reason → that reason (`Length`,
-///   `ContentFilter`, …) already explains why nothing arrived, so pass
-///   `Done` through and let the caller act on it.
-fn rewrite_synth_tool_stream(
-    inner: Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>>,
+/// Suppressing a part would leave a hole in the contiguous `PartStart`
+/// index sequence the accumulator requires, so the kept parts are
+/// renumbered 0,1,2,…
+struct SynthRewriter {
     synth_tool_name: String,
-) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, Error>> + Send>> {
-    let mut synth_seen = false;
-    let mut other_tool_seen = false;
-    // Original part index -> remapped index (`Some`) or suppressed (`None`).
-    let mut index_map: HashMap<u32, Option<u32>> = HashMap::new();
-    let mut next_index: u32 = 0;
-    Box::pin(
-        inner
-            .map(move |ev_result| -> Option<Result<StreamEvent, Error>> {
-                let ev = match ev_result {
-                    Ok(ev) => ev,
-                    Err(e) => return Some(Err(e)),
-                };
-                match ev {
-                    StreamEvent::PartStart { index, kind } => match kind {
-                        // Synthetic tool call -> relabel to a text part.
-                        PartKind::ToolCall { ref name, .. } if name == &synth_tool_name => {
-                            synth_seen = true;
-                            let mapped = next_index;
-                            next_index += 1;
-                            index_map.insert(index, Some(mapped));
-                            Some(Ok(StreamEvent::PartStart {
-                                index: mapped,
-                                kind: PartKind::Text,
-                            }))
-                        }
-                        // Genuine visible text -> suppress (see fn docs).
-                        PartKind::Text => {
-                            index_map.insert(index, None);
-                            None
-                        }
-                        // Real tool call -> keep, but renumber.
-                        PartKind::ToolCall { .. } => {
-                            other_tool_seen = true;
-                            let mapped = next_index;
-                            next_index += 1;
-                            index_map.insert(index, Some(mapped));
-                            Some(Ok(StreamEvent::PartStart {
-                                index: mapped,
-                                kind,
-                            }))
-                        }
-                        // Reasoning / refusal / builtin / continuation ->
-                        // keep, renumber.
-                        _ => {
-                            let mapped = next_index;
-                            next_index += 1;
-                            index_map.insert(index, Some(mapped));
-                            Some(Ok(StreamEvent::PartStart {
-                                index: mapped,
-                                kind,
-                            }))
-                        }
-                    },
-                    StreamEvent::Delta { index, delta } => match index_map.get(&index) {
-                        Some(Some(mapped)) => Some(Ok(StreamEvent::Delta {
-                            index: *mapped,
-                            delta,
-                        })),
-                        _ => None,
-                    },
-                    StreamEvent::PartUpdate { index, update } => match index_map.get(&index) {
-                        Some(Some(mapped)) => Some(Ok(StreamEvent::PartUpdate {
-                            index: *mapped,
-                            update,
-                        })),
-                        _ => None,
-                    },
-                    StreamEvent::PartEnd { index } => match index_map.get(&index) {
-                        Some(Some(mapped)) => Some(Ok(StreamEvent::PartEnd { index: *mapped })),
-                        _ => None,
-                    },
-                    StreamEvent::Done {
-                        finish_reason,
-                        usage,
-                    } => {
-                        if synth_seen {
-                            let finish_reason = if matches!(finish_reason, FinishReason::ToolCalls)
-                                && !other_tool_seen
-                            {
-                                FinishReason::Stop
-                            } else {
-                                finish_reason
-                            };
-                            Some(Ok(StreamEvent::Done {
-                                finish_reason,
-                                usage,
-                            }))
-                        } else if other_tool_seen {
-                            // Intermediate multi-turn turn: the model
-                            // called a real tool and hasn't emitted the
-                            // structured answer yet. Pass through.
-                            Some(Ok(StreamEvent::Done {
-                                finish_reason,
-                                usage,
-                            }))
-                        } else if matches!(finish_reason, FinishReason::Stop) {
-                            // Clean finish with nothing structured: the
-                            // model didn't comply with our coercion
-                            // polyfill. Retryable — a fresh sample can.
-                            Some(Err(Error::provider_retryable(
-                                "Library",
-                                "json_coercion: model did not invoke the structured-response \
-                                 tool and made no other tool call — the request asked for \
-                                 structured output but the model returned free-form text",
-                            )))
-                        } else {
-                            // Every other reason is self-describing;
-                            // wrapping it in a middleware error would
-                            // hide it from the caller.
-                            Some(Ok(StreamEvent::Done {
-                                finish_reason,
-                                usage,
-                            }))
-                        }
-                    }
+    model: String,
+    slots: HashMap<u32, Slot>,
+    next_index: u32,
+    /// The synthetic call's arguments, once it has streamed as text.
+    answer: Option<String>,
+    called: bool,
+}
+
+enum Slot {
+    Kept(u32),
+    Answer(u32),
+    LateAnswer { bytes: usize },
+    Suppressed,
+}
+
+impl SynthRewriter {
+    fn new(synth_tool_name: String, model: String) -> Self {
+        Self {
+            synth_tool_name,
+            model,
+            slots: HashMap::new(),
+            next_index: 0,
+            answer: None,
+            called: false,
+        }
+    }
+
+    fn on_event(&mut self, event: StreamEvent) -> Result<Option<StreamEvent>, Error> {
+        match event {
+            StreamEvent::PartStart { index, kind } => Ok(self.on_part_start(index, kind)),
+            StreamEvent::Done {
+                finish_reason,
+                usage,
+            } => Ok(Some(StreamEvent::Done {
+                finish_reason: self.on_done(finish_reason)?,
+                usage,
+            })),
+            event @ (StreamEvent::Delta { index, .. }
+            | StreamEvent::PartUpdate { index, .. }
+            | StreamEvent::PartEnd { index }) => Ok(self.on_part_event(index, event)),
+        }
+    }
+
+    fn on_part_start(&mut self, index: u32, kind: PartKind) -> Option<StreamEvent> {
+        let (slot, kind) = match kind {
+            PartKind::ToolCall { name, .. } if name == self.synth_tool_name => {
+                if self.called {
+                    self.slots.insert(index, Slot::LateAnswer { bytes: 0 });
+                    return None;
                 }
-            })
-            .filter_map(futures_util::future::ready),
-    )
+                self.answer = Some(String::new());
+                (Slot::Answer(self.next_index), PartKind::Text)
+            }
+            PartKind::Text => {
+                self.slots.insert(index, Slot::Suppressed);
+                return None;
+            }
+            kind => {
+                if matches!(kind, PartKind::ToolCall { .. }) && !self.called {
+                    self.called = true;
+                    self.warn_if_answered();
+                }
+                (Slot::Kept(self.next_index), kind)
+            }
+        };
+        let out = self.next_index;
+        self.next_index += 1;
+        self.slots.insert(index, slot);
+        Some(StreamEvent::PartStart { index: out, kind })
+    }
+
+    /// An answer that streamed before a real call in its turn has reached
+    /// the caller and can't be taken back.
+    fn warn_if_answered(&self) {
+        let Some(answer) = &self.answer else {
+            return;
+        };
+        let mut hasher = std::hash::DefaultHasher::new();
+        answer.hash(&mut hasher);
+        tracing::warn!(
+            model = %self.model,
+            answer_bytes = answer.len(),
+            answer_hash = format_args!("{:016x}", hasher.finish()),
+            "json_coercion: a final answer streamed before a tool call in its turn",
+        );
+    }
+
+    fn on_part_event(&mut self, index: u32, event: StreamEvent) -> Option<StreamEvent> {
+        match self.slots.get_mut(&index) {
+            Some(Slot::Kept(out)) => Some(reindex(event, *out)),
+            Some(Slot::Answer(out)) => {
+                if let (StreamEvent::Delta { delta, .. }, Some(answer)) = (&event, &mut self.answer)
+                {
+                    answer.push_str(delta);
+                }
+                Some(reindex(event, *out))
+            }
+            Some(Slot::LateAnswer { bytes }) => {
+                match &event {
+                    StreamEvent::Delta { delta, .. } => *bytes += delta.len(),
+                    StreamEvent::PartEnd { .. } => tracing::debug!(
+                        model = %self.model,
+                        bytes = *bytes,
+                        "json_coercion: dropping a final answer given after a tool call",
+                    ),
+                    _ => {}
+                }
+                None
+            }
+            Some(Slot::Suppressed) => None,
+            None => Some(event),
+        }
+    }
+
+    /// The finish reason to report, or an error when the model answered
+    /// in free text alone.
+    fn on_done(&self, finish_reason: FinishReason) -> Result<FinishReason, Error> {
+        let answered = self.answer.is_some();
+        match (answered, self.called, finish_reason) {
+            (true, false, FinishReason::ToolCalls) => Ok(FinishReason::Stop),
+            (false, false, FinishReason::Stop) => Err(Error::provider_retryable(
+                "Library",
+                "json_coercion: model did not invoke the structured-response \
+                 tool and made no other tool call — the request asked for \
+                 structured output but the model returned free-form text",
+            )),
+            // `Length`, `ContentFilter` and the like explain an empty
+            // turn themselves.
+            (_, _, finish_reason) => Ok(finish_reason),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -549,42 +556,39 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn preserves_other_tool_calls() {
-        let synth_name = "respond_with_json".to_string();
-        let events: Vec<Result<StreamEvent, Error>> = vec![
-            Ok(StreamEvent::PartStart {
-                index: 0,
-                kind: PartKind::ToolCall {
-                    call_id: "c1".to_string(),
-                    name: synth_name.clone(),
-                },
-            }),
-            Ok(StreamEvent::Delta {
-                index: 0,
-                delta: r#"{"x":1}"#.to_string(),
-            }),
-            Ok(StreamEvent::PartEnd { index: 0 }),
-            Ok(StreamEvent::PartStart {
-                index: 1,
-                kind: PartKind::ToolCall {
-                    call_id: "c2".to_string(),
-                    name: "get_weather".to_string(),
-                },
-            }),
-            Ok(StreamEvent::Delta {
-                index: 1,
-                delta: r#"{"city":"NY"}"#.to_string(),
-            }),
-            Ok(StreamEvent::PartEnd { index: 1 }),
-            Ok(StreamEvent::Done {
-                finish_reason: FinishReason::ToolCalls,
-                usage: Usage::default(),
-            }),
-        ];
-        let provider = MockProvider::new(events);
-        let prompt = Prompt::user("hi");
-        let config = ConfigBuilder::new("claude-sonnet-4-5")
+    fn synth_and_real_calls(order: &[&str]) -> Vec<Result<StreamEvent, Error>> {
+        let mut events = Vec::new();
+        for (index, name) in order.iter().enumerate() {
+            let index = index as u32;
+            let arguments = if *name == "respond_with_json" {
+                r#"{"x":"canary"}"#
+            } else {
+                r#"{"city":"NY"}"#
+            };
+            events.extend([
+                Ok(StreamEvent::PartStart {
+                    index,
+                    kind: PartKind::ToolCall {
+                        call_id: format!("c{index}"),
+                        name: name.to_string(),
+                    },
+                }),
+                Ok(StreamEvent::Delta {
+                    index,
+                    delta: arguments.to_string(),
+                }),
+                Ok(StreamEvent::PartEnd { index }),
+            ]);
+        }
+        events.push(Ok(StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+            usage: Usage::default(),
+        }));
+        events
+    }
+
+    fn weather_config(model: &str) -> crate::Config {
+        ConfigBuilder::new(model)
             .response_format(json_schema_rf("Answer", r#"{"type":"object"}"#))
             .tools(vec![Tool::Function(Function {
                 name: "get_weather".to_string(),
@@ -593,27 +597,123 @@ mod tests {
                     serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
                 ),
             })])
-            .build();
+            .build()
+    }
 
-        let response = generate(&provider, &prompt, &config).await.unwrap();
-        let complete = response.buffer().await.unwrap();
-
-        let mut saw_text = false;
-        let mut saw_real_call = false;
-        for part in &complete.content {
-            if let AssistantPart::Text { content, .. } = part {
-                assert_eq!(content, r#"{"x":1}"#);
-                saw_text = true;
+    /// Everything logged at `warn` or above while the guard lives.
+    fn capture_warnings() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<u8>>>) {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
             }
-            if let AssistantPart::ToolCall(FunctionCall { name, .. }) = part {
-                if name == "get_weather" {
-                    saw_real_call = true;
-                }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
             }
         }
-        assert!(saw_text);
-        assert!(saw_real_call);
+        let logged = Arc::new(Mutex::new(Vec::new()));
+        let sink = Sink(logged.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        (tracing::subscriber::set_default(subscriber), logged)
+    }
+
+    /// A synth call after a real one in its turn was written before the
+    /// real call's result: the turn reaches the caller as the real call
+    /// alone.
+    #[tokio::test]
+    async fn an_answer_after_a_real_call_is_dropped() {
+        let provider =
+            MockProvider::new(synth_and_real_calls(&["get_weather", "respond_with_json"]));
+        let complete = generate(
+            &provider,
+            &Prompt::user("hi"),
+            &weather_config("claude-sonnet-4-5"),
+        )
+        .await
+        .unwrap()
+        .buffer()
+        .await
+        .unwrap();
+
+        let [AssistantPart::ToolCall(FunctionCall { name, .. })] = complete.content.as_slice()
+        else {
+            panic!("expected only the real call: {:?}", complete.content);
+        };
+        assert_eq!(name, "get_weather");
         assert!(matches!(complete.finish_reason, FinishReason::ToolCalls));
+    }
+
+    /// A synth call before a real one has streamed by the time the real
+    /// call arrives; it stays, and the leak is logged without its content.
+    #[tokio::test]
+    async fn an_answer_before_a_real_call_is_kept_and_logged() {
+        let (_guard, logged) = capture_warnings();
+        let provider =
+            MockProvider::new(synth_and_real_calls(&["respond_with_json", "get_weather"]));
+        let complete = generate(
+            &provider,
+            &Prompt::user("hi"),
+            &weather_config("claude-sonnet-4-5"),
+        )
+        .await
+        .unwrap()
+        .buffer()
+        .await
+        .unwrap();
+
+        let [AssistantPart::Text { content, .. }, AssistantPart::ToolCall(FunctionCall { name, .. })] =
+            complete.content.as_slice()
+        else {
+            panic!("expected the answer then the call: {:?}", complete.content);
+        };
+        assert_eq!(
+            (content.as_str(), name.as_str()),
+            (r#"{"x":"canary"}"#, "get_weather")
+        );
+        assert_eq!(complete.finish_reason, FinishReason::ToolCalls);
+        let logged = String::from_utf8(logged.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("answer_bytes=14 "), "{logged}");
+        assert!(!logged.contains("canary"), "{logged}");
+    }
+
+    /// A builtin call's result exists before the model writes on, so an
+    /// answer after one is final.
+    #[tokio::test]
+    async fn an_answer_after_a_builtin_call_is_kept() {
+        let mut events = vec![
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::BuiltinToolCall {
+                    kind: crate::types::ProviderBuiltin::CodeExecution,
+                },
+            }),
+            Ok(StreamEvent::PartEnd { index: 0 }),
+        ];
+        events.extend(
+            synth_and_real_calls(&["respond_with_json"])
+                .into_iter()
+                .map(|event| event.map(|event| reindex(event, 1))),
+        );
+        let provider = MockProvider::new(events);
+        let complete = generate(
+            &provider,
+            &Prompt::user("hi"),
+            &weather_config("claude-sonnet-4-5"),
+        )
+        .await
+        .unwrap()
+        .buffer()
+        .await
+        .unwrap();
+
+        assert_eq!(complete.text(), r#"{"x":"canary"}"#);
+        assert_eq!(complete.finish_reason, FinishReason::Stop);
     }
 
     #[test]
@@ -625,10 +725,19 @@ mod tests {
             response_schema_with_tools: true,
             ..Capabilities::default()
         };
-        assert!(default_middleware(&caps_full).is_empty());
+        let names = |caps: &Capabilities| -> Vec<String> {
+            default_middleware(caps)
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect()
+        };
+        assert_eq!(names(&caps_full), ["text_after_tool_calls"]);
 
         let caps_anthropic = Capabilities::anthropic("claude-sonnet-4-5");
-        assert_eq!(default_middleware(&caps_anthropic).len(), 1);
+        assert_eq!(
+            names(&caps_anthropic),
+            ["json_coercion", "text_after_tool_calls"]
+        );
     }
 
     /// On a model that supports schema natively but not schema+tools

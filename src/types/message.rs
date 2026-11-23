@@ -378,10 +378,13 @@ pub struct FunctionCall {
     /// value still lives on the call in history, so switching away from
     /// Gemini and back re-echoes the original signature, and switching
     /// between Gemini models echoes a signature a different model produced.
-    /// Gemini currently tolerates a stale or absent `thoughtSignature`, so
-    /// neither is rejected today; if that changes this needs an origin
-    /// (provider + model) guard before echo. `None` for providers that
-    /// don't emit one.
+    /// Gemini 3 rejects a function call of the current turn (since the
+    /// latest user message that is not a function response) without the
+    /// signature it was given; in a parallel batch only the first call
+    /// carries one. Gemini 2.5 accepts an absent signature. Neither is
+    /// documented to reject a signature another model produced; if that
+    /// changes this needs an origin (provider + model) guard before echo.
+    /// `None` for providers that don't emit one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_signature: Option<String>,
 }

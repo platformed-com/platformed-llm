@@ -297,7 +297,7 @@ impl std::fmt::Debug for Config {
 /// All settings except `model` default to `None` (provider default).
 /// Capability and middleware overrides default to "use the library's
 /// auto-derived value"; setting either pins the chain to the value
-/// you supply, including `Vec::new()` to disable polyfills entirely.
+/// you supply, including `Vec::new()` to disable every default stage.
 #[derive(Clone)]
 pub struct ConfigBuilder {
     model: String,
@@ -467,10 +467,13 @@ impl ConfigBuilder {
         self
     }
 
-    /// Override the middleware chain. Pass `Vec::new()` to disable all
-    /// polyfills (validation will still run and surface unsupported
-    /// requests as `Error::Config`). Pass a custom list to add your
-    /// own middleware or reorder the defaults.
+    /// Override the middleware chain. The override replaces the whole
+    /// default list, including the stage that drops text written after
+    /// a tool call, so to add your own middleware extend
+    /// [`crate::middleware::default_middleware`]`(&caps)` rather than
+    /// starting from scratch. `Vec::new()` disables all of it
+    /// (validation will still run and surface unsupported requests as
+    /// `Error::Config`).
     pub fn with_middleware(
         mut self,
         middleware: Vec<std::sync::Arc<dyn crate::middleware::Middleware>>,

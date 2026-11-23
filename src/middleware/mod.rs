@@ -40,8 +40,10 @@ use crate::types::{RawConfig, ResponseFormat, Tool};
 use crate::{Capabilities, Error, Prompt, Response};
 
 pub mod json_coercion;
+pub mod tool_turn;
 
 pub use json_coercion::JsonCoercionMiddleware;
+pub use tool_turn::TextAfterToolCallsMiddleware;
 
 /// A response-stream wrapper produced by a middleware during request
 /// rewriting. Captures any per-request state (e.g. the synthetic tool
@@ -86,16 +88,17 @@ pub trait Middleware: Send + Sync + std::fmt::Debug {
 
 /// Default middleware list derived from a capability set.
 ///
-/// Any middleware whose presence depends only on the model's caps
-/// (and not on the specific request) gets included unconditionally
-/// when the cap is missing. Middleware are responsible for being
-/// cheap when they have nothing to do — e.g. [`JsonCoercionMiddleware`]
-/// no-ops when `response_format` is unset.
+/// Polyfills are included when the model lacks the cap they cover.
+/// [`TextAfterToolCallsMiddleware`] is included for every model.
+/// Middleware are responsible for being cheap when they have nothing
+/// to do — e.g. [`JsonCoercionMiddleware`] no-ops when
+/// `response_format` is unset.
 pub fn default_middleware(caps: &Capabilities) -> Vec<Arc<dyn Middleware>> {
     let mut out: Vec<Arc<dyn Middleware>> = Vec::new();
     if !caps.response_schema || !caps.response_schema_with_tools || !caps.native_json_mode {
         out.push(Arc::new(JsonCoercionMiddleware));
     }
+    out.push(Arc::new(TextAfterToolCallsMiddleware));
     out
 }
 
@@ -262,8 +265,10 @@ pub fn validate_prompt(prompt: &Prompt) -> Result<(), Error> {
 ///
 /// `provider` is any `&dyn Provider`. Calling
 /// [`crate::Provider::generate`] directly bypasses middleware — use
-/// that only if you've already run the pipeline yourself or you know
-/// the model natively supports everything in the config.
+/// that only if you've already run the pipeline yourself, or you know
+/// the model natively supports everything in the config and you don't
+/// need text written after a tool call dropped
+/// ([`TextAfterToolCallsMiddleware`]).
 pub async fn generate(
     provider: &dyn Provider,
     prompt: &Prompt,

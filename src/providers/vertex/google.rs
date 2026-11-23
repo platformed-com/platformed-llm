@@ -1321,6 +1321,9 @@ pub(crate) struct GoogleStreamState {
     /// and closed the text part, the citation target would otherwise
     /// be lost (`index_of(Text)` is `None` at finish).
     last_text_index: Option<u32>,
+    /// A `functionCall` part has arrived this turn, so a `STOP` finish
+    /// is reported as [`FinishReason::ToolCalls`].
+    saw_function_call: bool,
 }
 
 impl Default for GoogleStreamState {
@@ -1328,11 +1331,30 @@ impl Default for GoogleStreamState {
         Self {
             tracker: crate::providers::part_tracker::PartTracker::new(),
             last_text_index: None,
+            saw_function_call: false,
         }
     }
 }
 
 impl GoogleStreamState {
+    fn finish(
+        &mut self,
+        out: &mut Vec<StreamEvent>,
+        finish_reason: FinishReason,
+        usage: Option<GoogleUsageMetadata>,
+    ) {
+        self.close_text(out);
+        self.close_code_execution(out);
+        let finish_reason = match finish_reason {
+            FinishReason::Stop if self.saw_function_call => FinishReason::ToolCalls,
+            other => other,
+        };
+        out.push(StreamEvent::Done {
+            finish_reason,
+            usage: usage.map(Into::into).unwrap_or_default(),
+        });
+    }
+
     fn open_text(&mut self, out: &mut Vec<StreamEvent>) -> u32 {
         if let Some(idx) = self.tracker.index_of(&GoogleSlot::Text) {
             return idx;
@@ -1520,6 +1542,7 @@ pub(crate) fn convert_response_stateful(
                     });
                 }
                 GooglePartData::FunctionCall { function_call } => {
+                    state.saw_function_call = true;
                     // Close any open text part before starting a tool call.
                     state.close_text(&mut events);
                     state.close_code_execution(&mut events);
@@ -1604,10 +1627,6 @@ pub(crate) fn convert_response_stateful(
                 }
             }
 
-            // Close any still-open text part before emitting Done.
-            state.close_text(&mut events);
-            state.close_code_execution(&mut events);
-
             let finish_message = candidate
                 .finish_message
                 .as_deref()
@@ -1650,16 +1669,7 @@ pub(crate) fn convert_response_stateful(
                     FinishReason::Incomplete
                 }
             };
-
-            let usage = response
-                .usage_metadata
-                .map(|meta| meta.into())
-                .unwrap_or_default();
-
-            events.push(StreamEvent::Done {
-                finish_reason,
-                usage,
-            });
+            state.finish(&mut events, finish_reason, response.usage_metadata);
         }
     } else if let Some(feedback) = &response.prompt_feedback {
         // Prompt was safety-blocked. Surface as ContentFilter regardless of
@@ -1672,24 +1682,14 @@ pub(crate) fn convert_response_stateful(
                 "Gemini prompt was blocked",
             );
         }
-        let usage = response
-            .usage_metadata
-            .map(|meta| meta.into())
-            .unwrap_or_default();
-        events.push(StreamEvent::Done {
-            finish_reason: FinishReason::ContentFilter,
-            usage,
-        });
+        state.finish(
+            &mut events,
+            FinishReason::ContentFilter,
+            response.usage_metadata,
+        );
     } else if response.usage_metadata.is_some() {
         // If no candidates but we have usage metadata, this might be a final response
-        let usage = response
-            .usage_metadata
-            .map(|meta| meta.into())
-            .unwrap_or_default();
-        events.push(StreamEvent::Done {
-            finish_reason: FinishReason::Stop,
-            usage,
-        });
+        state.finish(&mut events, FinishReason::Stop, response.usage_metadata);
     }
 
     Ok(events)
@@ -3015,5 +3015,66 @@ mod tests {
         let part = &r.candidates[0].content.as_ref().unwrap().parts[0];
         assert!(matches!(&part.data, GooglePartData::Text { text } if text == "Sunny."));
         assert_eq!(part.thought_signature.as_deref(), Some("sig_abc"));
+    }
+
+    fn call_chunk(signature: &str) -> String {
+        serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{
+                    "functionCall": {"name": "f", "args": {}},
+                    "thoughtSignature": signature,
+                }]},
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 2, "totalTokenCount": 3},
+        })
+        .to_string()
+    }
+
+    fn convert_chunks(chunks: &[String]) -> Vec<StreamEvent> {
+        let mut state = GoogleStreamState::default();
+        chunks
+            .iter()
+            .flat_map(|chunk| {
+                let response: GoogleResponse = serde_json::from_str(chunk).unwrap();
+                convert_response_stateful(response, &mut state).unwrap()
+            })
+            .collect()
+    }
+
+    /// Gemini finishes a turn with function calls `STOP`; the crate
+    /// reports that as `ToolCalls`, as the other providers do.
+    #[test]
+    fn stop_with_a_function_call_finishes_tool_calls() {
+        let events = convert_chunks(&[call_chunk("sig")]);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_usage_only_finish_after_a_function_call_is_tool_calls() {
+        let call_without_finish = serde_json::json!({
+            "candidates": [{"content": {"role": "model", "parts": [
+                {"functionCall": {"name": "f", "args": {}}},
+            ]}}],
+        })
+        .to_string();
+        let usage_only = serde_json::json!({
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 2, "totalTokenCount": 3},
+        })
+        .to_string();
+        let events = convert_chunks(&[call_without_finish, usage_only]);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+                ..
+            })
+        ));
     }
 }
