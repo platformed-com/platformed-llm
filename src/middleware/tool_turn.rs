@@ -170,6 +170,32 @@ mod tests {
         ]
     }
 
+    fn builtin(index: u32) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::PartStart {
+                index,
+                kind: PartKind::BuiltinToolCall {
+                    kind: crate::types::ProviderBuiltin::WebSearch,
+                },
+            },
+            StreamEvent::PartEnd { index },
+        ]
+    }
+
+    fn reasoning(index: u32) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::PartStart {
+                index,
+                kind: PartKind::Reasoning,
+            },
+            StreamEvent::Delta {
+                index,
+                delta: "Thinking.".into(),
+            },
+            StreamEvent::PartEnd { index },
+        ]
+    }
+
     fn done() -> StreamEvent {
         StreamEvent::Done {
             finish_reason: FinishReason::ToolCalls,
@@ -196,6 +222,8 @@ mod tests {
             .map(|part| match part {
                 AssistantPart::Text { content, .. } => format!("text:{content}"),
                 AssistantPart::ToolCall(call) => call.call_id.clone(),
+                AssistantPart::BuiltinToolCall { .. } => "builtin".into(),
+                AssistantPart::Reasoning { .. } => "reasoning".into(),
                 part => panic!("unexpected part {part:?}"),
             })
             .collect()
@@ -261,42 +289,104 @@ mod tests {
         assert_eq!(shape(&response), ["text:Checking.", "c1", "c3", "c4"]);
     }
 
-    /// Chat with tools on a provider that writes its text before its
-    /// calls passes through the default middleware unchanged.
+    /// A builtin call's result exists before the model writes on, so only
+    /// a function call starts the drop.
     #[tokio::test]
-    async fn text_before_calls_passes_through_the_default_middleware() {
-        use crate::providers::mock::{MockProvider, MockResponse};
-        use crate::types::FunctionCall;
+    async fn text_after_a_builtin_call_is_kept() {
+        let response = turn(vec![
+            builtin(0),
+            text(1, &["Found it."]),
+            call(2),
+            text(3, &["Done."]),
+        ])
+        .await;
+        assert_eq!(shape(&response), ["builtin", "text:Found it.", "c2"]);
+    }
 
-        let provider = MockProvider::always(MockResponse::from_parts(
-            vec![
-                AssistantPart::Text {
-                    content: "Let me look that up.".into(),
-                    annotations: Vec::new(),
-                },
-                AssistantPart::ToolCall(FunctionCall {
-                    call_id: "c1".into(),
-                    name: "lookup".into(),
-                    arguments: "{}".into(),
-                    provider_signature: None,
-                }),
-            ],
-            FinishReason::ToolCalls,
-        ));
-        let config = crate::Config::builder("claude-sonnet-4-5")
-            .tools(vec![Tool::function(
+    #[tokio::test]
+    async fn text_after_reasoning_is_kept() {
+        let response = turn(vec![reasoning(0), text(1, &["Answer."])]).await;
+        assert_eq!(shape(&response), ["reasoning", "text:Answer."]);
+    }
+
+    fn text_part(content: &str) -> AssistantPart {
+        AssistantPart::Text {
+            content: content.into(),
+            annotations: Vec::new(),
+        }
+    }
+
+    fn call_part(call_id: &str) -> AssistantPart {
+        AssistantPart::ToolCall(crate::types::FunctionCall {
+            call_id: call_id.into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+            provider_signature: None,
+        })
+    }
+
+    /// `parts` from `model` through the default middleware, with or
+    /// without a function tool.
+    async fn through_default_middleware(
+        model: &str,
+        parts: Vec<AssistantPart>,
+        with_tools: bool,
+    ) -> CompleteResponse {
+        use crate::providers::mock::{MockProvider, MockResponse};
+
+        let provider =
+            MockProvider::always(MockResponse::from_parts(parts, FinishReason::ToolCalls));
+        let mut config = crate::Config::builder(model);
+        if with_tools {
+            config = config.tools(vec![Tool::function(
                 "lookup",
                 None,
                 Cow::Owned(serde_json::value::RawValue::from_string("{}".into()).unwrap()),
-            )])
-            .build();
-        let response = crate::generate(&provider, &Prompt::user("hi"), &config)
+            )]);
+        }
+        crate::generate(&provider, &Prompt::user("hi"), &config.build())
             .await
             .unwrap()
             .buffer()
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Chat with tools on a provider that writes its text before its
+    /// calls passes through the default middleware unchanged.
+    #[tokio::test]
+    async fn text_before_calls_passes_through_the_default_middleware() {
+        let response = through_default_middleware(
+            "claude-sonnet-4-5",
+            vec![text_part("Let me look that up."), call_part("c1")],
+            true,
+        )
+        .await;
         assert_eq!(shape(&response), ["text:Let me look that up.", "c1"]);
         assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+    }
+
+    /// `gemini-3-pro` supports schema with tools natively, so this stage
+    /// is the only one in its default list.
+    #[tokio::test]
+    async fn text_after_a_call_is_dropped_by_the_default_middleware() {
+        let response = through_default_middleware(
+            "gemini-3-pro",
+            vec![call_part("c0"), text_part(r#"{"answer":"done"}"#)],
+            true,
+        )
+        .await;
+        assert_eq!(shape(&response), ["c0"]);
+    }
+
+    #[tokio::test]
+    async fn the_default_middleware_leaves_a_request_without_function_tools_alone() {
+        let response = through_default_middleware(
+            "gemini-3-pro",
+            vec![call_part("c0"), text_part("Done.")],
+            false,
+        )
+        .await;
+        assert_eq!(shape(&response), ["c0", "text:Done."]);
     }
 }

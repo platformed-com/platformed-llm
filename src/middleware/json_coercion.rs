@@ -18,9 +18,7 @@ use std::hash::{Hash, Hasher};
 
 use futures_util::stream::StreamExt;
 
-use crate::types::{
-    FinishReason, Function, PartKind, PartUpdate, RawConfig, ResponseFormat, Tool, ToolChoice,
-};
+use crate::types::{FinishReason, Function, PartKind, RawConfig, ResponseFormat, Tool, ToolChoice};
 use crate::{Capabilities, Error, Prompt, Response, StreamEvent};
 
 use super::tool_turn::reindex;
@@ -46,7 +44,9 @@ use super::{Middleware, ResponseTransform};
 /// 5. Wraps the response stream so the synthetic tool-call events are
 ///    rewritten as a text part — the caller sees the JSON arguments
 ///    as the assistant's text output, never knows a tool was involved.
-///    Other tool calls pass through unchanged.
+///    A synthetic call that follows a real call in its turn is dropped,
+///    since it was written before the real call's result existed. Other
+///    tool calls pass through unchanged.
 ///
 /// No-ops when `response_format` is `None` / `Text`, or when caps say
 /// the model already supports the requested format natively.
@@ -170,13 +170,8 @@ impl Middleware for JsonCoercionMiddleware {
             Response::from_stream(
                 response
                     .stream()
-                    .map(
-                        move |event| match event.and_then(|event| rewriter.on_event(event)) {
-                            Ok(events) => events.into_iter().map(Ok).collect(),
-                            Err(error) => vec![Err(error)],
-                        },
-                    )
-                    .flat_map(futures_util::stream::iter),
+                    .map(move |event| event.and_then(|event| rewriter.on_event(event)))
+                    .filter_map(|event| async move { event.transpose() }),
             )
         });
         Ok(Some(transform))
@@ -222,7 +217,10 @@ fn unique_tool_name(base: &str, existing: Option<&[Tool]>) -> String {
 ///   — which concatenates *all* text parts — would return
 ///   `preamble + json`, silently unparseable. Dropping them guarantees
 ///   `text()` is exactly the synth JSON.
-/// - Other (real) tool calls pass through unchanged.
+/// - Other (real) tool calls pass through unchanged. When the synthetic
+///   call carried a Gemini batch's only `thoughtSignature`, the
+///   signature is lost with the relabel; coercion only runs on Gemini
+///   models before 3, which accept an unsigned call.
 ///
 /// Suppressing a part would leave a hole in the contiguous `PartStart`
 /// index sequence the accumulator requires, so the kept parts are
@@ -234,11 +232,7 @@ struct SynthRewriter {
     next_index: u32,
     /// The synthetic call's arguments, once it has streamed as text.
     answer: Option<String>,
-    /// Index of the first real call, and whether it has a signature.
-    first_call: Option<(u32, bool)>,
-    /// The synthetic call's signature, for the first real call when it
-    /// has none: Gemini signs only the first call of a parallel batch.
-    synth_signature: Option<String>,
+    called: bool,
 }
 
 enum Slot {
@@ -256,44 +250,43 @@ impl SynthRewriter {
             slots: HashMap::new(),
             next_index: 0,
             answer: None,
-            first_call: None,
-            synth_signature: None,
+            called: false,
         }
     }
 
-    fn on_event(&mut self, event: StreamEvent) -> Result<Vec<StreamEvent>, Error> {
+    fn on_event(&mut self, event: StreamEvent) -> Result<Option<StreamEvent>, Error> {
         match event {
             StreamEvent::PartStart { index, kind } => Ok(self.on_part_start(index, kind)),
             StreamEvent::Done {
                 finish_reason,
                 usage,
-            } => Ok(vec![StreamEvent::Done {
+            } => Ok(Some(StreamEvent::Done {
                 finish_reason: self.on_done(finish_reason)?,
                 usage,
-            }]),
+            })),
             event @ (StreamEvent::Delta { index, .. }
             | StreamEvent::PartUpdate { index, .. }
             | StreamEvent::PartEnd { index }) => Ok(self.on_part_event(index, event)),
         }
     }
 
-    fn on_part_start(&mut self, index: u32, kind: PartKind) -> Vec<StreamEvent> {
+    fn on_part_start(&mut self, index: u32, kind: PartKind) -> Option<StreamEvent> {
         let (slot, kind) = match kind {
             PartKind::ToolCall { name, .. } if name == self.synth_tool_name => {
-                if self.first_call.is_some() {
+                if self.called {
                     self.slots.insert(index, Slot::LateAnswer { bytes: 0 });
-                    return Vec::new();
+                    return None;
                 }
                 self.answer = Some(String::new());
                 (Slot::Answer(self.next_index), PartKind::Text)
             }
             PartKind::Text => {
                 self.slots.insert(index, Slot::Suppressed);
-                return Vec::new();
+                return None;
             }
             kind => {
-                if matches!(kind, PartKind::ToolCall { .. }) && self.first_call.is_none() {
-                    self.first_call = Some((self.next_index, false));
+                if matches!(kind, PartKind::ToolCall { .. }) && !self.called {
+                    self.called = true;
                     self.warn_if_answered();
                 }
                 (Slot::Kept(self.next_index), kind)
@@ -302,7 +295,7 @@ impl SynthRewriter {
         let out = self.next_index;
         self.next_index += 1;
         self.slots.insert(index, slot);
-        vec![StreamEvent::PartStart { index: out, kind }]
+        Some(StreamEvent::PartStart { index: out, kind })
     }
 
     /// An answer that streamed before a real call in its turn has reached
@@ -321,10 +314,16 @@ impl SynthRewriter {
         );
     }
 
-    fn on_part_event(&mut self, index: u32, event: StreamEvent) -> Vec<StreamEvent> {
-        let (out, is_answer) = match self.slots.get_mut(&index) {
-            Some(Slot::Kept(out)) => (*out, false),
-            Some(Slot::Answer(out)) => (*out, true),
+    fn on_part_event(&mut self, index: u32, event: StreamEvent) -> Option<StreamEvent> {
+        match self.slots.get_mut(&index) {
+            Some(Slot::Kept(out)) => Some(reindex(event, *out)),
+            Some(Slot::Answer(out)) => {
+                if let (StreamEvent::Delta { delta, .. }, Some(answer)) = (&event, &mut self.answer)
+                {
+                    answer.push_str(delta);
+                }
+                Some(reindex(event, *out))
+            }
             Some(Slot::LateAnswer { bytes }) => {
                 match &event {
                     StreamEvent::Delta { delta, .. } => *bytes += delta.len(),
@@ -335,53 +334,18 @@ impl SynthRewriter {
                     ),
                     _ => {}
                 }
-                return Vec::new();
+                None
             }
-            Some(Slot::Suppressed) => return Vec::new(),
-            None => return vec![event],
-        };
-        let mut events = Vec::new();
-        match (&event, &mut self.first_call) {
-            (StreamEvent::Delta { delta, .. }, _) if is_answer => {
-                if let Some(answer) = &mut self.answer {
-                    answer.push_str(delta);
-                }
-            }
-            (
-                StreamEvent::PartUpdate {
-                    update: PartUpdate::Signature(signature),
-                    ..
-                },
-                _,
-            ) if is_answer => self.synth_signature = Some(signature.clone()),
-            (
-                StreamEvent::PartUpdate {
-                    update: PartUpdate::Signature(_),
-                    ..
-                },
-                Some((first, signed)),
-            ) if *first == out => *signed = true,
-            (StreamEvent::PartEnd { .. }, Some((first, signed @ false))) if *first == out => {
-                if let Some(signature) = &self.synth_signature {
-                    *signed = true;
-                    events.push(StreamEvent::PartUpdate {
-                        index: out,
-                        update: PartUpdate::Signature(signature.clone()),
-                    });
-                }
-            }
-            _ => {}
+            Some(Slot::Suppressed) => None,
+            None => Some(event),
         }
-        events.push(reindex(event, out));
-        events
     }
 
     /// The finish reason to report, or an error when the model answered
     /// in free text alone.
     fn on_done(&self, finish_reason: FinishReason) -> Result<FinishReason, Error> {
         let answered = self.answer.is_some();
-        let called = self.first_call.is_some();
-        match (answered, called, finish_reason) {
+        match (answered, self.called, finish_reason) {
             (true, false, FinishReason::ToolCalls) => Ok(FinishReason::Stop),
             (false, false, FinishReason::Stop) => Err(Error::provider_retryable(
                 "Library",
@@ -597,7 +561,7 @@ mod tests {
         for (index, name) in order.iter().enumerate() {
             let index = index as u32;
             let arguments = if *name == "respond_with_json" {
-                r#"{"x":1}"#
+                r#"{"x":"canary"}"#
             } else {
                 r#"{"city":"NY"}"#
             };
@@ -710,76 +674,46 @@ mod tests {
         };
         assert_eq!(
             (content.as_str(), name.as_str()),
-            (r#"{"x":1}"#, "get_weather")
+            (r#"{"x":"canary"}"#, "get_weather")
         );
+        assert_eq!(complete.finish_reason, FinishReason::ToolCalls);
         let logged = String::from_utf8(logged.lock().unwrap().clone()).unwrap();
-        assert!(logged.contains("answer_bytes=7"), "{logged}");
-        assert!(!logged.contains(r#"{"x":1}"#), "{logged}");
+        assert!(logged.contains("answer_bytes=14 "), "{logged}");
+        assert!(!logged.contains("canary"), "{logged}");
     }
 
-    /// Gemini signs only the first call of a parallel batch. When that is
-    /// the synth call, the first real call takes its signature.
+    /// A builtin call's result exists before the model writes on, so an
+    /// answer after one is final.
     #[tokio::test]
-    async fn a_synth_call_passes_its_signature_to_the_first_real_call() {
-        let call = |index: u32, name: &str, signature: Option<&str>| {
-            let mut events = vec![
-                Ok(StreamEvent::PartStart {
-                    index,
-                    kind: PartKind::ToolCall {
-                        call_id: format!("c{index}"),
-                        name: name.to_string(),
-                    },
-                }),
-                Ok(StreamEvent::Delta {
-                    index,
-                    delta: r#"{"x":1}"#.to_string(),
-                }),
-            ];
-            events.extend(signature.map(|signature| {
-                Ok(StreamEvent::PartUpdate {
-                    index,
-                    update: crate::types::PartUpdate::Signature(signature.to_string()),
-                })
-            }));
-            events.push(Ok(StreamEvent::PartEnd { index }));
-            events
-        };
-        let mut events: Vec<Result<StreamEvent, Error>> = Vec::new();
-        events.extend(call(0, "respond_with_json", Some("sig")));
-        events.extend(call(1, "get_weather", None));
-        events.extend(call(2, "get_weather", None));
-        events.push(Ok(StreamEvent::Done {
-            finish_reason: FinishReason::ToolCalls,
-            usage: Usage::default(),
-        }));
+    async fn an_answer_after_a_builtin_call_is_kept() {
+        let mut events = vec![
+            Ok(StreamEvent::PartStart {
+                index: 0,
+                kind: PartKind::BuiltinToolCall {
+                    kind: crate::types::ProviderBuiltin::CodeExecution,
+                },
+            }),
+            Ok(StreamEvent::PartEnd { index: 0 }),
+        ];
+        events.extend(
+            synth_and_real_calls(&["respond_with_json"])
+                .into_iter()
+                .map(|event| event.map(|event| reindex(event, 1))),
+        );
         let provider = MockProvider::new(events);
-        let config = ConfigBuilder::new("gemini-2.5-flash")
-            .response_format(json_schema_rf("Answer", r#"{"type":"object"}"#))
-            .tools(vec![Tool::Function(Function {
-                name: "get_weather".to_string(),
-                description: None,
-                parameters: std::borrow::Cow::Owned(
-                    serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
-                ),
-            })])
-            .build();
+        let complete = generate(
+            &provider,
+            &Prompt::user("hi"),
+            &weather_config("claude-sonnet-4-5"),
+        )
+        .await
+        .unwrap()
+        .buffer()
+        .await
+        .unwrap();
 
-        let response = generate(&provider, &Prompt::user("hi"), &config)
-            .await
-            .unwrap();
-        let complete = response.buffer().await.unwrap();
-
-        let signatures: Vec<(&str, Option<&str>)> = complete
-            .content
-            .iter()
-            .filter_map(|part| match part {
-                AssistantPart::ToolCall(call) => {
-                    Some((call.call_id.as_str(), call.provider_signature.as_deref()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(signatures, [("c1", Some("sig")), ("c2", None)]);
+        assert_eq!(complete.text(), r#"{"x":"canary"}"#);
+        assert_eq!(complete.finish_reason, FinishReason::Stop);
     }
 
     #[test]
