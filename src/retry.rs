@@ -8,13 +8,17 @@
 //! 30-minute wait, or to retry an [`Error::Auth`] that will never
 //! succeed.
 //!
-//! This module centralises the two parts of that loop:
+//! This module centralises the parts of that loop:
 //!
 //! - [`RetryPolicy`] — how many attempts, how long to wait between
 //!   them, and how a provider-supplied [`Error::retry_after`] hint
 //!   interacts with the exponential schedule. Compute a delay with
 //!   [`RetryPolicy::delay_after`] if you want to drive the loop
 //!   yourself.
+//! - [`generate_with_retry`] / [`RetryingResponse`] — stream a
+//!   response across attempts, signalling each retry in-band so a
+//!   consumer of the live events can discard a failed attempt's
+//!   partial output.
 //! - [`retry()`] — wrap an async operation in the loop. The closure
 //!   encompasses the *entire* operation (including any streaming
 //!   consumption inside it), so a mid-stream failure simply re-enters
@@ -57,9 +61,9 @@
 //! If you're streaming directly to a user and the first attempt
 //! emitted some tokens before failing, retrying will produce
 //! different output that won't stitch with what you already showed.
-//! That's a caller-policy concern — drive the loop with
-//! [`RetryPolicy::delay_after`] yourself and decide whether to
-//! discard the partial output, surface a "retry?" prompt, or stop.
+//! [`generate_with_retry`] streams across attempts and marks each
+//! retry with a [`RetryEvent::Reset`], at which point the consumer
+//! discards what it took from the failed attempt.
 //!
 //! # What doesn't
 //!
@@ -79,6 +83,10 @@
 use std::time::Duration;
 
 use crate::Error;
+
+mod stream;
+
+pub use stream::{generate_with_retry, RetryAttempt, RetryEvent, RetryingResponse};
 
 /// Knobs governing the retry loop. Construct with
 /// [`RetryPolicy::standard`] for sensible defaults, or build manually
