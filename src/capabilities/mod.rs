@@ -324,6 +324,11 @@ mod tests {
             );
         }
 
+        // gpt-6.2-astra must reach the family row, not the `gpt-` catch-all.
+        let astra = Capabilities::openai("gpt-6.2-astra");
+        assert_eq!(astra.context_window_tokens, 1_050_000);
+        assert_eq!(astra.max_output_tokens, 128_000);
+
         // gpt-4.1 — 1M context.
         assert_eq!(
             Capabilities::openai("gpt-4.1").context_window_tokens,
