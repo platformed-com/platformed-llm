@@ -22,6 +22,8 @@ const fn caps(context: u32, output: u32) -> Capabilities {
 
 /// OpenAI model table, ordered most-specific first.
 pub(super) static MODELS: &[ModelEntry] = &[
+    // ----- GPT-6 family (gpt-6.2 added 2026-11) -----
+    (Prefix("gpt-6.2"), caps(1_050_000, 128_000)),
     // ----- GPT-5 family (released 2025; gpt-5.5 added 2026-04, gpt-5.6 added 2026-07) -----
     // `gpt-5.6` covers the sol / terra / luna tiers, which share limits.
     (Prefix("gpt-5.6"), caps(1_050_000, 128_000)),
